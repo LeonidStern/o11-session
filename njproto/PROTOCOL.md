@@ -1,6 +1,6 @@
 # NINJAM protocol specification
 
-Revision 1, 2026-10-16. Written from the behaviour of the NINJAM server and client in the Jamsa repository (`LeonidStern/Jamsa`, commit `e040ae1`), including the Jamsa extensions (codec negotiation and the room bitrate). It describes what goes over the wire and how each side must behave; it contains no code. It is meant to be enough to write a new client or server from scratch that works with existing NINJAM clients (ReaNINJAM, JamTaba, JamWide, the original NINJAM clients) and with the Jamsa server and plug-in.
+Revision 2, 2026-10-16 (revision 1 plus the exact server texts and defaults found by running a clean-room implementation against the reference; see section 14). Written from the behaviour of the NINJAM server and client in the Jamsa repository (`LeonidStern/Jamsa`, commit `e040ae1`), including the Jamsa extensions (codec negotiation and the room bitrate). It describes what goes over the wire and how each side must behave; it contains no code. It is meant to be enough to write a new client or server from scratch that works with existing NINJAM clients (ReaNINJAM, JamTaba, JamWide, the original NINJAM clients) and with the Jamsa server and plug-in.
 
 Where this spec says "Jamsa extension", original NINJAM software doesn't know the feature and ignores it. Everything else is the protocol as Cockos defined it in 2005.
 
@@ -106,7 +106,7 @@ The server accepts `client_version` from `0x00020000` to `0x0002ffff` inclusive.
 
 **Usernames.** A username is `anonymous` or `anonymous:<name>` for an anonymous login, or a name from the server's user list. The server rewrites anonymous names: `<name>` is cut to 16 characters, `@` and `.` become `_`, then `@<client IP>` is appended (the IP's last octet replaced by `x` when the server masks addresses); a bare `anonymous` becomes `anon@<IP>`. Any character in the final name that is not a letter, digit, `-`, `_`, `@` or `.` becomes `_`, and the name is cut to 128 characters. The client learns its effective name from the AUTH_REPLY.
 
-If a user with the same name (case-insensitive) is already logged in, the server disconnects the old connection (sending PART and channel removals to the others), unless the account has the "multiple logins" privilege, in which case the new login gets `.2`, `.3`, ... appended (at most 16 of them).
+If a user with the same name (case-insensitive) is already logged in, the server disconnects the old connection (sending PART and channel removals to the others), unless the account has the "multiple logins" privilege, in which case the new login gets `.2`, `.3`, ... appended (at most 16 of them). This replacement happens **before** the capacity check below. Anonymous users have the multiple-logins privilege only when the server is configured for it (`AnonymousUsers 2` in the reference); by default a second anonymous login with the same name replaces the first.
 
 **Status accounts.** A server may have one status user. A login as that user gets the user list, a CONFIG_CHANGE, the TOPIC and a `USERCOUNT` chat line, and is then disconnected without an AUTH_REPLY. It's a way to poll a server.
 
@@ -337,7 +337,42 @@ A server may be configured to **require** a codec (`RequireCodec opus`): logins 
 ### 8.4 Chat commands
 
 - `!codec` shows the room's codec; `!codec opus`, `!codec flac`, `!codec vorbis` choose one (needs the vote privilege; refused when the server doesn't relay that codec or requires another). The choice applies at everyone's next interval.
-- `!bitrate` shows the room's Opus bitrate; `!bitrate N` sets it, 32-510 kbps (needs the vote privilege). A server may start with a bitrate from its configuration (`OpusBitrate`).
+- `!bitrate` shows the room's Opus bitrate; `!bitrate N` sets it, 32-510 kbps (needs the vote privilege). The reference server starts at **128 kbps** unless its configuration (`OpusBitrate`) says otherwise; a configured value outside 32-510 is ignored with a warning and 128 stays.
+
+With `RequireCodec`, `!codec` may still switch between the allowed codecs (for example Opus to FLAC); only `!codec vorbis` is refused.
+
+### 8.5 Exact server texts
+
+All of these are chat lines `MSG` with an **empty username** (the same channel as voting results), not `PRIVMSG *`. Codec names are written `Opus`, `FLAC`, `Vorbis`. A hidden user is named `someone`.
+
+Answers to the sender only:
+
+| Situation | Text |
+|---|---|
+| `!codec` with no or an unknown argument | `[server] room audio is <E>. <choices>` where `<choices>` is `Change it with !codec opus, !codec flac or !codec vorbis`, or `Change it with !codec opus or !codec flac` with RequireCodec |
+| same, while the effective codec differs from the chosen one because of someone | `[server] room audio is <E> (<C> was chosen, but <user>'s client can't play it). <choices>` |
+| `!codec X` or `!bitrate N` without the vote privilege | `[server] you don't have permission to change the room's audio` |
+| `!codec X` for a codec the server doesn't relay, or `!codec vorbis` with RequireCodec | `[server] this server doesn't allow <X>` |
+| `!bitrate` with no or a bad argument, bitrate set | `[server] the room's Opus bitrate is <N> kbps. Change it with !bitrate N, from 32 to 510` |
+| same, no bitrate set | `[server] the room has no Opus bitrate: everyone sends their own. Set one with !bitrate N, from 32 to 510` |
+
+Broadcast to everyone (after a successful command, before the CODEC_MASK):
+
+| Situation | Text |
+|---|---|
+| `!codec X` and the room now uses X | `[server] <user> switched the room's audio to <X>` |
+| `!codec X` but someone can't play X | `[server] <user> chose <X>, but <who>'s client can't play it, so the room uses <E> until they leave` |
+| `!codec X` but the room uses another codec for another reason | `[server] <user> chose <X>, but the room uses <E>` |
+| `!bitrate N` while the room plays Opus | `[server] <user> set the room's Opus bitrate to <N> kbps` |
+| `!bitrate N` while it plays something else | `[server] <user> set the room's Opus bitrate to <N> kbps, for when the room plays Opus` |
+
+Announcements when the effective codec changes on its own (someone joined or left), sent to everyone right after the JOIN or PART; nothing is announced for the first user of an empty room:
+
+| Situation | Text |
+|---|---|
+| back to the chosen codec | `[server] room audio is back to <C>` |
+| fell back because of a user who can't play the chosen one | `[server] room audio is now <E>, because <who>'s client can't play <C>` |
+| any other change | `[server] room audio is now <E>` |
 
 ## 9. Chat: CHAT_MESSAGE (`0xC0`)
 
@@ -375,7 +410,7 @@ From the client: `SESSION`, GUID as 32 hex digits, channel index as decimal, the
 | Command | Effect |
 |---|---|
 | `!topic` | the server sends the current TOPIC to the sender |
-| `!vote bpm N`, `!vote bpi N` | cast a vote (needs the vote privilege; N within 40-400 or 2-64). Each user's latest vote per setting counts for `VotingTimeout` seconds (default 120). When the leading value has at least `threshold % × visible users` votes (rounded), the server applies it, sends `[voting system] setting BPM to N` and a CONFIG_CHANGE, and clears the votes; otherwise it posts `[voting system] leading candidate: a/b votes for N BPM [each vote expires in Ts]`. Voting is off when the threshold is over 100 |
+| `!vote bpm N`, `!vote bpi N` | cast a vote (needs the vote privilege; N within 40-400 or 2-64). Each user's latest vote per setting counts for `VotingTimeout` seconds (default 120). When the leading value has at least `threshold % × visible users` votes (rounded), the server applies it, broadcasts `[voting system] setting BPM to N` (or `BPI`) and a CONFIG_CHANGE, and clears the votes; otherwise it broadcasts `[voting system] leading candidate: a/b votes for N BPM [each vote expires in Ts]` to everyone. Voting is off when the threshold is over 100: `[voting system] Voting not enabled`; without the privilege: `[voting system] No vote permission`; bad arguments: `[voting system] !vote requires <bpm|bpi> <value> parameters`. These three go to the sender only. All vote lines are `MSG` with an empty user |
 | `!codec [opus|flac|vorbis]`, `!bitrate [N]` | section 8.4 |
 | other `!word` | `PRIVMSG * Unknown !command. Commands available: !vote, !topic, !codec, !bitrate` to the sender |
 
@@ -384,8 +419,8 @@ From the client: `SESSION`, GUID as 32 hex digits, channel index as decimal, the
 | Command | Privilege | Effect |
 |---|---|---|
 | `topic <text>` | topic | set the topic; everyone gets `TOPIC <user> <text>`. Without text: the sender gets the topic |
-| `kick <name>` | kick | disconnect the user; `name*` matches a prefix. Everyone gets `MSG "" User X kicked by Y` |
-| `bpm N`, `bpi N` | bpm | set the tempo at once (20-400, 2-1024); everyone gets CONFIG_CHANGE and `MSG "" <user> sets BPM to N` |
+| `kick <name>` | kick | disconnect the user (every match, when `name*` gives a prefix). Everyone gets `MSG "" User X kicked by Y`; no match: `User "<name>" not found!` to the sender |
+| `bpm N`, `bpi N` | bpm | set the tempo at once (20-400, 2-1024); everyone gets CONFIG_CHANGE and `MSG "" <user> sets BPM to N`. Out of range: `BPM parameter must be between 20 and 400` / `BPI parameter must be between 2 and 1024` to the sender |
 | `stat [full]` | any | private-room statistics (lobby servers) |
 | `join <room>` | any | move to a private room (lobby servers only) |
 
@@ -443,3 +478,8 @@ A new client or server should pass these against the existing ones (the Jamsa re
 10. `!bitrate 128` → the mask carries 128 for everyone with codec bits; out-of-range values only answer the sender.
 11. A client that stops sending keepalives is dropped after about 9 s; one that sends them stays.
 12. Upload, in sequence, three intervals from one client while another client listens: the listener's playback is exactly one interval late and stays in time across a `!vote bpm` change.
+
+## 14. Revision history
+
+- **Revision 2 (2026-10-16):** a clean-room implementation written from revision 1 was run against the reference server and client. Audio, login, channels, subscriptions and forwarding matched at once; the differences were all in things revision 1 left open, now fixed in the text: the exact `[server]` and `[voting system]` chat texts and the fact that they are `MSG` lines with an empty user (8.5, 9.4, 9.5); the default Opus bitrate of 128 kbps; anonymous users don't get multiple logins unless configured; the same-name replacement runs before the capacity check; `!codec` may switch between allowed codecs under RequireCodec.
+- **Revision 1 (2026-10-16):** first version, written from the Jamsa repository at `e040ae1`.
