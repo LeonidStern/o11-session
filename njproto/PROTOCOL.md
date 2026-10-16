@@ -315,7 +315,7 @@ Without this extension everyone sends Vorbis. The extension lets a room agree on
 | u32 | codecs: `CLIENT_CAP` codec bits of the codec the room uses now; 0 = Vorbis |
 | u32 | opus_kbps: the room's Opus bitrate; present only when nonzero |
 
-Longer payloads are allowed and the extra bytes ignored (room for future fields). The server sends this only to clients that set at least one codec bit in `client_caps`, right after login and again whenever the room's codec or bitrate changes. Clients that set no codec bits never see it and never see non-Vorbis audio either.
+Longer payloads are allowed and the extra bytes ignored (room for future fields). The server sends this only to clients that set at least one codec bit in `client_caps`, right after login and again whenever the room's codec or bitrate changes. It is sent to a client **only when the codec or bitrate differs from the last mask that client received**: a `!codec` that doesn't change the effective codec produces the chat line but no new mask. Clients that set no codec bits never see it and never see non-Vorbis audio either.
 
 ### 8.2 Choosing the room's codec
 
@@ -376,7 +376,7 @@ Announcements when the effective codec changes on its own (someone joined or lef
 
 ## 9. Chat: CHAT_MESSAGE (`0xC0`)
 
-The payload is **up to five strings**, each ending in `0x00`, including the last one (the Jamsa server rejects a message whose last byte isn't `0x00`; the original server accepted it). Fewer than five strings is normal; missing ones are empty. The first string is the command.
+The payload is **up to five strings**, each ending in `0x00`, including the last one (the Jamsa server rejects a message whose last byte isn't `0x00`; the original server accepted it). The first string is the command. **The reference always sends all five strings**, the unused ones empty (a lone `0x00`), so a `JOIN` is `JOIN\0user\0\0\0\0`; a new implementation should do the same, because some receivers index the fields without checking. A receiver must still accept fewer than five, treating the missing ones as empty.
 
 ### 9.1 Client → server
 
@@ -481,5 +481,6 @@ A new client or server should pass these against the existing ones (the Jamsa re
 
 ## 14. Revision history
 
+- **Revision 2a (2026-10-16):** two more findings from the same comparison: chat messages always carry five strings (9), and CODEC_MASK is only resent when it changes (8.1).
 - **Revision 2 (2026-10-16):** a clean-room implementation written from revision 1 was run against the reference server and client. Audio, login, channels, subscriptions and forwarding matched at once; the differences were all in things revision 1 left open, now fixed in the text: the exact `[server]` and `[voting system]` chat texts and the fact that they are `MSG` lines with an empty user (8.5, 9.4, 9.5); the default Opus bitrate of 128 kbps; anonymous users don't get multiple logins unless configured; the same-name replacement runs before the capacity check; `!codec` may switch between allowed codecs under RequireCodec.
 - **Revision 1 (2026-10-16):** first version, written from the Jamsa repository at `e040ae1`.
