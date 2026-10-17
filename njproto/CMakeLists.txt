@@ -36,9 +36,6 @@ endforeach()
 # The client engine (ENGINE.md) needs libopus and libFLAC.
 option(NJPROTO_BUILD_ENGINE "Build the njproto_engine library, njjam and its tests" ON)
 if(NJPROTO_BUILD_ENGINE)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(CODECS REQUIRED IMPORTED_TARGET opus flac)
-
   add_library(njproto_engine STATIC
     engine/src/dsp.cpp
     engine/src/opus_codec.cpp
@@ -46,7 +43,15 @@ if(NJPROTO_BUILD_ENGINE)
     engine/src/engine.cpp
   )
   target_include_directories(njproto_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(njproto_engine PUBLIC njproto PkgConfig::CODECS)
+  # A parent project that builds the codecs itself (the Jamsa plug-in) defines the targets
+  # opus and FLAC before adding this directory; otherwise the system packages are used.
+  if(TARGET opus AND TARGET FLAC)
+    target_link_libraries(njproto_engine PUBLIC njproto opus FLAC)
+  else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CODECS REQUIRED IMPORTED_TARGET opus flac)
+    target_link_libraries(njproto_engine PUBLIC njproto PkgConfig::CODECS)
+  endif()
   find_package(Threads REQUIRED)
   target_link_libraries(njproto_engine PUBLIC Threads::Threads)
 
