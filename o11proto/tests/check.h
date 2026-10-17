@@ -61,6 +61,29 @@ inline int runAll() {
 
 #define CHECK_EQ(a, b) CHECK((a) == (b))
 
-#define TEST_MAIN() int main() { return testing::runAll(); }
+// A CHECK that also ends the test case when it fails, for a condition the
+// rest of the case relies on (an element it indexes, a message it decodes).
+#define REQUIRE(cond)                                                       \
+    do {                                                                    \
+        bool require_ok_ = static_cast<bool>(cond);                         \
+        CHECK(require_ok_ && #cond);                                        \
+        if (!require_ok_) return;                                           \
+    } while (0)
+
+#define REQUIRE_EQ(a, b) REQUIRE((a) == (b))
+
+// Line-buffered output, so the lines before a crash are not lost in the
+// stdio buffer when the output goes to a pipe (ctest). The Windows C runtime
+// treats _IOLBF as full buffering, so output is unbuffered there.
+#ifdef _WIN32
+#define TESTING_STDOUT_MODE _IONBF
+#else
+#define TESTING_STDOUT_MODE _IOLBF
+#endif
+#define TEST_MAIN()                                                         \
+    int main() {                                                            \
+        std::setvbuf(stdout, nullptr, TESTING_STDOUT_MODE, BUFSIZ);         \
+        return testing::runAll();                                           \
+    }
 
 #endif

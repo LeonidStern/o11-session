@@ -1,6 +1,6 @@
 # Router port mapping specification
 
-Revision 1b, 2026-10-17. Companion to `PROTOCOL.md`. Describes the small
+Revision 1c, 2026-10-17. Companion to `PROTOCOL.md`. Describes the small
 library a hosted room uses to ask the home router to forward its TCP port, so
 that other players can reach a server behind NAT without the host configuring
 the router by hand. Written from the behaviour of the Jamsa server's port
@@ -74,6 +74,12 @@ loops until stopped:
 
 When the loop ends, the mapping is removed (section 6) and the thread exits.
 `stop()` sets the flag, wakes the thread, joins it, and returns.
+
+On POSIX systems the thread blocks SIGPIPE for itself (`pthread_sigmask`)
+before anything else, and keeps it blocked. miniupnpc sends on its own TCP
+sockets without `MSG_NOSIGNAL` or `SO_NOSIGPIPE`, so a router that resets the
+connection would otherwise raise SIGPIPE and end the process, which in a
+plug-in is the host. The process's signal handling is never changed.
 
 ## 5. Mapping
 
@@ -169,6 +175,8 @@ written in C++ or as a Python script started by the test, and a `NOTES.md`
 line for anything this document left open.
 
 ## 10. Revision history
+
+- **1c** (2026-10-17): the mapping thread blocks SIGPIPE for itself (section 4).
 
 - **1b** (2026-10-17): names only: the library is `o11proto_portmap`, the environment variables `O11_UPNP_ROOTDESC` and `O11_NATPMP_GATEWAY`, the mapping description `O11 Session`.
 

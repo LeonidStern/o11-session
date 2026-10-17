@@ -39,8 +39,13 @@
 #include <unistd.h>
 #endif
 
-// send() must not raise SIGPIPE; Windows (and macOS) have no such flag and
-// never raise it, so the flag is simply absent there.
+// A send() to a peer that has reset the connection raises SIGPIPE on POSIX,
+// whose default action ends the process: inside a plug-in, the whole host.
+// The library never changes the process's signal handling, so it stops the
+// signal at each socket instead: MSG_NOSIGNAL on every send where the flag
+// exists (Linux, FreeBSD, newer macOS SDKs), and SO_NOSIGPIPE on every socket
+// where that exists (macOS and the BSDs; see noSigpipe() below). Windows has
+// no SIGPIPE, and there the flag is simply 0.
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
@@ -133,12 +138,25 @@ inline ssize_type recv(socket_t s, void* buf, std::size_t len, int flags) {
     return ::recv(s, buf, len, flags);
 #endif
 }
+// MSG_NOSIGNAL is always added: no send through here can raise SIGPIPE.
 inline ssize_type send(socket_t s, const void* buf, std::size_t len, int flags) {
 #ifdef _WIN32
     if (len > static_cast<std::size_t>(INT_MAX)) len = INT_MAX;
     return ::send(s, static_cast<const char*>(buf), static_cast<int>(len), flags);
 #else
-    return ::send(s, buf, len, flags);
+    return ::send(s, buf, len, flags | MSG_NOSIGNAL);
+#endif
+}
+
+// Sets SO_NOSIGPIPE where it exists, for systems whose send() takes no
+// MSG_NOSIGNAL; harmless where both exist, a no-op where neither does.
+// Called on every socket the library connects or accepts (Connection::adopt).
+inline void noSigpipe(socket_t s) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setOpt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)s;
 #endif
 }
 
