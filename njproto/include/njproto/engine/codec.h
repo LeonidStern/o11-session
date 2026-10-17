@@ -134,6 +134,9 @@ protected:
     // Pulls new input; returns the number of new bytes.
     std::size_t pullInput();
     void pushOutput(const float* interleaved, std::size_t frames);
+    // Grows the output by `frames` and returns where to write them (interleaved),
+    // so a decoder can produce straight into the buffer without a copy.
+    float* reserveOutput(std::size_t frames);
 
     std::uint32_t fourcc_;
     std::shared_ptr<ByteStream> stream_;

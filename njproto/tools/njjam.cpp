@@ -128,12 +128,30 @@ bool readWavMono(const std::string& path, int rate, std::vector<float>& out) {
 // ------------------------------------------------------------- analysis
 
 // SNR of `x` against the best-fitting sinusoid at `hz` (phase and amplitude free).
+// Steps a unit phasor (s, c) by the angle (cw, sw), renormalising now and then.
+struct Phasor {
+    double s = 0.0, c = 1.0, cw, sw;
+    long n = 0;
+    Phasor(double hz, int rate) : cw(std::cos(2 * M_PI * hz / rate)), sw(std::sin(2 * M_PI * hz / rate)) {}
+    void step() {
+        double ns = s * cw + c * sw;
+        c = c * cw - s * sw;
+        s = ns;
+        if (++n == 4096) {
+            double g = 1.0 / std::sqrt(s * s + c * c);
+            s *= g;
+            c *= g;
+            n = 0;
+        }
+    }
+};
+
 double snrAgainstTone(const float* x, std::size_t n, double hz, int rate) {
     if (n == 0) return 0;
     double sc = 0, ss = 0, cc = 0, ssn = 0, scn = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        double w = 2 * M_PI * hz * static_cast<double>(i) / rate;
-        double s = std::sin(w), c = std::cos(w);
+    Phasor ph(hz, rate);
+    for (std::size_t i = 0; i < n; ++i, ph.step()) {
+        double s = ph.s, c = ph.c;
         ss += s * s;
         cc += c * c;
         sc += s * c;
@@ -144,9 +162,9 @@ double snrAgainstTone(const float* x, std::size_t n, double hz, int rate) {
     if (std::fabs(det) < 1e-12) return 0;
     double a = (ssn * cc - scn * sc) / det, b = (scn * ss - ssn * sc) / det;
     double sig = 0, noise = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        double w = 2 * M_PI * hz * static_cast<double>(i) / rate;
-        double fit = a * std::sin(w) + b * std::cos(w);
+    Phasor ph2(hz, rate);
+    for (std::size_t i = 0; i < n; ++i, ph2.step()) {
+        double fit = a * ph2.s + b * ph2.c;
         sig += fit * fit;
         noise += (x[i] - fit) * (x[i] - fit);
     }
@@ -230,6 +248,7 @@ int main(int argc, char** argv) {
     // ---- audio thread: a simulated device at srate / block
     std::atomic<bool> stop{false};
     std::vector<float> recording;              // interleaved stereo
+    recording.reserve(static_cast<std::size_t>((a.seconds + 1.0) * a.srate) * 2);
     std::thread audio([&] {
         const int n = a.block;
         std::vector<float> inbuf(static_cast<std::size_t>(n)), l(static_cast<std::size_t>(n)), r(static_cast<std::size_t>(n));
@@ -237,7 +256,9 @@ int main(int argc, char** argv) {
         const float* in[1] = {inbuf.data()};
         float* out[2] = {l.data(), r.data()};
         float* sout[2] = {sl.data(), sr.data()};
-        double phase = 0;
+        // The tone is a rotating phasor (one complex multiply per sample)
+        // rather than a sin() per sample; renormalised now and then.
+        Phasor tone_ph(a.tone, a.srate);
         std::size_t wav_pos = 0;
         long frames_done = 0;
         bool broadcast = true;
@@ -245,9 +266,8 @@ int main(int argc, char** argv) {
         while (!stop.load()) {
             for (int i = 0; i < n; ++i) {
                 if (a.have_tone) {
-                    inbuf[static_cast<std::size_t>(i)] = static_cast<float>(a.amp * std::sin(phase));
-                    phase += 2 * M_PI * a.tone / a.srate;
-                    if (phase > 2 * M_PI) phase -= 2 * M_PI;
+                    inbuf[static_cast<std::size_t>(i)] = static_cast<float>(a.amp * tone_ph.s);
+                    tone_ph.step();
                 } else {
                     inbuf[static_cast<std::size_t>(i)] = wav.empty() ? 0.0f : wav[wav_pos++ % wav.size()];
                 }
@@ -271,9 +291,11 @@ int main(int argc, char** argv) {
             } else {
                 sender.process(in, 1, out, 2, n, a.srate);
             }
+            std::size_t at = recording.size();
+            recording.resize(at + static_cast<std::size_t>(n) * 2);
             for (int i = 0; i < n; ++i) {
-                recording.push_back(l[static_cast<std::size_t>(i)]);
-                recording.push_back(r[static_cast<std::size_t>(i)]);
+                recording[at + static_cast<std::size_t>(i) * 2] = l[static_cast<std::size_t>(i)];
+                recording[at + static_cast<std::size_t>(i) * 2 + 1] = r[static_cast<std::size_t>(i)];
             }
             frames_done += n;
             auto next = t0 + std::chrono::microseconds(static_cast<long>(frames_done * 1000000.0 / a.srate));
@@ -305,7 +327,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "connection failed: %s\n", sender.errorText().c_str());
             break;
         }
-        if (idle) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        // ENGINE.md asks for run() at least every 50 ms; the upload queue holds
+        // about 5 s, so 10 ms between idle polls is plenty.
+        if (idle) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     stop.store(true);
     audio.join();
@@ -317,7 +341,10 @@ int main(int argc, char** argv) {
     // ---- report over the last two intervals
     if (ilen <= 0) ilen = intervalLengthFor(listener.serverBpm() > 0 ? listener.serverBpm() : 120,
                                             bpi > 0 ? bpi : 8, a.srate);
+    // Trailing digital silence (the other side left before this run ended)
+    // is not part of the measurement window.
     std::size_t frames = recording.size() / 2;
+    while (frames > 0 && recording[(frames - 1) * 2] == 0.0f && recording[(frames - 1) * 2 + 1] == 0.0f) --frames;
     std::size_t take = std::min(frames, static_cast<std::size_t>(ilen) * 2);
     std::vector<float> left(take);
     for (std::size_t i = 0; i < take; ++i) left[i] = recording[(frames - take + i) * 2];

@@ -18,7 +18,8 @@ specification leaves room, the choice is listed here.
 - `engine/tests/test_engine_codecs.cpp` (13.1-13.4 plus a resampler/LPC
   check), `engine/tests/test_engine_clock.cpp` (13.5-13.9),
   `engine/tests/test_engine_e2e.cpp` (13.10-13.13, two engines against the
-  in-process `Server` with a simulated audio clock).
+  in-process `Server` with a simulated audio clock, plus duplex rooms where
+  both engines send and listen with offset interval clocks, FLAC and Opus).
 - `tools/njjam.cpp`: the command-line client of section 14.
 - CMake option `NJPROTO_BUILD_ENGINE` (default ON) finds opus, ogg and flac
   with pkg-config; OFF builds only the protocol library.
@@ -174,11 +175,32 @@ specification leaves room, the choice is listed here.
   `--two` logs the listener in as `NAME_l`.
 - Extra options: `--password`, `--amp` (default 0.5), `--say TEXT` (sent once
   after login; `--say "!codec flac"` switches a room to FLAC), `--quiet`.
-- The sender's own channel is muted for monitoring so the recording of a
-  `--two` run holds only what the listener hears. SNR is a least-squares fit
-  of a sinusoid at the tone's frequency over the last two intervals.
+- The sender's own channel is muted for monitoring and the metronome is
+  muted, so the recording of a `--two` run holds only what the listener
+  hears. SNR is a least-squares fit of a sinusoid at the tone's frequency
+  over the last two intervals, after trailing digital silence is trimmed:
+  when the other player leaves before this run ends (7.1: a user's intervals
+  are discarded the moment it goes), the recording ends in silence and a
+  window that includes it would report a few dB although every decoded
+  sample was right. The tone generator and the fit use a rotating phasor
+  instead of a `sin()` per sample.
+- The control loop sleeps 10 ms when `run()` reports idle (ENGINE.md asks
+  for 50 ms at most; the upload queue holds about 5 s).
 - `--wav` reads 16-bit PCM or 32-bit float WAV (mono, or the first channel)
   and resamples it linearly to `--srate`.
+
+## Efficiency notes
+
+- The metronome keeps only its beat clock when muted or below 0.0001 (no
+  per-sample loop); the master stage leaves the samples alone at unity gain
+  and only meters them; decoders write straight into their output buffer
+  (`reserveOutput`), the Opus decoder in runs rather than frame by frame.
+- Of what remains, libopus (complexity 10, as 6.4 says) is about 85 % of a
+  `njjam --two` Opus run; the engine's own mixing, meters and buffer clearing
+  are a few percent. A FLAC run shows more system time than an Opus run with
+  the same syscall counts (it sends about four times as many WRITEs at the
+  2048-byte threshold of 6.1 and three times the bytes); the threshold is
+  kept as specified.
 
 ## Not implemented
 

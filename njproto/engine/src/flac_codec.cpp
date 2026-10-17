@@ -199,11 +199,18 @@ private:
         self->expected_ = sample + n;
         int bits = frame->header.bits_per_sample ? static_cast<int>(frame->header.bits_per_sample) : self->bits_;
         float scale = 1.0f / static_cast<float>(1u << (bits - 1));
-        self->tmp_.resize(static_cast<std::size_t>(n) * ch);
-        for (unsigned i = 0; i < n; ++i)
-            for (std::size_t c = 0; c < ch; ++c)
-                self->tmp_[static_cast<std::size_t>(i) * ch + c] = static_cast<float>(buffer[c][i]) * scale;
-        self->pushOutput(self->tmp_.data(), n);
+        float* dst = self->reserveOutput(n);
+        if (ch == 1) {
+            const FLAC__int32* src = buffer[0];
+            for (unsigned i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]) * scale;
+        } else {
+            const FLAC__int32* s0 = buffer[0];
+            const FLAC__int32* s1 = buffer[1];
+            for (unsigned i = 0; i < n; ++i) {
+                dst[static_cast<std::size_t>(i) * 2] = static_cast<float>(s0[i]) * scale;
+                dst[static_cast<std::size_t>(i) * 2 + 1] = static_cast<float>(s1[i]) * scale;
+            }
+        }
         return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
     }
     static void errorCb(const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus, void*) {}
@@ -226,7 +233,6 @@ private:
     int bits_ = 16;
     unsigned first_bs_ = 0;
     FLAC__uint64 expected_ = 0;
-    std::vector<float> tmp_;
 
     // decodeStep uses pullInput through this wrapper so stalls notice new data.
     std::size_t pullInput() {

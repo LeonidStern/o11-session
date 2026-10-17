@@ -297,12 +297,16 @@ private:
         const std::size_t ch = static_cast<std::size_t>(channels_);
         if (gain_ != 1.0f)
             for (std::size_t i = 0; i < static_cast<std::size_t>(frames) * ch; ++i) pcm_[i] *= gain_;
-        for (int i = 0; i < frames; ++i) {
-            long idx = decoded_ + i;                  // absolute 48 kHz position
-            if (idx < pre_skip_) continue;
-            const float* f = pcm_ + static_cast<std::size_t>(i) * ch;
-            if (eos_known_ && idx >= eos_granule_) lapping_.insert(lapping_.end(), f, f + ch);
-            else pushOutput(f, 1);
+        // Frames [decoded_, decoded_ + frames): drop those before pre_skip,
+        // output those before the end granule, keep the rest as lapping.
+        long first = std::max(decoded_, static_cast<long>(pre_skip_));
+        long end = decoded_ + frames;
+        long real_end = eos_known_ ? std::min(end, std::max(first, eos_granule_)) : end;
+        if (real_end > first)
+            pushOutput(pcm_ + static_cast<std::size_t>(first - decoded_) * ch, static_cast<std::size_t>(real_end - first));
+        if (end > real_end) {
+            const float* f = pcm_ + static_cast<std::size_t>(real_end - decoded_) * ch;
+            lapping_.insert(lapping_.end(), f, f + static_cast<std::size_t>(end - real_end) * ch);
         }
         decoded_ += frames;
         if (op.e_o_s) finished_ = true;

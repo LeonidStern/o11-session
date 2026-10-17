@@ -1073,6 +1073,15 @@ void Engine::mixMetronome(float* const* out, int numOut, int len, int sampleRate
     float gl, gr;
     panGains(metro_pan_.load(), &gl, &gr);
     int ipos = interval_pos_.load();
+    if (vol < 0.0001f || numOut == 0) {
+        // Nothing audible: only keep the beat clock in step, without a per-sample loop.
+        while (beat_index_ < bpi && next_beat_ < ipos + len) {
+            ++beat_index_;
+            next_beat_ += beat_len_;
+        }
+        click_pos_ = -1;
+        return;
+    }
     for (int i = 0; i < len; ++i) {
         int ip = ipos + i;
         if (ip == next_beat_ && beat_index_ < bpi) {
@@ -1112,14 +1121,23 @@ void Engine::applyMaster(float* const* out, int numOut, int len, int sampleRate)
     float gl, gr;
     panGains(master_pan_.load(), &gl, &gr);
     float pk0 = 0, pk1 = 0;
-    for (int i = 0; i < len; ++i) {
-        out[0][i] *= vol * gl;
-        pk0 = std::max(pk0, std::fabs(out[0][i]));
+    float g0 = vol * gl, g1 = vol * gr;
+    if (g0 == 1.0f) {                            // unity: meter only, leave the samples alone
+        for (int i = 0; i < len; ++i) pk0 = std::max(pk0, std::fabs(out[0][i]));
+    } else {
+        for (int i = 0; i < len; ++i) {
+            out[0][i] *= g0;
+            pk0 = std::max(pk0, std::fabs(out[0][i]));
+        }
     }
     if (numOut > 1) {
-        for (int i = 0; i < len; ++i) {
-            out[1][i] *= vol * gr;
-            pk1 = std::max(pk1, std::fabs(out[1][i]));
+        if (g1 == 1.0f) {
+            for (int i = 0; i < len; ++i) pk1 = std::max(pk1, std::fabs(out[1][i]));
+        } else {
+            for (int i = 0; i < len; ++i) {
+                out[1][i] *= g1;
+                pk1 = std::max(pk1, std::fabs(out[1][i]));
+            }
         }
     }
     raisePeak(master_peak_[0], pk0);

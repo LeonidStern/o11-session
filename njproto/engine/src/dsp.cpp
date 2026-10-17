@@ -231,6 +231,12 @@ void Decoder::pushOutput(const float* interleaved, std::size_t frames) {
     out_.insert(out_.end(), interleaved, interleaved + frames * static_cast<std::size_t>(channels_));
 }
 
+float* Decoder::reserveOutput(std::size_t frames) {
+    std::size_t at = out_.size();
+    out_.resize(at + frames * static_cast<std::size_t>(channels_));
+    return out_.data() + at;
+}
+
 void Decoder::skip(std::size_t frames) {
     rd_ += frames * static_cast<std::size_t>(channels_);
     if (rd_ > out_.size()) rd_ = out_.size();

@@ -287,4 +287,101 @@ TEST(stalled_listener_plays_newest) {            // 13.13
     CHECK(first != second);
 }
 
+// Two engines that each send a tone and listen to the other, with the second
+// engine's interval clock offset from the first's (it starts `offset` seconds
+// later), so each receives the other's intervals while they are still arriving.
+static void duplexRoom(std::uint32_t codec, int rate, double offset, double min_snr) {
+    Server server;
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.allow_anonymous = true;
+    cfg.allow_codecs = kCapOpus | kCapFlac;
+    cfg.chosen_codec = codec;
+    cfg.opus_kbps = 128;
+    cfg.bpm = 120;
+    cfg.bpi = 8;
+    CHECK(server.start(cfg));
+    Engine e[2];
+    const double hz[2] = {997.0, 1499.0};
+    for (int k = 0; k < 2; ++k) {
+        e[k].setMetronome(0, 0, true, 0);
+        LocalChannel lc;
+        lc.name = "tone";
+        lc.broadcast = true;
+        lc.mute = true;
+        e[k].setLocalChannel(0, lc);
+        e[k].connect("127.0.0.1", server.port(), k == 0 ? "anonymous:a" : "anonymous:b", "");
+    }
+    auto control = [&] {
+        server.poll(0);
+        for (int i = 0; i < 3; ++i) {
+            bool idle = e[0].run();
+            idle = e[1].run() && idle;
+            if (idle) break;
+        }
+        for (int k = 0; k < 2; ++k)
+            for (int u = 0; u < e[k].numUsers(); ++u)
+                for (int i = 0; i < 32; ++i) {
+                    int ch = e[k].channelAt(u, i);
+                    if (ch < 0) break;
+                    if (e[k].channelVolume(u, ch) != 1.0f) e[k].setChannelVolume(u, ch, 1.0f);
+                }
+    };
+    TimePoint deadline = Clock::now() + std::chrono::seconds(5);
+    while (!(e[0].status() == Status::Ok && e[1].status() == Status::Ok && e[0].serverBpi() > 0 &&
+             e[1].serverBpi() > 0 && e[0].numUsers() == 1 && e[1].numUsers() == 1)) {
+        CHECK(Clock::now() < deadline);
+        control();
+        server.poll(1);
+    }
+    CHECK_EQ(e[0].uploadCodec(), codec == kCapFlac ? kFourccFlac : kFourccOpus);
+    const int block = 512;
+    std::vector<float> in[2], l(block), r(block);
+    std::vector<float> heard[2];
+    double phase[2] = {0, 0};
+    long frames = 0;
+    const long start1 = static_cast<long>(offset * rate);
+    const long total = static_cast<long>(30.0 * rate);
+    for (int k = 0; k < 2; ++k) in[k].assign(block, 0.0f);
+    while (frames < total) {
+        for (int k = 0; k < 2; ++k) {
+            if (k == 1 && frames < start1) continue;
+            for (int i = 0; i < block; ++i) {
+                in[k][static_cast<std::size_t>(i)] = static_cast<float>(0.5 * std::sin(phase[k]));
+                phase[k] += 2 * M_PI * hz[k] / rate;
+                if (phase[k] > 2 * M_PI) phase[k] -= 2 * M_PI;
+            }
+            const float* inp[1] = {in[k].data()};
+            float* out[2] = {l.data(), r.data()};
+            e[k].process(inp, 1, out, 2, block, rate);
+            heard[k].insert(heard[k].end(), l.begin(), l.end());
+        }
+        frames += block;
+        control();
+    }
+    std::size_t ilen = static_cast<std::size_t>(e[0].usualIntervalLength());
+    for (int k = 0; k < 2; ++k) {
+        // The last two whole intervals of this engine's own clock.
+        std::size_t n = heard[k].size();
+        std::size_t whole = (n / ilen) * ilen;
+        const float* p = heard[k].data() + (whole - 2 * ilen);
+        double snr = snrAgainstTone(p, 2 * ilen, hz[1 - k], rate);
+        float peak = 0;
+        for (std::size_t i = 0; i < 2 * ilen; ++i) peak = std::max(peak, std::fabs(p[i]));
+        std::printf("  %s offset %.1f s: engine %d hears snr %.1f dB, peak %.3f\n",
+                    codec == kCapFlac ? "flac" : "opus", offset, k, snr, peak);
+        CHECK(snr >= min_snr);
+        CHECK(peak >= 0.45f && peak <= 0.55f);
+    }
+}
+
+TEST(duplex_flac_offset_clocks) {
+    duplexRoom(kCapFlac, 48000, 1.0, 60.0);
+    duplexRoom(kCapFlac, 48000, 3.0, 60.0);
+}
+
+TEST(duplex_opus_offset_clocks) {
+    duplexRoom(kCapOpus, 48000, 1.0, 35.0);
+}
+
 TEST_MAIN()
