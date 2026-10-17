@@ -28,8 +28,11 @@ add_library(o11proto STATIC
   src/server.cpp
   src/server_live.cpp
   src/live.cpp
+  src/live_transport.cpp
 )
 target_include_directories(o11proto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+find_package(Threads REQUIRED)                 # live::Transport's network thread
+target_link_libraries(o11proto PUBLIC Threads::Threads)
 if(WIN32)
   target_link_libraries(o11proto PUBLIC ws2_32 bcrypt)
 endif()
@@ -51,13 +54,14 @@ foreach(t test_codec test_sha1 test_loopback)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
-# Live mode (PROTOCOL.md 15): the relay's conformance tests.
-find_package(Threads REQUIRED)
-add_executable(test_live_server tests/test_live_server.cpp)
-target_include_directories(test_live_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_live_server o11proto Threads::Threads)
-add_test(NAME test_live_server COMMAND test_live_server)
-set_tests_properties(test_live_server PROPERTIES TIMEOUT 120)
+# Live mode (PROTOCOL.md 15): the relay's conformance tests and the client transport.
+foreach(t test_live_server test_live_transport)
+  add_executable(${t} tests/${t}.cpp)
+  target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(${t} o11proto)
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES TIMEOUT 120)
+endforeach()
 
 # ---------------------------------------------------------------- engine
 # The client engine (ENGINE.md) needs libopus and libFLAC.

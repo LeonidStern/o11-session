@@ -144,6 +144,16 @@ Example session:
   for every incoming message. Set `Options::auto_subscribe` to hear everyone.
 - `o11proto/server.h`: `ServerConfig` and `Server` with `start()`, `poll()`,
   `stop()`. Drive `poll()` from your own loop or call `runFor()`.
+  `ServerConfig::live` and `setLiveConfig()` run Live mode's UDP relay
+  (PROTOCOL.md section 15) inside the same loop.
+- `o11proto/live.h`: Live mode's message `0x07` (`live::ServerLive`,
+  `encode()`/`decode()`), the datagram constants and the hello cookie. With
+  `Client::Options::live` the client sets the caps bit and hands each `0x07`
+  to `on_live`.
+- `o11proto/live_transport.h`: `live::Transport`, the client's Live UDP: a
+  socket connected to the relay, hellos and the cookie, the client's drop
+  rules, and opaque payloads in (`on_data`) and out (`send()`), all on its own
+  network thread. The engine's Live layer (ENGINE.md section 15) runs on it.
 
 ## Client engine
 

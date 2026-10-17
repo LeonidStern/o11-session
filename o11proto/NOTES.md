@@ -302,6 +302,21 @@ the choice is listed here.
   forwarding-latency test asks for p99 under 2 ms on Linux and under 20 ms
   elsewhere, where shared build machines schedule more coarsely.
 
+### Client transport
+
+- `live::Transport` runs one network thread per Live client. It waits on the
+  socket for at most 1 ms per pass and calls `on_tick` after each pass, so a
+  caller that sends from `on_tick` (the engine's source) adds at most about
+  1 ms. The specification's informative layout (a receiving thread and a
+  sending thread woken by the audio thread) is folded into that one thread.
+- `send()` is allowed only on the network thread, which owns the socket and
+  closes it after `on_closing`; so no send can race with the close (6.1), and
+  the source's `/stop`s go out before the socket closes (quirk 21).
+- `Options::test_receive_loss` drops that fraction of received data
+  datagrams before `on_data`: a test hook for the engine's loss tests.
+- A Live client whose TCP connection is IPv6 can't start (`serverAddress()`
+  is empty): `no peer ID or server address`, as 4.1 says.
+
 ## Tools
 
 - `o11cli` always prints JSON lines (`--json` is accepted and changes nothing)
