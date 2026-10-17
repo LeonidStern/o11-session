@@ -32,8 +32,10 @@ configure with `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
 -DCMAKE_POLICY_DEFAULT_CMP0091=NEW` for a plug-in that needs no Visual C++
 runtime; on macOS add `"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"` for a
 universal build. `-DO11_TESTS=OFF` leaves the tests out.
-`.github/workflows/o11session.yml` does all of this on the three platforms and
-checks the plug-in with pluginval.
+`.github/workflows/o11session.yml` does all of this and checks the plug-in with
+pluginval: on macOS for every change, and on all three platforms for a release
+candidate (a pushed tag `rc-*`, or a manual run with "all platforms"), which
+also gets its own pre-release with the downloads.
 
 ### Targets
 
