@@ -226,13 +226,15 @@ std::string shortHostName(const std::string &hostName)
   return name.substr(0, n);
 }
 
-std::string hostTempoNote(const std::string &hostName, double hostTempo, int roomBpm, bool following)
+std::string hostTempoNote(const std::string &hostName, double hostTempo, int roomBpm, bool following, bool suggestLink)
 {
   if (hostTempo <= 0 || roomBpm <= 0 || fabs(hostTempo - roomBpm) <= BarSync::SAME_TEMPO) return "";
   const std::string host = shortHostName(hostName), room = std::to_string(roomBpm);
   const bool live = host == "Live";
   std::string s = host + " is at " + bpmText(hostTempo) + " BPM, the room at " + room + ": ";
-  s += std::string("set ") + (live ? "Live" : "its tempo") + " to " + room;
+  if (following && suggestLink)
+    s += live ? "turn on Link in Live, or set it to " + room : "turn on its Link if it has one, or set its tempo to " + room;
+  else s += std::string("set ") + (live ? "Live" : "its tempo") + " to " + room;
   if (!following) s += ", or turn on Sync";
   return s;
 }
@@ -244,11 +246,36 @@ static std::string hostInSentence(const std::string &hostName)
   return host == "The DAW" ? "your DAW" : host;
 }
 
-std::string syncTooltip(const std::string &hostName)
+std::string linkHint(const std::string &hostName)
 {
   const std::string host = hostInSentence(hostName);
-  return "Sync with " + host + ": when you change its tempo, vote the room to it; and while it plays, "
-         "start the intervals on its bars (a multiple of BPI beats from bar 1)";
+  if (host == "Live") return "Turn on Link in Live: then Live takes the room's tempo, and its bars start with the intervals.";
+  return "Turn on Link in " + host + " if it has Link: then it takes the room's tempo, and its bars start with the intervals.";
+}
+
+std::string syncTooltip(const std::string &hostName, LinkState link, int peers)
+{
+  const std::string host = hostInSentence(hostName);
+  const std::string lead = "Sync with " + host + ": when you change its tempo, vote the room to it; and while it plays, "
+                           "start the intervals on its bars (a multiple of BPI beats from bar 1)";
+  const std::string its = host == "Live" ? "Live's" : "its";
+  switch (link)
+  {
+    case LinkState::Waiting:
+      return lead + ". In a room, with Link on in " + host + (host == "Live" ? "" : " (if it has Link)") + ", " +
+             (host == "Live" ? "Live" : "it") + " takes the room's tempo instead, and its bars start with the intervals";
+    case LinkState::Leading:
+      if (peers > 0)
+        return "Sync with " + host + " through Link: " + host + " takes the room's tempo, and its bars start with the intervals; "
+               "when you change " + its + " tempo, you vote the room to it";
+      return linkHint(hostName) + " Until then, Sync votes the room to " + its +
+             " tempo when you change it, and starts the intervals on its bars while it plays";
+    case LinkState::OtherInstance: return lead + ". Another O11 Session in this set leads Link";
+    case LinkState::Contested:
+      return lead + ". Another app on the network keeps leading Link, so this one stopped: turn Sync off and on to lead it again";
+    case LinkState::Unavailable: return lead + ". Link couldn't start here";
+    default: return lead;
+  }
 }
 
 std::string hostChipName(const std::string &hostName)
