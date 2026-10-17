@@ -29,6 +29,8 @@
 
 #include "engine.h"
 
+static constexpr double kPi = 3.14159265358979323846; // kPi is not in MSVC's <math.h> by default
+
 using namespace jamsa;
 
 static int g_failures = 0, g_checks = 0;
@@ -46,7 +48,7 @@ static double snrAgainstTone(const float *x, size_t n, double hz, int rate)
   double sc = 0, ss = 0, cc = 0, ssn = 0, scn = 0;
   for (size_t i = 0; i < n; ++i)
   {
-    const double w = 2 * M_PI * hz * (double)i / rate;
+    const double w = 2 * kPi * hz * (double)i / rate;
     const double s = sin(w), c = cos(w);
     ss += s * s;
     cc += c * c;
@@ -59,7 +61,7 @@ static double snrAgainstTone(const float *x, size_t n, double hz, int rate)
   double sig = 0, noise = 0;
   for (size_t i = 0; i < n; ++i)
   {
-    const double w = 2 * M_PI * hz * (double)i / rate;
+    const double w = 2 * kPi * hz * (double)i / rate;
     const double fit = a * sin(w) + b * cos(w);
     sig += fit * fit;
     noise += (x[i] - fit) * (x[i] - fit);
@@ -121,8 +123,8 @@ struct Room
       for (int i = 0; i < BLOCK; i ++)
       {
         in[0][(size_t)i] = in[1][(size_t)i] = (float)(amp * sin(phase));
-        phase += 2 * M_PI * hz / RATE;
-        if (phase > 2 * M_PI) phase -= 2 * M_PI;
+        phase += 2 * kPi * hz / RATE;
+        if (phase > 2 * kPi) phase -= 2 * kPi;
       }
       float *ins[2] = { in[0].data(), in[1].data() };
       float *ho[2] = { hostOut[0].data(), hostOut[1].data() };
