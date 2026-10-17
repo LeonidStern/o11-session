@@ -195,6 +195,12 @@ implemented as written and no longer listed as a choice.
   lowest value leads. Votes expire after `VotingTimeout` seconds and are
   dropped on disconnect. The "Voting not enabled" check runs before the
   privilege check (order not given by the spec).
+- A vote that passes those checks is shown to the room (revision 2c): everyone,
+  the voter included, first gets `MSG <voter> <text>` with the command text as
+  the client sent it, white space trimmed at both ends (`!Vote BPM 100 ` gives
+  `!Vote BPM 100`), then the `leading candidate` or `setting` line. A refused
+  vote is answered to the sender only and shown to nobody. A hidden voter is
+  shown by name, as their chat is.
 - `/topic` with text needs the topic privilege and is broadcast as
   `TOPIC <user> <text>`; without text the sender gets `TOPIC "" <topic>`.
   `/kick name` matches exactly, `/kick name*` kicks every prefix match; each

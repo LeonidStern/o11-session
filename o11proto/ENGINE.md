@@ -1,6 +1,6 @@
 # NINJAM client engine specification
 
-Revision 2, 2026-10-17. Companion to `PROTOCOL.md` (revision 2b), which this
+Revision 2a, 2026-10-17. Companion to `PROTOCOL.md` (revision 2c), which this
 document builds on and never repeats: wire formats, message types, login,
 codec negotiation and chat are defined there, by section number.
 
@@ -440,7 +440,8 @@ spelling).
 
 Per user the application can read and set: volume (default 1.0), pan (0.0),
 mute (false). Per channel: subscribed, volume (default **0.25**), pan (0.0),
-mute, solo, output pair, flags, name, and the peak meter. Setting
+mute, solo, output pair, flags, name, the peak and level meters (section 8.6)
+and the dropout count (section 8.7). Setting
 `subscribed` sends CLIENT_SET_USERMASK with the updated mask; unsubscribing
 also discards the channel's playing and queued intervals.
 
@@ -467,13 +468,17 @@ When the download has grown past the **prebuffer** of 8192 bytes, or the WRITE
 has the end flag, the download becomes **playable** (once): a decoder for its
 fourcc is created on its buffer, primed (decode until it has produced at
 least one frame of output or the data so far is exhausted), and the result is
-put in the channel's interval queue. The buffer keeps receiving later WRITEs
+put in the channel's interval queue. When there is no decoder for the fourcc
+(a codec this engine doesn't play, such as Vorbis), an **undecodable** entry
+goes in the queue in its place: it plays as silence and counts as a dropout
+(section 8.7). The buffer keeps receiving later WRITEs
 while the decoder reads from it, so decoding streams; the end flag just marks
 that no more will come. A download with the end flag is forgotten after this
 (its buffer lives on with the decoder).
 
 The **interval queue** of a channel holds at most **two** entries: slot 0 and
-slot 1, each a decoded-interval-in-progress or a silent interval. A new entry
+slot 1, each a decoded-interval-in-progress, a silent interval or an
+undecodable one. A new entry
 goes into slot 0 if empty, else into slot 1, **replacing** whatever was there.
 Section 8.2 says how the queue advances.
 
@@ -525,7 +530,8 @@ user whose flags have neither `0x02` nor `0x04`:
 3. if the channel is subscribed and present, slot 0 of the queue becomes the
    current interval, else slot 0 is discarded;
 4. slot 1 moves to slot 0; slot 1 is cleared;
-5. reset the channel's drop count (section 8.3);
+5. reset the channel's drop count (section 8.5), and count a dropout when
+   the channel is late or the new interval is undecodable (section 8.7);
 6. if there is a new current interval with a decoder, apply the **fade-in**
    (section 8.3).
 
@@ -577,17 +583,21 @@ For each remote channel that is present, with its current interval:
 - decode until `available() > needed`, or the stream is exhausted;
 - if the channel has a **drop count** (section 8.2, below): skip that many
   frames first (as many as are available), reducing the count;
-- if `available() ≥ needed`: unless muted or volume < 10⁻⁷, clip the source
-  samples to -1..1 in place, update the peak meter from them, and add them to
-  the output pair with the pan law of section 5.4, resampling by linear
-  interpolation when the rates differ (an implementation may use a better
-  resampler; the reference uses linear). A mono source goes to both outputs;
-  a stereo source into a mono output is summed at half volume. Each output
-  sample is clipped to -1..1 before being added. Then skip `needed` frames.
+- if `available() ≥ needed`: unless volume < 10⁻⁷, clip the source samples
+  to -1..1 in place and work out the output samples: the output pair with
+  the pan law of section 5.4, resampling by linear interpolation when the
+  rates differ (an implementation may use a better resampler; the reference
+  uses linear). A mono source goes to both outputs; a stereo source into a
+  mono output is summed at half volume. Each output sample is clipped to
+  -1..1. Update the level meter (section 8.6) from them; unless muted, also
+  update the peak meter and add them to the output pair. Then skip `needed`
+  frames.
 - else (the stream is late or short): skip everything available and add the
   shortfall `needed - available()` to the channel's drop count, so that when
   the data arrives the stream catches up by dropping those frames instead of
-  playing late. Output nothing for this piece.
+  playing late. Output nothing for this piece. This may be a dropout (section
+  8.7). The drop count is the frames the stream owes, not a count of
+  dropouts.
 
 Then the **master** volume, pan and mute (defaults 1.0, 0.0, false; the same
 pan law) are applied to output channels 0 and 1 only, and the output peak
@@ -601,6 +611,50 @@ decaying by a factor of `0.015625^(len / sampleRate)` per piece of `len`
 frames (-36 dB per second). Remote channel meters measure after volume (the
 reference stores the peak × volume). They are readable from any thread as
 plain floats.
+
+Each remote channel has a second meter, its **level** (`channelLevel(user,
+ch, side)`): the same measurement as its peak meter (after volume and pan,
+with the same decay), but taken whether or not the channel is heard, so it
+goes on showing what the channel plays while the channel is muted, its user
+is muted or another channel is soloed. While the channel is heard the two
+are equal. (The reference has only the peak meter.)
+
+### 8.7 Dropouts
+
+Each remote channel counts its **dropouts**: the intervals, or parts of
+intervals, it couldn't play in full on time. `channelDropouts(user, ch)`
+returns the count, readable from any thread. It is 0 when the channel
+appears (a USERINFO record makes it present when it was not) and grows by at
+most one per interval of the engine's clock, in three cases:
+
+- **Late or missing:** at an interval boundary the channel is subscribed and
+  present, slot 0 of its queue is empty, and the channel is **expecting**
+  audio: its last current interval was audio (a decoder or an undecodable
+  one). The next interval had not arrived, or not become playable (section
+  7.3), when it should have started; it plays one interval later if it comes
+  at all. The channel goes on expecting across such boundaries, so each
+  interval missed counts. It stops expecting when a silent interval (zero
+  GUID) becomes current and when its intervals are discarded (section 7.1);
+  a channel that has sent nothing yet expects nothing.
+- **Undecodable:** an undecodable interval (section 7.3) becomes current.
+- **Ran out:** a piece of the current interval finds fewer frames than it
+  needs (section 8.5): the data is late, the stream stopped (the sender left,
+  the download timed out) or is bad from some point on (section 8.1), or it
+  ended before the interval did. A stream that has all arrived and been
+  decoded is not counted when it ends within **64** source frames of the end
+  of the interval (the two sides' interval lengths differ by a few frames of
+  rounding when their sample rates differ), nor when the piece lies past the
+  interval's usual length (an interval made longer with `setIntervalEnd`,
+  section 4.5). A stream that runs dry and catches up several times in one
+  interval is one dropout. A change to a slower tempo makes the last stream
+  at the old tempo end early in the first interval at the new one: that is a
+  dropout, the gap is heard.
+
+Not dropouts: a silent interval, an unsubscribed channel, a voice or session
+channel, an interval replaced in slot 1 of a full queue (section 7.3: the
+listener's own audio context stalled, which is not the channel's doing), and
+the part of an interval that the boundary cuts off (a tempo change, or
+`setIntervalEnd` making an interval shorter).
 
 ## 9. Metronome
 
@@ -621,7 +675,9 @@ device without a user interface needs it.)
 room commands (`!vote`, `!codec`, `!bitrate`, `/topic`, …) are plain text the
 application puts in a `MSG` or `ADMIN` as the protocol describes; the engine
 treats none of them specially. Received messages go to the chat callback
-(section 3.6) except `SESSION`, which is dropped.
+(section 3.6) except `SESSION`, which is dropped. A `!vote` that counts comes
+back to everyone as the voter's own `MSG`, before the `[voting system]` line
+(protocol 9.4), and reaches the callback like any other chat.
 
 ## 11. Queries
 
@@ -636,7 +692,9 @@ numbers from any thread):
 - codecs: `codecMask()`, `roomOpusKbps()`, `uploadCodec()`, `uploadKbps(i)`;
 - remote: `numUsers()`, user name/volume/pan/mute by index, channel
   enumeration (`channelAt(user, i)` returns the i-th present channel's index
-  or -1), channel name/subscribed/volume/pan/mute/solo/outChannel/flags, peaks;
+  or -1), channel name/subscribed/volume/pan/mute/solo/outChannel/flags, peaks,
+  levels (`channelLevel`, section 8.6), dropouts (`channelDropouts`, section
+  8.7);
 - local: channel list, each field of section 5.1, peaks;
 - `anySolo()`, master peaks.
 
@@ -664,6 +722,7 @@ numbers from any thread):
 | default remote channel volume | 0.25 |
 | default metronome volume | 0.5 |
 | drop limit for a FLAC gap | 5 s |
+| dropout slack at the end of a whole stream | 64 source frames |
 
 ## 13. Acceptance tests
 
@@ -703,6 +762,24 @@ A conforming implementation passes:
    left 0.5, right 1.0.
 9. A stream at 48000 played at 44100 keeps time: over 10 s of output the
    consumed source frame count is 480000 ± 100.
+
+**Meters and dropouts (end to end: one engine fed by a protocol client that
+uploads FLAC intervals of a 997 Hz tone at 0.5 when the test says, 1 s
+intervals, simulated clock)**
+15. With the remote channel at volume 1.0: while it is heard, the level
+    equals the peak (both 0.45..0.55); with the channel muted, its user
+    muted, or another channel soloed, the output is 0, the peak falls below
+    0.01 within 1 s and the level stays within 0.45..0.55; at volume 0.5 and
+    pan -1 the level is 0.22..0.28 left and below 0.01 right, muted or not.
+16. Intervals that arrive on time count no dropout, also one that is 3 frames
+    short; one that arrives after the boundary it should have started at
+    counts 1; two missing intervals count 2; one holding half an interval of
+    audio counts 1; one whose data stops after 9000 bytes and comes later
+    in the interval counts 1, and the audio is back before the interval
+    ends; an undecodable (Vorbis) one counts 1; a zero-GUID BEGIN and the
+    silence after it, and intervals while unsubscribed, count 0; the count
+    is per channel and starts again at 0 when a channel goes and comes
+    back. In tests 10-13 every listener counts 0.
 
 **Against servers (end to end, needs `o11server` from this repository and may
 also be run against the reference server)**
@@ -758,6 +835,11 @@ also be run against the reference server)**
   prefix, fourcc `OPUr` (6.4, 8.1); libogg is no longer a dependency; test
   13.14 is FLAC only. Decided because the new plug-in does not need to
   interoperate with Ogg-based NINJAM clients.
+- **2a** (2026-10-17): a level meter per remote channel that keeps measuring
+  while the channel is muted or soloed away (8.5, 8.6), dropout counts per
+  remote channel (8.7) and the undecodable queue entry they need (7.3),
+  tests 13.15 and 13.16; a counted `!vote` is echoed to the room (protocol
+  revision 2c, section 10 here).
 - **1a** (2026-10-17): clarifications after the first implementation: exact
   boundary semantics (4.4), exact resampler positions and undithered exact
   values (6.4), playback phase reset (8.5), tests 13.3, 13.10 and 13.13

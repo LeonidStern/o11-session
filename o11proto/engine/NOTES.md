@@ -20,7 +20,9 @@ specification leaves room, the choice is listed here.
   check and the `OPUr` byte-at-a-time / truncated-stream checks of 8.1), `engine/tests/test_engine_clock.cpp` (13.5-13.9),
   `engine/tests/test_engine_e2e.cpp` (13.10-13.13, two engines against the
   in-process `Server` with a simulated audio clock, plus duplex rooms where
-  both engines send and listen with offset interval clocks, FLAC and Opus).
+  both engines send and listen with offset interval clocks, FLAC and Opus;
+  13.15-13.16, one engine fed by a plain o11proto client that uploads FLAC
+  intervals on cue, for the level meter and the dropout count).
 - `tools/o11jam.cpp`: the command-line client of section 14.
 - CMake option `O11PROTO_BUILD_ENGINE` (default ON) finds opus and flac with
   pkg-config; OFF builds only the protocol library.
@@ -180,7 +182,42 @@ specification leaves room, the choice is listed here.
   The phase is reset at each boundary (the new stream starts at its frame 0).
 - A late or short stream: skip what is available, add the shortfall to the
   drop count, output nothing for the piece; the drop count is reset at the
-  boundary.
+  boundary. `RemoteChannel::drop_count` is that shortfall in source frames
+  (what the stream owes and skips once the data is there, to stay in time),
+  not a count of dropouts.
+- Level meter (8.6, `channelLevel`): `RemoteChannel::level[2]`, atomics next
+  to `peak[2]`, decayed together. The mixing loop runs for every channel with
+  a decoder and volume >= 1e-7, muted or not; it always raises the level and
+  only writes the output and raises the peak when the channel is heard, so
+  while it is heard the two hold identical values.
+- Dropouts (8.7, `channelDropouts`): `RemoteChannel::dropouts` is an atomic
+  `long`, written in the audio context (and reset to 0 by the control
+  context when the channel appears), both under `remote_mutex_`; queries
+  take the mutex only to find the user, like the peaks. Per channel,
+  `audio_expected` is set when an audio or undecodable interval becomes
+  current and cleared by a silent one or `discardChannelIntervals`;
+  `dropped` limits the count to one per interval. A download with no decoder
+  (`makeDecoder` returns null: Vorbis, Ogg Opus) used to be left out of the
+  queue; it now takes its slot as an undecodable entry, which plays nothing
+  as before and counts once when it becomes current.
+- A stream that ran out counts unless it has `finished()` (all arrived and
+  decoded) and ends at most `kDropoutSlackFrames` (64) source frames before
+  the end of the interval, or the piece starts past the usual length. The
+  slack is for rounding between two sides' interval lengths: an Opus stream
+  from a 44.1 kHz sender is `floor(trunc(T x 44100) x 48000 / 44100)` frames
+  and can be one short of a 48 kHz listener's `trunc(T x 48000)` (110 BPM /
+  16 BPI, for example), from an 8000 Hz sender up to six. 8.5 then plays
+  nothing in that last piece of the interval; that behaviour is unchanged
+  here, only not counted. FLAC streams can't come up short this way (the
+  listener consumes `floor(len x src / dst)` frames, never more than the
+  sender's count).
+- Left out of the count on purpose: intervals replaced in slot 1 of a full
+  queue (the listener's own audio stalled: every channel would count the
+  same, and the count is meant to tell which player's audio is not coming
+  through) and audio cut off by a boundary. Counted although nobody's network
+  is at fault: the first interval after a change to a slower tempo, and,
+  in a room whose mask fell to Vorbis, every interval (another engine sends
+  nothing, a legacy client sends Vorbis); both are gaps the listener hears.
 - The fade-out is the previous decoder's lapping frames followed by what it
   still has available, up to 128 frames; for FLAC that is empty when the
   stream was exactly the interval long. The fade-in is applied in place to
@@ -228,6 +265,9 @@ specification leaves room, the choice is listed here.
   per-sample loop); the master stage leaves the samples alone at unity gain
   and only meters them; decoders write straight into their output buffer
   (`reserveOutput`), the Opus decoder in runs rather than frame by frame.
+- A muted (or soloed-away) remote channel still goes through the resampling
+  and gain loop, without writing the output, so that its level meter stays
+  live (8.6); before, a muted channel only had its frames skipped.
 - Of what remains, libopus (complexity 10, as 6.4 says) is about 85 % of a
   `o11jam --two` Opus run; the engine's own mixing, meters and buffer clearing
   are a few percent. A FLAC run shows more system time than an Opus run with

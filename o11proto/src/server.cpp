@@ -868,7 +868,7 @@ void Server::handleBangCommand(Conn& c, const std::string& text) {
     } else if (word == "!vote") {
         std::string setting, value;
         splitFirst(rest, setting, value);
-        handleVote(c, lower(setting), value);
+        handleVote(c, lower(setting), value, text);
     } else if (word == "!codec") {
         // Texts from section 8.5; all are MSG lines with an empty username.
         std::string want = lower(trim(rest));
@@ -934,8 +934,9 @@ void Server::handleBangCommand(Conn& c, const std::string& text) {
     }
 }
 
-void Server::handleVote(Conn& c, const std::string& setting, const std::string& value) {
-    // Texts from section 9.4; these three go to the sender only.
+void Server::handleVote(Conn& c, const std::string& setting, const std::string& value, const std::string& text) {
+    // Texts from section 9.4; these three go to the sender only, and a refused
+    // vote is not shown to the room.
     if (cfg_.vote_threshold_percent > 100) {
         sendServerMsg(c, "[voting system] Voting not enabled");
         return;
@@ -952,6 +953,9 @@ void Server::handleVote(Conn& c, const std::string& setting, const std::string& 
         sendServerMsg(c, "[voting system] !vote requires <bpm|bpi> <value> parameters");
         return;
     }
+    // A vote that counts is shown to everyone (the voter included) as the
+    // voter's own chat line, before the [voting system] line it produces.
+    broadcastChat(ChatMessage("MSG", c.name, trim(text)));
     TimePoint now = Clock::now();
     auto& votes = votes_[setting];
     votes[c.id] = Vote{static_cast<int>(n), now};

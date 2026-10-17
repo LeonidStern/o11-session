@@ -1,4 +1,5 @@
-// ENGINE.md 13.10-13.13: two engines against o11server, simulated clock.
+// ENGINE.md 13.10-13.13: two engines against o11server, simulated clock;
+// and the level meters and dropout counts of 8.6 and 8.7.
 #include <cmath>
 #include <vector>
 
@@ -137,6 +138,143 @@ struct Room {
     }
 };
 
+
+// A listener engine fed by a plain o11proto client that uploads FLAC
+// intervals of a tone exactly when a test says so, so the test decides what
+// arrives when against the listener's simulated audio clock. The room runs
+// 1 s intervals (120 BPM, 2 BPI); the sender has channels 0 "tone" and 1 "two".
+struct Feed {
+    static constexpr int kLen = 48000;          // one interval at 48 kHz
+    static constexpr int kQuarter = kLen / 4;
+    Server server;
+    Client sender;
+    Engine listener;
+    std::unique_ptr<Encoder> enc;
+    const int rate = 48000, block = 480;
+    double hz = 997.0, amp = 0.5, phase = 0;
+    int sender_topics = 0, listener_topics = 0;
+    int sent_for = 0;                           // stream(): the last listener interval fed
+    float heard_peak = 0;                       // largest output sample since the test reset it
+    std::vector<float> l, r;
+
+    Feed() {
+        ServerConfig cfg;
+        cfg.port = 0;
+        cfg.allow_anonymous = true;
+        cfg.allow_codecs = kCapOpus | kCapFlac;
+        cfg.bpm = 120;
+        cfg.bpi = 2;
+        CHECK(server.start(cfg));
+        listener.setMetronome(0, 0, true, 0);
+        listener.onChat = [this](const std::array<std::string, 5>& f) {
+            if (f[0] == "TOPIC") ++listener_topics;
+        };
+        sender.on_chat = [this](const ChatMessage& m) {
+            if (m.fields[0] == "TOPIC") ++sender_topics;
+        };
+        enc = makeEncoder(kFourccFlac, rate, 1, 0);
+        l.assign(static_cast<std::size_t>(block), 0.0f);
+        r = l;
+    }
+    bool pumpUntil(const std::function<bool()>& pred) {
+        TimePoint deadline = Clock::now() + std::chrono::seconds(5);
+        while (!pred()) {
+            if (Clock::now() > deadline) return false;
+            server.poll(1);
+            sender.poll(0);
+            listener.run();
+        }
+        return true;
+    }
+    // Returns once the listener has handled everything the sender sent: the
+    // server answers the sender's !topic after what the sender sent before
+    // it, and the listener's !topic after what it forwarded to the listener.
+    bool sync() {
+        int s = sender_topics, t = listener_topics;
+        sender.say("!topic");
+        if (!pumpUntil([&] { return sender_topics > s; })) return false;
+        listener.say("!topic");
+        return pumpUntil([&] { return listener_topics > t; });
+    }
+    bool connect() {
+        ChannelInfoRecord a, b;
+        a.name = "tone";
+        b.name = "two";
+        sender.setChannels({a, b});
+        Client::Options o;
+        o.username = "anonymous:feed";
+        o.codec_caps = kCapOpus | kCapFlac;
+        if (!sender.connect("127.0.0.1", server.port(), o)) return false;
+        listener.connect("127.0.0.1", server.port(), "anonymous:ear", "");
+        if (!pumpUntil([&] {
+                return sender.loggedIn() && listener.status() == Status::Ok && listener.serverBpi() > 0 &&
+                       listener.numUsers() == 1 && listener.channelSubscribed(0, 0) && listener.channelSubscribed(0, 1);
+            }))
+            return false;
+        listener.setChannelVolume(0, 0, 1.0f);
+        listener.setChannelVolume(0, 1, 1.0f);
+        return sync();                          // the subscription has reached the server
+    }
+    int pos() const {
+        int p = 0, n = 0;
+        listener.position(&p, &n);
+        return p;
+    }
+    bool before(int loop, int at) const {
+        return listener.loopCount() < loop || (listener.loopCount() == loop && pos() < at);
+    }
+    void playBlock() {
+        float* out[2] = {l.data(), r.data()};
+        listener.process(nullptr, 0, out, 2, block, rate);
+        for (int i = 0; i < block; ++i)
+            heard_peak = std::max(heard_peak, std::max(std::fabs(l[static_cast<std::size_t>(i)]), std::fabs(r[static_cast<std::size_t>(i)])));
+        server.poll(0);
+        sender.poll(0);
+        listener.run();
+    }
+    // Plays the listener's clock up to `at` frames into interval `loop`.
+    void playTo(int loop, int at) {
+        while (before(loop, at)) playBlock();
+    }
+    // The same, uploading a whole interval of the tone a quarter into each
+    // listener interval on the way, so each plays in the next.
+    void stream(int loop, int at) {
+        while (before(loop, at)) {
+            if (listener.loopCount() > sent_for && pos() >= kQuarter) {
+                sendWhole();
+                CHECK(sync());
+                sent_for = listener.loopCount();
+            }
+            playBlock();
+        }
+    }
+    // The next `frames` of the tone as one FLAC stream.
+    std::vector<std::uint8_t> flac(int frames) {
+        std::vector<float> pcm(static_cast<std::size_t>(frames));
+        for (auto& v : pcm) {
+            v = static_cast<float>(amp * std::sin(phase));
+            phase += 2 * M_PI * hz / rate;
+        }
+        enc->begin();
+        enc->encode(pcm.data(), frames);
+        enc->finish();
+        std::vector<std::uint8_t> out(enc->outputData(), enc->outputData() + enc->outputSize());
+        enc->consume(enc->outputSize());
+        return out;
+    }
+    // Uploads the first `upto` bytes of an interval, with the end flag when that is all of it.
+    Guid send(std::uint8_t channel, std::uint32_t fourcc, const std::vector<std::uint8_t>& bytes, std::size_t upto) {
+        Guid g = sender.beginInterval(channel, fourcc);
+        sender.writeInterval(g, bytes.data(), upto, upto == bytes.size());
+        return g;
+    }
+    void sendWhole() {
+        std::vector<std::uint8_t> b = flac(kLen);
+        send(0, kFourccFlac, b, b.size());
+    }
+    long dropouts(int ch = 0) const { return listener.channelDropouts(0, ch); }
+};
+
 }  // namespace
 
 TEST(two_engines_opus_then_flac_48k) {           // 13.10
@@ -156,6 +294,8 @@ TEST(two_engines_opus_then_flac_48k) {           // 13.10
     CHECK(snr >= 35.0);
     CHECK(peak >= 0.45f && peak <= 0.55f);
     CHECK(room.listener.channelPeak(0, 0, 0) > 0.3f);
+    CHECK_EQ(room.listener.channelLevel(0, 0, 0), room.listener.channelPeak(0, 0, 0));
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);
 
     room.sender.say("!codec flac");
     // The interval already begun stays Opus and reaches the listener one
@@ -167,6 +307,7 @@ TEST(two_engines_opus_then_flac_48k) {           // 13.10
     std::printf("  flac 48k: snr %.1f dB, peak %.3f\n", snr, peak);
     CHECK(snr >= 60.0);
     CHECK(peak >= 0.45f && peak <= 0.55f);
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);
 }
 
 TEST(two_engines_opus_44k1) {                    // 13.11
@@ -179,6 +320,7 @@ TEST(two_engines_opus_44k1) {                    // 13.11
     std::printf("  opus 44.1k: snr %.1f dB, peak %.3f\n", snr, peak);
     CHECK(snr >= 30.0);
     CHECK(peak >= 0.45f && peak <= 0.55f);
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);
 }
 
 TEST(transmit_off_and_on) {                      // 13.12
@@ -236,6 +378,7 @@ TEST(transmit_off_and_on) {                      // 13.12
     room.lastTwo(&snr, &peak);
     std::printf("  after resume: snr %.1f dB, peak %.3f\n", snr, peak);
     CHECK(snr >= 35.0);
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);   // the silence BEGIN is no dropout
     observer.disconnect();
 }
 
@@ -285,6 +428,9 @@ TEST(stalled_listener_plays_newest) {            // 13.13
     CHECK(second >= newest - 1);
     CHECK(third > newest);
     CHECK(first != second);
+    // The intervals replaced in the queue during the stall are the listener's
+    // own loss, not the channel's: no dropouts.
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);
 }
 
 // Two engines that each send a tone and listen to the other, with the second
@@ -372,6 +518,7 @@ static void duplexRoom(std::uint32_t codec, int rate, double offset, double min_
                     codec == kCapFlac ? "flac" : "opus", offset, k, snr, peak);
         CHECK(snr >= min_snr);
         CHECK(peak >= 0.45f && peak <= 0.55f);
+        CHECK_EQ(e[k].channelDropouts(0, 0), 0);
     }
 }
 
@@ -382,6 +529,174 @@ TEST(duplex_flac_offset_clocks) {
 
 TEST(duplex_opus_offset_clocks) {
     duplexRoom(kCapOpus, 48000, 1.0, 35.0);
+}
+
+TEST(level_while_muted) {                        // 8.6
+    Feed f;
+    REQUIRE(f.connect());
+    f.stream(2, 40000);                          // the tone plays from L2 on
+    float peak = f.listener.channelPeak(0, 0, 0);
+    std::printf("  heard: peak %.3f, level %.3f\n", peak, f.listener.channelLevel(0, 0, 0));
+    CHECK(peak > 0.45f && peak < 0.55f);
+    CHECK(f.heard_peak > 0.45f);
+    for (int side = 0; side < 2; ++side)           // the same measurement while heard
+        CHECK_EQ(f.listener.channelLevel(0, 0, side), f.listener.channelPeak(0, 0, side));
+    // Channel muted, user muted, another channel soloed: nothing is heard and
+    // the peak falls away, but the level stays at the tone's.
+    auto silenced = [&](const char* what, int loop) {
+        f.heard_peak = 0;
+        f.stream(loop, 40000);                   // 1 s silenced
+        float pk = f.listener.channelPeak(0, 0, 0);
+        float lv0 = f.listener.channelLevel(0, 0, 0), lv1 = f.listener.channelLevel(0, 0, 1);
+        std::printf("  %s: peak %.4f, level %.3f %.3f\n", what, pk, lv0, lv1);
+        CHECK_EQ(f.heard_peak, 0.0f);
+        CHECK(pk < 0.01f);
+        CHECK(lv0 > 0.45f && lv0 < 0.55f);
+        CHECK(lv1 > 0.45f && lv1 < 0.55f);
+    };
+    f.listener.setChannelMute(0, 0, true);
+    silenced("channel muted", 3);
+    f.listener.setChannelMute(0, 0, false);
+    f.listener.setUserMute(0, true);
+    silenced("user muted", 4);
+    f.listener.setUserMute(0, false);
+    f.listener.setChannelSolo(0, 1, true);
+    CHECK(f.listener.anySolo());
+    silenced("other channel soloed", 5);
+    f.listener.setChannelSolo(0, 1, false);
+    // Heard again, at half volume and panned hard left, muted or not: volume
+    // and pan count in the level as in the peak.
+    f.listener.setChannelVolume(0, 0, 0.5f);
+    f.listener.setChannelPan(0, 0, -1.0f);
+    f.stream(7, 40000);
+    float lv0 = f.listener.channelLevel(0, 0, 0), lv1 = f.listener.channelLevel(0, 0, 1);
+    CHECK(lv0 > 0.22f && lv0 < 0.28f);
+    CHECK(lv1 < 0.01f);
+    CHECK_EQ(lv0, f.listener.channelPeak(0, 0, 0));
+    f.listener.setChannelMute(0, 0, true);
+    f.stream(8, 40000);
+    lv0 = f.listener.channelLevel(0, 0, 0);
+    lv1 = f.listener.channelLevel(0, 0, 1);
+    std::printf("  half volume, hard left, muted: peak %.4f, level %.3f %.4f\n", f.listener.channelPeak(0, 0, 0), lv0, lv1);
+    CHECK(lv0 > 0.22f && lv0 < 0.28f);
+    CHECK(lv1 < 0.01f);
+    CHECK(f.listener.channelPeak(0, 0, 0) < 0.01f);
+    CHECK_EQ(f.dropouts(), 0);
+}
+
+TEST(dropouts_per_channel) {                     // 8.7
+    Feed f;
+    REQUIRE(f.connect());
+    const int q = Feed::kQuarter, len = Feed::kLen;
+    CHECK_EQ(f.dropouts(), 0);
+    // Normal playback: an interval arriving during listener interval j plays
+    // whole in j+1 (L2-L4 here). The one for L4 is 3 frames short, as the
+    // rounding between two sample rates can make it: no dropout either.
+    f.stream(3, q);
+    std::vector<std::uint8_t> nearly = f.flac(len - 3);
+    f.send(0, kFourccFlac, nearly, nearly.size());
+    CHECK(f.sync());
+    f.playTo(4, len);
+    CHECK(f.heard_peak > 0.45f && f.heard_peak < 0.55f);
+    CHECK_EQ(f.dropouts(), 0);
+
+    // Late: nothing arrived during L4, so L5 starts with nothing; the interval
+    // comes during L5 and plays in L6.
+    f.playTo(5, q);
+    CHECK_EQ(f.dropouts(), 1);
+    f.sendWhole();
+    CHECK(f.sync());
+    f.heard_peak = 0;
+    f.playTo(6, len);
+    CHECK(f.heard_peak > 0.45f);
+    CHECK_EQ(f.dropouts(), 1);
+
+    // Missing: nothing during L6 and L7, so L7 and L8 each start with nothing.
+    f.playTo(8, q);
+    CHECK_EQ(f.dropouts(), 3);
+    f.sendWhole();
+    CHECK(f.sync());
+
+    // Ran out: the interval for L10 holds half an interval of audio.
+    f.playTo(9, q);
+    std::vector<std::uint8_t> half = f.flac(len / 2);
+    f.send(0, kFourccFlac, half, half.size());
+    CHECK(f.sync());
+    f.playTo(10, len / 2 - 2000);
+    CHECK_EQ(f.dropouts(), 3);
+    f.playTo(10, q * 3);
+    CHECK_EQ(f.dropouts(), 4);
+
+    // Late data: the interval for L12 stops after its first 9000 bytes (enough
+    // to start playing) and the rest comes late in L12. The stream runs dry
+    // over many pieces and catches up once the rest is there: one dropout.
+    f.sent_for = 9;
+    f.stream(11, q);                             // the interval for L11 goes out on time
+    std::vector<std::uint8_t> part = f.flac(len);
+    std::printf("  one interval of the tone is %zu bytes of FLAC\n", part.size());
+    CHECK(part.size() > 9000 * 2);
+    Guid g = f.send(0, kFourccFlac, part, 9000);
+    CHECK(f.sync());
+    f.playTo(12, len * 5 / 8);
+    CHECK_EQ(f.dropouts(), 5);
+    f.sender.writeInterval(g, part.data() + 9000, part.size() - 9000, true);
+    f.sendWhole();                               // and the interval for L13, on time
+    CHECK(f.sync());
+    f.heard_peak = 0;
+    f.playTo(12, len * 7 / 8);
+    CHECK(f.heard_peak > 0.45f);                 // caught up within the interval
+    f.playTo(13, len);
+    CHECK_EQ(f.dropouts(), 5);
+
+    // Can't be decoded: a Vorbis interval (no decoder in this engine) for L14.
+    std::vector<std::uint8_t> junk(10000, 0x5a);
+    f.send(0, kFourccVorbis, junk, junk.size());
+    CHECK(f.sync());
+    f.playTo(14, q);
+    CHECK_EQ(f.dropouts(), 6);
+
+    // A deliberate silent interval is no dropout, and nothing is due after it.
+    f.sender.sendSilence(0);
+    CHECK(f.sync());
+    f.playTo(17, len);
+    CHECK_EQ(f.dropouts(), 6);
+
+    // Unsubscribed, nothing plays and nothing counts; subscribed again,
+    // nothing is due until audio comes.
+    f.sent_for = 17;
+    f.stream(19, q);                             // audio again in L19
+    f.listener.setChannelSubscribed(0, 0, false);
+    CHECK(f.sync());
+    f.playTo(20, q);
+    f.sendWhole();                               // not forwarded to an unsubscribed listener
+    CHECK(f.sync());
+    f.playTo(21, q);
+    f.listener.setChannelSubscribed(0, 0, true);
+    CHECK(f.sync());
+    f.playTo(23, len);
+    CHECK_EQ(f.dropouts(), 6);
+
+    // Per channel, counted from the channel's appearance: channel 1 never
+    // sent anything; one undecodable interval counts there only, and the
+    // count starts again when the channel goes and comes back.
+    CHECK_EQ(f.dropouts(1), 0);
+    f.send(1, kFourccVorbis, junk, junk.size());
+    CHECK(f.sync());
+    f.playTo(24, q);
+    CHECK_EQ(f.dropouts(1), 1);
+    CHECK_EQ(f.dropouts(0), 6);
+    ChannelInfoRecord a, b;
+    a.name = "tone";
+    b.name = "two";
+    f.sender.setChannels({a});
+    CHECK(f.sync());
+    CHECK_EQ(f.listener.channelAt(0, 1), -1);
+    f.sender.setChannels({a, b});
+    CHECK(f.sync());
+    CHECK_EQ(f.listener.channelAt(0, 1), 1);
+    CHECK_EQ(f.dropouts(1), 0);
+    CHECK_EQ(f.dropouts(0), 6);
+    std::printf("  dropouts: channel 0 %ld, channel 1 %ld\n", f.dropouts(0), f.dropouts(1));
 }
 
 TEST_MAIN()

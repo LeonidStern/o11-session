@@ -31,6 +31,7 @@ constexpr int kPrebufferBytes = 8192;
 constexpr int kFirstWriteThreshold = 8192;
 constexpr int kLaterWriteThreshold = 2048;
 constexpr int kCrossfadeFrames = 128;
+constexpr int kDropoutSlackFrames = 64;          // a whole stream this close to the interval's end is no dropout (8.7)
 
 // Settings of a local channel (ENGINE.md 5.1).
 struct LocalChannel {
@@ -143,7 +144,9 @@ public:
     bool channelSolo(int user, int ch) const;
     int channelOutChannel(int user, int ch) const;
     int channelFlags(int user, int ch) const;
-    float channelPeak(int user, int ch, int side) const;
+    float channelPeak(int user, int ch, int side) const;     // what is heard (8.6)
+    float channelLevel(int user, int ch, int side) const;    // the same, also while muted or soloed away (8.6)
+    long channelDropouts(int user, int ch) const;            // intervals not played in full on time (8.7)
     void setChannelSubscribed(int user, int ch, bool v);
     void setChannelVolume(int user, int ch, float v);
     void setChannelPan(int user, int ch, float v);
@@ -194,6 +197,7 @@ private:
     struct Slot {
         bool used = false;
         bool silent = false;
+        bool failed = false;                    // a download no decoder could be made for (8.7)
         std::unique_ptr<Decoder> dec;
     };
     struct RemoteChannel {
@@ -208,11 +212,15 @@ private:
         int outChannel = 0;
         bool has_pair = false;
         std::atomic<float> peak[2]{{0.0f}, {0.0f}};
+        std::atomic<float> level[2]{{0.0f}, {0.0f}};    // peak as if not muted
+        std::atomic<long> dropouts{0};          // since the channel appeared
         // playback (audio context)
         bool has_current = false;
         std::unique_ptr<Decoder> current;       // null while silent
         Slot slots[2];
-        long drop_count = 0;
+        long drop_count = 0;                    // frames a late stream owes, skipped when they arrive (8.5)
+        bool audio_expected = false;            // the last interval was audio, so another is due (8.7)
+        bool dropped = false;                   // a dropout was counted in this interval
         PlaybackResampler rs;
         std::vector<float> fade;                // interleaved fade-out
         int fade_channels = 0;
@@ -266,6 +274,8 @@ private:
     void mixMetronome(float* const* out, int numOut, int len, int sampleRate);
     void applyMaster(float* const* out, int numOut, int len, int sampleRate);
     void outputPair(int outChannel, int offset, int numOut, int* idx, bool* mono) const;
+    bool isDropout(const RemoteChannel& rc, const Decoder& dec, int srcRate, int sampleRate) const;
+    static void countDropout(RemoteChannel& rc);
     static void decayPeak(std::atomic<float>& p, float factor);
     static void raisePeak(std::atomic<float>& p, float v);
 
