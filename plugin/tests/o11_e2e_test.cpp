@@ -256,7 +256,10 @@ int main()
     {
       auto peerTempo = [&]() { return peer.captureAppSessionState().tempo(); };
       for (int i = 0; i < 50 && fabs(peerTempo() - 120.0) > 1e-6; i ++) room.advance(0.2);
+      // then its beat lines up; it is moved in steps of at most 2 ms, so on a slow machine
+      // whose blocks come late it can take a few seconds
       room.advance(1.0);
+      for (int i = 0; i < 50 && field(room.host.command("status"), "linkaligned") != "1"; i ++) room.advance(0.2);
       const std::string st = room.host.command("status");
       printf("  link: %s, the peer at %.3f BPM\n", st.substr(st.find(" link=")).c_str(), peerTempo());
       CHECK(fabs(peerTempo() - 120.0) < 1e-6);
