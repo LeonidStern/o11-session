@@ -11,20 +11,45 @@ namespace engine {
 
 // -------------------------------------------------------- float -> int16
 
-std::int16_t floatToInt16(float v, std::mt19937& rng) {
+namespace {
+
+// The conversion of ENGINE.md 6.4 with the dither drawn by `tpdf()`. It
+// avoids libm calls (floor, lround) in the per-sample path: |x| beyond the
+// range where dither can still change the clipped result is clipped at once,
+// and inside it a float -> int truncation tests for an exact step and rounds
+// half away from zero exactly as std::lround does (x + 0.5 is exact for
+// |x| < 2^22).
+template <class Tpdf>
+inline std::int16_t convert(float v, Tpdf&& tpdf) {
     if (v == 0.0f || std::isnan(v)) return 0;    // digital silence stays exact
     float x = v * 32768.0f;
+    if (x >= 32769.0f) return 32767;             // any dither still clips
+    if (x <= -32770.0f) return -32768;
     // A value that already sits on a 16-bit step is kept as it is, so audio
     // that was quantised before stays bit-exact (ENGINE.md 13.3); anything
     // else gets TPDF dither of 1 LSB.
-    if (x != std::floor(x)) {
-        std::uniform_real_distribution<float> uni(0.0f, 1.0f);
-        x += uni(rng) + uni(rng) - 1.0f;
-    }
-    long r = std::lround(x);
+    if (static_cast<float>(static_cast<int>(x)) != x) x += tpdf();
+    int r = static_cast<int>(x >= 0.0f ? x + 0.5f : x - 0.5f);
     if (r > 32767) r = 32767;
     if (r < -32768) r = -32768;
     return static_cast<std::int16_t>(r);
+}
+
+}  // namespace
+
+std::int16_t floatToInt16(float v, std::mt19937& rng) {
+    return convert(v, [&rng] {
+        std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+        return uni(rng) + uni(rng) - 1.0f;
+    });
+}
+
+std::int16_t floatToInt16(float v, DitherRng& rng) {
+    return convert(v, [&rng] { return rng.tpdf(); });
+}
+
+void floatToInt16(const float* in, std::int32_t* out, std::size_t n, DitherRng& rng) {
+    for (std::size_t i = 0; i < n; ++i) out[i] = convert(in[i], [&rng] { return rng.tpdf(); });
 }
 
 // ------------------------------------------------------------------- LPC

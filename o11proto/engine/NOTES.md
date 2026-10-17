@@ -158,7 +158,11 @@ specification leaves room, the choice is listed here.
 - Float to 16-bit: 0 and NaN give 0; a value that already sits exactly on a
   16-bit step is kept as it is (no dither), so quantised audio round-trips
   bit-exactly (13.3); any other value gets 1 LSB TPDF dither, rounding to
-  nearest, clipping. The dither generator is a per-encoder `std::mt19937`.
+  nearest, clipping. The dither generator is a per-encoder xorshift64*
+  (`DitherRng`, seeded from `std::random_device`): one 64-bit draw gives
+  both uniform values as 24-bit fractions. It replaced `std::mt19937` with
+  two `uniform_real_distribution` draws, which cost more CPU than libFLAC's
+  level-5 encoding itself.
 - Decoder: the read callback returns ABORT when starved; the decoder is then
   `flush()`ed and the input rewound to the last `get_decode_position` (a tell
   callback is supplied), so a truncated frame is retried from its start once
