@@ -1,6 +1,6 @@
 # Router port mapping specification
 
-Revision 1, 2026-10-17. Companion to `PROTOCOL.md`. Describes the small
+Revision 1a, 2026-10-17. Companion to `PROTOCOL.md`. Describes the small
 library a hosted room uses to ask the home router to forward its TCP port, so
 that other players can reach a server behind NAT without the host configuring
 the router by hand. Written from the behaviour of the Jamsa server's port
@@ -46,7 +46,7 @@ other line as "still trying" or a reason.
 | Name | Value |
 |---|---|
 | lease asked for | 3600 s |
-| renewal | at half of the lease the router granted, at least 30 s |
+| renewal | at half of the lease the router granted; at least 30 s when the lease is 60 s or more, else at least 1 s |
 | recheck of a permanent mapping | every 1800 s (routers forget mappings when they reboot) |
 | retry after a failure to find a router | 300 s |
 | UPnP discovery wait | 2000 ms |
@@ -69,7 +69,7 @@ loops until stopped:
    `[portmap] could not find a router that supports UPnP or NAT-PMP. Forward
    TCP port <port> on your router to this machine by hand, or turn on UPnP in
    the router's settings. Will keep trying every 5 minutes.` and wait 300 s.
-4. On success: wait lease/2 (at least 30 s), or 1800 s for a permanent lease.
+4. On success: wait lease/2 (at least 30 s for leases of 60 s or more, at least 1 s for shorter ones, so a short lease is still renewed before it expires), or 1800 s for a permanent lease.
 5. Waiting is interruptible by `stop()`.
 
 When the loop ends, the mapping is removed (section 6) and the thread exits.
@@ -170,4 +170,5 @@ line for anything this document left open.
 
 ## 10. Revision history
 
+- **1a** (2026-10-17): the renewal floor of 30 s applies only to leases of 60 s or more (test 8.6 needs a 10 s lease renewed after 5 s).
 - **1** (2026-10-17): first version.
