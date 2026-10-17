@@ -1,10 +1,11 @@
 # Engine notes
 
-**Ambiguous sentences in ENGINE.md (revision 1):** 13.3 "digital silence of 2 s encodes to under 200 bytes" (not reachable with libFLAC's mandatory VORBIS_COMMENT block and 4096-sample subset blocks: about 400 bytes); 6.4 "any other value is scaled by 32768, gets TPDF dither of 1 LSB" together with 13.3 "a signal already quantised to 16 bits decodes bit-exactly" (dither would move exact values by up to 1 LSB); 13.10 "the tone's peak within 0.45..0.55" together with 7.1 "volume (default **0.25**)" (the listener must raise the channel volume to 1.0 to see that peak); 13.13 "plays the newest intervals, not the stale ones" together with 7.3 "a new entry goes into slot 0 if empty, else into slot 1, replacing whatever was there" (after a stall slot 0 holds the first interval that arrived during it, so one stale interval plays before the newest); 13.2 "the decoded 48 kHz stream has 96000 ± 2 frames" together with 6.4 "the stream of one interval begins exactly where the previous ended" (a frame count that varies by ±1 between intervals moves the join by a sample; this engine makes the count exact); 8.1 "`read(n)` / `skip(n)`" (the decoder here exposes `data()` + `skip(n)` instead of a copying `read`); 4.4 "a boundary falls exactly when `intervalPos == intervalLength`" (taken as: the boundary is processed when the next sample is about to be produced, so after a block that ends exactly at the boundary `position()` still reports `pos == len` and `loopCount()` is unchanged, as 13.6 reads); 8.5 "`phase` is the resampler's fractional position carried from the last piece" (not said whether it survives an interval boundary; reset here).
+**Ambiguous sentences in ENGINE.md (revisions 1 and 2):** 13.3 "digital silence of 2 s encodes to under 200 bytes" (not reachable with libFLAC's mandatory VORBIS_COMMENT block and 4096-sample subset blocks: about 400 bytes); 6.4 "any other value is scaled by 32768, gets TPDF dither of 1 LSB" together with 13.3 "a signal already quantised to 16 bits decodes bit-exactly" (dither would move exact values by up to 1 LSB); 13.10 "the tone's peak within 0.45..0.55" together with 7.1 "volume (default **0.25**)" (the listener must raise the channel volume to 1.0 to see that peak); 13.13 "plays the newest intervals, not the stale ones" together with 7.3 "a new entry goes into slot 0 if empty, else into slot 1, replacing whatever was there" (after a stall slot 0 holds the first interval that arrived during it, so one stale interval plays before the newest); 13.2 "the decoded 48 kHz stream has 96000 ± 2 frames" together with 6.4 "the stream of one interval begins exactly where the previous ended" (a frame count that varies by ±1 between intervals moves the join by a sample; this engine makes the count exact); 8.1 "`read(n)` / `skip(n)`" (the decoder here exposes `data()` + `skip(n)` instead of a copying `read`); 4.4 "a boundary falls exactly when `intervalPos == intervalLength`" (taken as: the boundary is processed when the next sample is about to be produced, so after a block that ends exactly at the boundary `position()` still reports `pos == len` and `loopCount()` is unchanged, as 13.6 reads); 8.5 "`phase` is the resampler's fractional position carried from the last piece" (not said whether it survives an interval boundary; reset here); 8.1 (revision 2) "packets are decoded at 48000 Hz as each one's length and bytes have fully arrived" together with "on the trailer, samples past `real` are not output but kept as the lapping frames" (the padding is only known to be padding when the trailer arrives, after the last packet; the decoder here decodes each packet as it arrives but holds back the *output* of the most recent one until the next length prefix, the trailer or the end of the input is seen, which works because the padding minus the pre-skip is always shorter than one packet); 8.1 "a stream that stops without a trailer is played to its last whole packet with no trimming" (taken as: the pre-skip from the header is still dropped, only the trim at `real` is skipped, and there are no lapping frames); 8.1 "a packet ... that libopus refuses is bad and decodes to nothing from that point" (the packet held back before it was good and is still output, without lapping frames).
 
-Clean-room implementation of `ENGINE.md` revision 1 on top of the njproto
-client. The only inputs were `PROTOCOL.md`, `ENGINE.md`, the njproto sources in
-this folder and the public headers of libopus, libogg and libFLAC. Wherever the
+Clean-room implementation of `ENGINE.md` revision 2 (revision 1 plus the
+`OPUr` raw Opus framing) on top of the njproto client. The only inputs were
+`PROTOCOL.md`, `ENGINE.md`, the njproto sources in this folder and the public
+headers of libopus and libFLAC (libogg is no longer used). Wherever the
 specification leaves room, the choice is listed here.
 
 ## Layout
@@ -16,13 +17,13 @@ specification leaves room, the choice is listed here.
 - `engine/src/opus_codec.cpp`, `engine/src/flac_codec.cpp`: the two encoders
   and decoders (6.4, 8.1) and `makeEncoder`/`makeDecoder`.
 - `engine/tests/test_engine_codecs.cpp` (13.1-13.4 plus a resampler/LPC
-  check), `engine/tests/test_engine_clock.cpp` (13.5-13.9),
+  check and the `OPUr` byte-at-a-time / truncated-stream checks of 8.1), `engine/tests/test_engine_clock.cpp` (13.5-13.9),
   `engine/tests/test_engine_e2e.cpp` (13.10-13.13, two engines against the
   in-process `Server` with a simulated audio clock, plus duplex rooms where
   both engines send and listen with offset interval clocks, FLAC and Opus).
 - `tools/njjam.cpp`: the command-line client of section 14.
-- CMake option `NJPROTO_BUILD_ENGINE` (default ON) finds opus, ogg and flac
-  with pkg-config; OFF builds only the protocol library.
+- CMake option `NJPROTO_BUILD_ENGINE` (default ON) finds opus and flac with
+  pkg-config; OFF builds only the protocol library.
 
 ## Threads and contexts (section 2)
 
@@ -98,12 +99,22 @@ specification leaves room, the choice is listed here.
   interval it closes).
 - The upload queue holds 512 blocks per channel; a full queue drops blocks.
 
-## Opus (6.4, 8.1)
+## Opus (6.4, 8.1) - fourcc `OPUr`
 
+- Fourcc `OPUr` (`kFourccOpusRaw`, bytes `O P U r` in wire order), the raw
+  framing of revision 2: `makeEncoder`/`makeDecoder` accept only this fourcc;
+  an incoming `OPUS` (Ogg Opus from the original plug-in) has no decoder and
+  is ignored like any unknown codec. The protocol library maps both fourccs to
+  the `0x100` capability (`codecCapForFourcc`), as PROTOCOL.md 7.8 says, and
+  `njcli` takes `.opur` files as `OPUr` (`.opus` still passes through as
+  `OPUS`).
 - `pre_skip` is `OPUS_GET_LOOKAHEAD` after the encoder is created. Each
-  interval: `OPUS_RESET_STATE`, a new Ogg stream with a random serial,
-  OpusHead (input rate, gain 0, family 0) and OpusTags ("njproto engine", no
-  comments) each flushed as their own page.
+  interval: `OPUS_RESET_STATE`, then the 12-byte header (version 1, channels,
+  pre-skip, the input rate, reserved 0) written at once, each packet as `u16`
+  length + bytes as soon as it is encoded, and the trailer `u16` 0 + `u32`
+  real at the end. An encoder error or a packet above 65535 bytes (impossible:
+  libopus never produces more than 1275 bytes for 20 ms) stops the packets of
+  that interval; the trailer is still written.
 - Resampler: windowed sinc, 32 taps each side, Blackman window, 512 phases
   with linear interpolation between phases, cutoff scaled when downsampling.
   Its state persists across intervals of one encoder. It is primed with 64
@@ -115,11 +126,24 @@ specification leaves room, the choice is listed here.
   from a Levinson-Durbin fit of order 24 on the last 1024 resampled samples
   per channel (Gaussian lag window of about 20 Hz, bandwidth expansion
   0.998^k, white-noise correction 1e-5), 128 samples at full level then a
-  raised-cosine fade to 0. The last packet's granule is `real + pre_skip`
-  with e_o_s.
-- Decoder: output gain applied as 10^(gain/(20*256)); samples at index >=
-  the e_o_s page's granule (minus pre_skip) are the lapping frames; family
-  != 0 or more than two channels decode to nothing.
+  raised-cosine fade to 0. The trailer's `real` is the resampled frame count.
+- Decoder: the header is parsed once 12 bytes are in (version != 1 or
+  channels not 1 or 2: bad, nothing decoded); each packet is decoded once its
+  length and all its bytes are in, so partial deliveries (down to one byte at
+  a time) decode identically to the whole stream. The output of the most
+  recent packet is held back until the next length prefix (then it is whole
+  output), the trailer (split at `pre_skip + real` into output and lapping
+  frames) or the end of the input without a trailer (whole output, no lapping
+  frames, trailing partial bytes dropped). This is exact because the padding
+  minus the pre-skip is 0..959 frames, always inside the last packet, and it
+  costs 20 ms of latency between a packet's arrival and its availability,
+  well inside the 8192-byte prebuffer. Frames are counted by what libopus
+  returns for each packet (960 for a conforming stream, as 6.4 counts them).
+  The header's input rate and reserved word are ignored; `rate()` is 48000.
+  A packet libopus refuses marks the stream bad; what was decoded before it
+  (including the held packet) is output and nothing after it.
+- A stream from an `OPUS` (Ogg) sender is not decoded: test 13.14 is FLAC
+  only, as revision 2 says.
 
 ## FLAC (6.4, 8.1)
 
@@ -184,6 +208,15 @@ specification leaves room, the choice is listed here.
   window that includes it would report a few dB although every decoded
   sample was right. The tone generator and the fit use a rotating phasor
   instead of a `sin()` per sample.
+- The window is the last two intervals of the recording, leading silence
+  included. In a `--two` run the listener logs in about 20 ms after the
+  sender, so its interval clock (and the start of the first interval it
+  plays, at 4 s with the server's default 120 BPM / 8 BPI) is offset by that
+  much; a 12 s run's window of 8 s then begins some 10 ms before the first
+  tone sample and reports about 29 dB although every played sample is right
+  (10 log10(8 / 0.011) = 28.7). `--seconds 13` or more puts the window inside
+  the played audio and shows the real figure (about 47 dB with Opus at 128
+  kbps).
 - The control loop sleeps 10 ms when `run()` reports idle (ENGINE.md asks
   for 50 ms at most; the upload queue holds about 5 s).
 - `--wav` reads 16-bit PCM or 32-bit float WAV (mono, or the first channel)

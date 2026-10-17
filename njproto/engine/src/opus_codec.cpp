@@ -1,10 +1,13 @@
-// njproto engine - Ogg Opus encoder and decoder (ENGINE.md 6.4 and 8.1).
+// njproto engine - raw Opus (`OPUr`) encoder and decoder (ENGINE.md 6.4 and
+// 8.1, PROTOCOL.md 7.8). The stream is the engine's own framing, no Ogg:
+//   header  u8 version=1, u8 channels, u16 pre_skip, u32 input rate, u32 0
+//   packets u16 length (1..65535), then one 960-sample Opus packet
+//   trailer u16 0, u32 real (48 kHz samples after the pre-skip)
+// All little-endian.
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <random>
 
-#include <ogg/ogg.h>
 #include <opus/opus.h>
 
 #include "njproto/engine/codec.h"
@@ -14,7 +17,9 @@ namespace engine {
 
 namespace {
 
-const char* kVendor = "njproto engine";
+constexpr std::size_t kHeaderBytes = 12;
+constexpr std::size_t kTrailerBytes = 6;
+constexpr std::size_t kMaxPacketBytes = 65535;
 
 void put16(std::uint8_t* p, std::uint16_t v) {
     p[0] = static_cast<std::uint8_t>(v & 0xFF);
@@ -24,12 +29,16 @@ void put32(std::uint8_t* p, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) p[i] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF);
 }
 std::uint16_t get16(const std::uint8_t* p) { return static_cast<std::uint16_t>(p[0] | (p[1] << 8)); }
+std::uint32_t get32(const std::uint8_t* p) {
+    return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
+           (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
+}
 
 // ------------------------------------------------------------- encoder
 
 class OpusEnc : public Encoder {
 public:
-    OpusEnc(int rate, int channels, int kbps) : Encoder(kFourccOpus, rate, channels, kbps) {
+    OpusEnc(int rate, int channels, int kbps) : Encoder(kFourccOpusRaw, rate, channels, kbps) {
         int err = 0;
         enc_ = opus_encoder_create(kOpusRate, channels, OPUS_APPLICATION_AUDIO, &err);
         if (enc_) {
@@ -43,48 +52,26 @@ public:
             pre_skip_ = static_cast<int>(la);
         }
         resampler_.reset(rate, kOpusRate, channels);
-        std::random_device rd;
-        rng_.seed(rd());
-        std::memset(&os_, 0, sizeof(os_));
     }
     ~OpusEnc() override {
-        if (stream_open_) ogg_stream_clear(&os_);
         if (enc_) opus_encoder_destroy(enc_);
     }
 
     void begin() override {
         if (!enc_) return;
-        if (stream_open_) ogg_stream_clear(&os_);
-        ogg_stream_init(&os_, static_cast<int>(rng_()));
         stream_open_ = true;
         opus_encoder_ctl(enc_, OPUS_RESET_STATE);
         pending_.clear();
-        granule_ = 0;
         real_ = 0;
-        packetno_ = 0;
         history_.assign(static_cast<std::size_t>(kLpcHistory) * static_cast<std::size_t>(channels_), 0.0f);
 
-        // OpusHead (RFC 7845 5.1): 19 bytes for mapping family 0.
-        std::uint8_t head[19];
-        std::memcpy(head, "OpusHead", 8);
-        head[8] = 1;
-        head[9] = static_cast<std::uint8_t>(channels_);
-        put16(head + 10, static_cast<std::uint16_t>(pre_skip_));
-        put32(head + 12, static_cast<std::uint32_t>(rate_));
-        put16(head + 16, 0);                                 // output gain
-        head[18] = 0;                                        // mapping family
-        packetIn(head, sizeof(head), 0, true, false);
-        // OpusTags: vendor string, no comments.
-        std::vector<std::uint8_t> tags(8);
-        std::memcpy(tags.data(), "OpusTags", 8);
-        std::uint8_t len[4];
-        put32(len, static_cast<std::uint32_t>(std::strlen(kVendor)));
-        tags.insert(tags.end(), len, len + 4);
-        tags.insert(tags.end(), kVendor, kVendor + std::strlen(kVendor));
-        put32(len, 0);
-        tags.insert(tags.end(), len, len + 4);
-        packetIn(tags.data(), tags.size(), 0, false, false);
-        flushPages();
+        std::uint8_t head[kHeaderBytes];
+        head[0] = 1;                                         // version
+        head[1] = static_cast<std::uint8_t>(channels_);
+        put16(head + 2, static_cast<std::uint16_t>(pre_skip_));
+        put32(head + 4, static_cast<std::uint32_t>(rate_));  // input rate, informational
+        put32(head + 8, 0);                                  // reserved
+        emit(head, sizeof(head));
     }
 
     void encode(const float* interleaved, int frames) override {
@@ -95,8 +82,7 @@ public:
         real_ += static_cast<long>(rs.size() / static_cast<std::size_t>(channels_));
         pending_.insert(pending_.end(), rs.begin(), rs.end());
         rememberHistory(rs);
-        encodeWholeFrames(false);
-        writePages();
+        encodeWholeFrames();
     }
 
     void finish() override {
@@ -124,9 +110,12 @@ public:
             }
             pending_.insert(pending_.end(), ext.begin(), ext.end());
         }
-        encodeWholeFrames(true);
-        flushPages();
-        ogg_stream_clear(&os_);
+        encodeWholeFrames();
+        pending_.clear();
+        std::uint8_t trailer[kTrailerBytes];
+        put16(trailer, 0);
+        put32(trailer + 2, static_cast<std::uint32_t>(real_));
+        emit(trailer, sizeof(trailer));
         stream_open_ = false;
     }
 
@@ -144,10 +133,9 @@ private:
         }
     }
 
-    // Encodes every whole 960-frame block in pending_. With `last`, pending_
-    // is a multiple of 960 and the final packet gets granule real+pre_skip
-    // and the end-of-stream flag.
-    void encodeWholeFrames(bool last) {
+    // Encodes every whole 960-frame block in pending_ and writes each packet
+    // as soon as it is produced, with its u16 length in front.
+    void encodeWholeFrames() {
         const std::size_t ch = static_cast<std::size_t>(channels_);
         const std::size_t need = static_cast<std::size_t>(kOpusFrame) * ch;
         std::size_t off = 0;
@@ -155,175 +143,144 @@ private:
         while (pending_.size() - off >= need) {
             int n = opus_encode_float(enc_, pending_.data() + off, kOpusFrame, packet, sizeof(packet));
             off += need;
-            if (n < 0) break;
-            granule_ += kOpusFrame;
-            bool eos = last && (pending_.size() - off < need);
-            ogg_int64_t gp = eos ? static_cast<ogg_int64_t>(real_ + pre_skip_) : granule_;
-            packetIn(packet, static_cast<std::size_t>(n), gp, false, eos);
-            if (!last) writePages();
+            if (n <= 0 || static_cast<std::size_t>(n) > kMaxPacketBytes) break;
+            std::uint8_t len[2];
+            put16(len, static_cast<std::uint16_t>(n));
+            emit(len, sizeof(len));
+            emit(packet, static_cast<std::size_t>(n));
         }
         pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(off));
     }
 
-    void packetIn(const std::uint8_t* data, std::size_t len, ogg_int64_t granule, bool bos, bool eos) {
-        ogg_packet op;
-        op.packet = const_cast<unsigned char*>(data);
-        op.bytes = static_cast<long>(len);
-        op.b_o_s = bos ? 1 : 0;
-        op.e_o_s = eos ? 1 : 0;
-        op.granulepos = granule;
-        op.packetno = packetno_++;
-        ogg_stream_packetin(&os_, &op);
-    }
-    void writePages() {
-        ogg_page og;
-        while (ogg_stream_pageout(&os_, &og) > 0) {
-            emit(og.header, static_cast<std::size_t>(og.header_len));
-            emit(og.body, static_cast<std::size_t>(og.body_len));
-        }
-    }
-    void flushPages() {
-        ogg_page og;
-        while (ogg_stream_flush(&os_, &og) > 0) {
-            emit(og.header, static_cast<std::size_t>(og.header_len));
-            emit(og.body, static_cast<std::size_t>(og.body_len));
-        }
-    }
-
     OpusEncoder* enc_ = nullptr;
-    ogg_stream_state os_;
     bool stream_open_ = false;
     int pre_skip_ = 0;
     Resampler resampler_;
     std::vector<float> pending_;       // resampled, interleaved, not yet encoded
     std::vector<float> history_;       // last 1024 frames for the LPC padding
-    long granule_ = 0;                 // 48 kHz samples encoded so far
     long real_ = 0;                    // real (unpadded) samples this interval
-    ogg_int64_t packetno_ = 0;
-    std::mt19937 rng_;
 };
 
 // ------------------------------------------------------------- decoder
 
+// The padding after `real` is shorter than one packet (pad - pre_skip < 960),
+// so the lapping frames always lie inside the last packet. The decoder
+// therefore holds back the output of the most recent packet until it sees
+// what follows: another packet (the held one is whole output), the trailer
+// (split at `real` into output and lapping) or the end of the input without
+// a trailer (whole output, no lapping).
 class OpusDec : public Decoder {
 public:
-    explicit OpusDec(std::shared_ptr<ByteStream> s) : Decoder(kFourccOpus, std::move(s)) {
-        ogg_sync_init(&oy_);
-        std::memset(&os_, 0, sizeof(os_));
+    explicit OpusDec(std::shared_ptr<ByteStream> s) : Decoder(kFourccOpusRaw, std::move(s)) {
         rate_ = kOpusRate;
         channels_ = 1;
     }
     ~OpusDec() override {
         if (dec_) opus_decoder_destroy(dec_);
-        if (stream_open_) ogg_stream_clear(&os_);
-        ogg_sync_clear(&oy_);
     }
 
     bool decodeStep() override {
         if (finished_ || bad_) return false;
-        std::size_t before = in_.size();
         pullInput();
-        if (in_.size() > before) {
-            std::size_t n = in_.size() - before;
-            char* buf = ogg_sync_buffer(&oy_, static_cast<long>(n));
-            std::memcpy(buf, in_.data() + before, n);
-            ogg_sync_wrote(&oy_, static_cast<long>(n));
-            in_.clear();
-        }
         bool progress = false;
         for (;;) {
-            ogg_packet op;
-            if (stream_open_ && ogg_stream_packetout(&os_, &op) == 1) {
-                handlePacket(op);
+            if (!headers_done_) {
+                if (in_.size() - pos_ < kHeaderBytes) break;
+                if (!parseHeader(in_.data() + pos_)) {
+                    bad_ = true;
+                    break;
+                }
+                pos_ += kHeaderBytes;
                 progress = true;
-                if (finished_ || bad_) return progress;
                 continue;
             }
-            ogg_page og;
-            int r = ogg_sync_pageout(&oy_, &og);
-            if (r != 1) {
-                if (r == 0 && in_ended_ && !progress) {
-                    // No more data will come and no page is pending.
-                    if (stream_open_ && ogg_stream_packetout(&os_, &op) != 1) finished_ = true;
-                    else if (!stream_open_) finished_ = true;
-                }
-                return progress;
+            if (in_.size() - pos_ < 2) break;
+            std::size_t len = get16(in_.data() + pos_);
+            if (len == 0) {
+                if (in_.size() - pos_ < kTrailerBytes) break;
+                long real = static_cast<long>(get32(in_.data() + pos_ + 2));
+                pos_ += kTrailerBytes;
+                releaseHeld(pre_skip_ + real);
+                finished_ = true;
+                progress = true;
+                break;
             }
-            if (!stream_open_) {
-                ogg_stream_init(&os_, ogg_page_serialno(&og));
-                stream_open_ = true;
+            if (in_.size() - pos_ < 2 + len) break;
+            const std::uint8_t* pkt = in_.data() + pos_ + 2;
+            pos_ += 2 + len;
+            progress = true;
+            if (!decodePacket(pkt, len)) {
+                bad_ = true;
+                break;
             }
-            if (ogg_page_eos(&og)) {
-                eos_known_ = true;
-                eos_granule_ = ogg_page_granulepos(&og);
-            }
-            ogg_stream_pagein(&os_, &og);
+        }
+        if (!finished_ && !bad_ && in_ended_) {
+            // The loop stopped on incomplete data and no more will come (no
+            // trailer): play to the last whole packet, no trimming.
+            releaseHeld(-1);
+            finished_ = true;
             progress = true;
         }
+        if (bad_) releaseHeld(-1);
+        if (pos_ > 0) {
+            in_.erase(in_.begin(), in_.begin() + static_cast<std::ptrdiff_t>(pos_));
+            pos_ = 0;
+        }
+        return progress;
     }
 
 private:
-    void handlePacket(const ogg_packet& op) {
-        const std::uint8_t* d = op.packet;
-        std::size_t n = static_cast<std::size_t>(op.bytes);
-        if (packets_ == 0) {
-            if (n < 19 || std::memcmp(d, "OpusHead", 8) != 0) {
-                bad_ = true;
-                return;
-            }
-            channels_ = d[9];
-            pre_skip_ = get16(d + 10);
-            std::int16_t gain = static_cast<std::int16_t>(get16(d + 16));
-            gain_ = static_cast<float>(std::pow(10.0, gain / (20.0 * 256.0)));
-            if (d[18] != 0 || channels_ < 1 || channels_ > 2) {
-                bad_ = true;
-                return;
-            }
-            int err = 0;
-            dec_ = opus_decoder_create(kOpusRate, channels_, &err);
-            if (!dec_) bad_ = true;
-            ++packets_;
-            return;
-        }
-        if (packets_ == 1) {
-            ++packets_;                               // OpusTags
-            headers_done_ = true;
-            return;
-        }
-        ++packets_;
-        if (!dec_) return;
-        int frames = opus_decode_float(dec_, d, static_cast<opus_int32>(n), pcm_, 5760, 0);
-        if (frames <= 0) return;
-        const std::size_t ch = static_cast<std::size_t>(channels_);
-        if (gain_ != 1.0f)
-            for (std::size_t i = 0; i < static_cast<std::size_t>(frames) * ch; ++i) pcm_[i] *= gain_;
-        // Frames [decoded_, decoded_ + frames): drop those before pre_skip,
-        // output those before the end granule, keep the rest as lapping.
-        long first = std::max(decoded_, static_cast<long>(pre_skip_));
-        long end = decoded_ + frames;
-        long real_end = eos_known_ ? std::min(end, std::max(first, eos_granule_)) : end;
-        if (real_end > first)
-            pushOutput(pcm_ + static_cast<std::size_t>(first - decoded_) * ch, static_cast<std::size_t>(real_end - first));
-        if (end > real_end) {
-            const float* f = pcm_ + static_cast<std::size_t>(real_end - decoded_) * ch;
-            lapping_.insert(lapping_.end(), f, f + static_cast<std::size_t>(end - real_end) * ch);
-        }
-        decoded_ += frames;
-        if (op.e_o_s) finished_ = true;
+    bool parseHeader(const std::uint8_t* h) {
+        if (h[0] != 1) return false;
+        int ch = h[1];
+        if (ch < 1 || ch > 2) return false;
+        channels_ = ch;
+        pre_skip_ = get16(h + 2);
+        int err = 0;
+        dec_ = opus_decoder_create(kOpusRate, channels_, &err);
+        if (!dec_) return false;
+        headers_done_ = true;
+        return true;
     }
 
-    ogg_sync_state oy_;
-    ogg_stream_state os_;
-    bool stream_open_ = false;
+    // Decodes one packet into held_, first releasing the packet held before it.
+    bool decodePacket(const std::uint8_t* d, std::size_t n) {
+        const std::size_t ch = static_cast<std::size_t>(channels_);
+        int frames = opus_decode_float(dec_, d, static_cast<opus_int32>(n), pcm_, kMaxFrames, 0);
+        if (frames <= 0) return false;
+        releaseHeld(-1);
+        held_start_ = decoded_;
+        held_.assign(pcm_, pcm_ + static_cast<std::size_t>(frames) * ch);
+        decoded_ += frames;
+        return true;
+    }
+
+    // Outputs the held packet's frames from pre_skip on; with real_end >= 0
+    // the frames at index >= real_end become the lapping frames instead.
+    void releaseHeld(long real_end) {
+        if (held_.empty()) return;
+        const std::size_t ch = static_cast<std::size_t>(channels_);
+        long end = held_start_ + static_cast<long>(held_.size() / ch);
+        long first = std::max(held_start_, static_cast<long>(pre_skip_));
+        long cut = real_end < 0 ? end : std::min(end, std::max(first, real_end));
+        if (cut > first)
+            pushOutput(held_.data() + static_cast<std::size_t>(first - held_start_) * ch, static_cast<std::size_t>(cut - first));
+        if (end > cut) {
+            const float* f = held_.data() + static_cast<std::size_t>(cut - held_start_) * ch;
+            lapping_.insert(lapping_.end(), f, f + static_cast<std::size_t>(end - cut) * ch);
+        }
+        held_.clear();
+    }
+
+    static constexpr int kMaxFrames = 5760;   // 120 ms, the longest Opus packet
     OpusDecoder* dec_ = nullptr;
-    int packets_ = 0;
+    std::size_t pos_ = 0;                     // consumed bytes of in_
     int pre_skip_ = 0;
-    float gain_ = 1.0f;
-    long decoded_ = 0;
-    bool eos_known_ = false;
-    long eos_granule_ = 0;
+    long decoded_ = 0;                        // 48 kHz frames decoded so far
+    long held_start_ = 0;                     // stream index of held_[0]
+    std::vector<float> held_;                 // the last decoded packet, not yet output
     bool bad_ = false;
-    float pcm_[5760 * 2];
+    float pcm_[kMaxFrames * 2];
 };
 
 }  // namespace

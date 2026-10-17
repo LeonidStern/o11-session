@@ -33,11 +33,11 @@ foreach(t test_codec test_sha1 test_loopback)
 endforeach()
 
 # ---------------------------------------------------------------- engine
-# The client engine (ENGINE.md) needs libopus, libogg and libFLAC.
+# The client engine (ENGINE.md) needs libopus and libFLAC.
 option(NJPROTO_BUILD_ENGINE "Build the njproto_engine library, njjam and its tests" ON)
 if(NJPROTO_BUILD_ENGINE)
   find_package(PkgConfig REQUIRED)
-  pkg_check_modules(CODECS REQUIRED IMPORTED_TARGET opus ogg flac)
+  pkg_check_modules(CODECS REQUIRED IMPORTED_TARGET opus flac)
 
   add_library(njproto_engine STATIC
     engine/src/dsp.cpp

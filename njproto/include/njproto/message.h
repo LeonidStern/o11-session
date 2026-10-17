@@ -72,7 +72,8 @@ constexpr std::uint32_t fourcc(char a, char b, char c, char d) {
            (static_cast<std::uint32_t>(static_cast<unsigned char>(d)) << 24);
 }
 constexpr std::uint32_t kFourccVorbis = fourcc('O', 'G', 'G', 'v');
-constexpr std::uint32_t kFourccOpus = fourcc('O', 'P', 'U', 'S');
+constexpr std::uint32_t kFourccOpus = fourcc('O', 'P', 'U', 'S');      // Ogg Opus (reference)
+constexpr std::uint32_t kFourccOpusRaw = fourcc('O', 'P', 'U', 'r');   // raw Opus packets (7.8)
 constexpr std::uint32_t kFourccFlac = fourcc('F', 'L', 'A', 'C');
 
 std::uint32_t fourccFromString(const std::string& s);   // 0 if not 4 chars

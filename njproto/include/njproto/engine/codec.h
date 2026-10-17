@@ -1,6 +1,6 @@
 // njproto engine - encoders, decoders and the DSP helpers they need.
 // Written from ENGINE.md sections 6.4 and 8.1 and the public headers of
-// libopus, libogg and libFLAC.
+// libopus and libFLAC (no libogg: the Opus framing is the engine's own).
 #ifndef NJPROTO_ENGINE_CODEC_H
 #define NJPROTO_ENGINE_CODEC_H
 

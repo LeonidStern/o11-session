@@ -354,6 +354,8 @@ TEST(fourcc_and_guid_helpers) {
     CHECK_EQ(fourccFromString("FLAC"), kFourccFlac);
     CHECK_EQ(fourccFromString("FLA"), 0u);
     CHECK_EQ(codecCapForFourcc(kFourccOpus), kCapOpus);
+    CHECK_EQ(codecCapForFourcc(kFourccOpusRaw), kCapOpus);
+    CHECK_EQ(fourccToString(kFourccOpusRaw), "OPUr");
     CHECK_EQ(codecCapForFourcc(kFourccFlac), kCapFlac);
     CHECK_EQ(codecCapForFourcc(kFourccVorbis), 0u);
     Guid g = testGuid(0x10);

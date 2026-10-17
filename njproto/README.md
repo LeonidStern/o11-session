@@ -26,7 +26,7 @@ Builds with g++ on Linux at `-Wall -Wextra` without warnings. The loopback test
 takes about ten seconds because it waits for real keepalive and transfer timeouts.
 
 The client engine (`njproto_engine`, `njjam`, the `test_engine_*` tests) needs
-libopus, libogg and libFLAC, found with pkg-config. Pass
+libopus and libFLAC, found with pkg-config. Pass
 `-DNJPROTO_BUILD_ENGINE=OFF` to build only the protocol library and its tools.
 
 ## njserver
@@ -84,7 +84,7 @@ was seen rather than a timeout), `chat` (command and fields), `codec_mask`,
 `--upload FILE` sends the file's bytes as one interval on channel 0 right after
 login; with `--bpm-interval` it repeats the upload at every interval boundary
 (60 x BPI / BPM seconds) as a fake "always playing" client. The fourcc comes from
-the extension (`.opus`, `.flac`, else `OGGv`) or `--fourcc`. `--dump DIR` saves
+the extension (`.opus`, `.opur`, `.flac`, else `OGGv`) or `--fourcc`. `--dump DIR` saves
 every received interval as `DIR/<guid>.<ext>`, creating `DIR` if needed.
 
 Example session:

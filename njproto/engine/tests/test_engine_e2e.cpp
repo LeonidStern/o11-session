@@ -145,7 +145,7 @@ TEST(two_engines_opus_then_flac_48k) {           // 13.10
     CHECK_EQ(room.listener.numUsers(), 1);
     CHECK_EQ(room.listener.channelAt(0, 0), 0);
     CHECK_EQ(room.listener.channelName(0, 0), "tone");
-    CHECK_EQ(room.sender.uploadCodec(), kFourccOpus);
+    CHECK_EQ(room.sender.uploadCodec(), kFourccOpusRaw);
     CHECK_EQ(room.sender.roomOpusKbps(), 128);
     room.advance(12.0);
     CHECK_EQ(room.sender.uploadKbps(0), 128);
@@ -334,7 +334,7 @@ static void duplexRoom(std::uint32_t codec, int rate, double offset, double min_
         control();
         server.poll(1);
     }
-    CHECK_EQ(e[0].uploadCodec(), codec == kCapFlac ? kFourccFlac : kFourccOpus);
+    CHECK_EQ(e[0].uploadCodec(), codec == kCapFlac ? kFourccFlac : kFourccOpusRaw);
     const int block = 512;
     std::vector<float> in[2], l(block), r(block);
     std::vector<float> heard[2];

@@ -22,7 +22,7 @@ std::string fourccToString(std::uint32_t f) {
 }
 
 std::uint32_t codecCapForFourcc(std::uint32_t f) {
-    if (f == kFourccOpus) return kCapOpus;
+    if (f == kFourccOpus || f == kFourccOpusRaw) return kCapOpus;
     if (f == kFourccFlac) return kCapFlac;
     return 0;
 }

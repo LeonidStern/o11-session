@@ -248,13 +248,13 @@ std::unique_ptr<Encoder> makeOpusEncoder(int rate, int channels, int kbps);
 std::unique_ptr<Decoder> makeOpusDecoder(std::shared_ptr<ByteStream> s);
 
 std::unique_ptr<Encoder> makeEncoder(std::uint32_t fourcc, int rate, int channels, int kbps) {
-    if (fourcc == kFourccOpus) return makeOpusEncoder(rate, channels, kbps);
+    if (fourcc == kFourccOpusRaw) return makeOpusEncoder(rate, channels, kbps);
     if (fourcc == kFourccFlac) return std::make_unique<FlacEnc>(rate, channels, kbps);
     return nullptr;
 }
 
 std::unique_ptr<Decoder> makeDecoder(std::uint32_t fourcc, std::shared_ptr<ByteStream> s) {
-    if (fourcc == kFourccOpus) return makeOpusDecoder(std::move(s));
+    if (fourcc == kFourccOpusRaw) return makeOpusDecoder(std::move(s));
     if (fourcc == kFourccFlac) return std::make_unique<FlacDec>(std::move(s));
     return nullptr;
 }

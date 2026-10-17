@@ -156,6 +156,7 @@ int main(int argc, char** argv) {
         std::size_t dot = upload_file.rfind('.');
         std::string ext = dot == std::string::npos ? "" : upload_file.substr(dot + 1);
         if (ext == "opus") upload_fourcc = kFourccOpus;
+        else if (ext == "opur") upload_fourcc = kFourccOpusRaw;
         else if (ext == "flac") upload_fourcc = kFourccFlac;
         if (!fourcc_text.empty()) upload_fourcc = fourccFromString(fourcc_text);
     }
@@ -209,7 +210,7 @@ int main(int argc, char** argv) {
         dl.fourcc = d.fourcc;
         dl.bytes = 0;
         if (!dump_dir.empty()) {
-            std::string ext = d.fourcc == kFourccOpus ? "opus" : d.fourcc == kFourccFlac ? "flac" : "ogg";
+            std::string ext = d.fourcc == kFourccOpus ? "opus" : d.fourcc == kFourccOpusRaw ? "opur" : d.fourcc == kFourccFlac ? "flac" : "ogg";
             dl.file.open(dump_dir + "/" + guidToHex(d.guid) + "." + ext, std::ios::binary);
         }
     };

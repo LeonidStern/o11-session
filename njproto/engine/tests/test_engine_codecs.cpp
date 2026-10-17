@@ -78,13 +78,21 @@ double rms(const float* p, std::size_t n) {
 TEST(opus_round_trip_48k_stereo) {              // 13.1
     const int rate = 48000, frames = 96000;
     auto pcm = tone(997.0, 0.5, rate, frames, 2);
-    auto enc = makeEncoder(kFourccOpus, rate, 2, 128);
+    auto enc = makeEncoder(kFourccOpusRaw, rate, 2, 128);
     CHECK(enc != nullptr);
     auto bytes = encodeInterval(*enc, pcm, 2);
     CHECK(bytes.size() > 8192);
-    CHECK_EQ(std::string(bytes.begin(), bytes.begin() + 4), "OggS");
+    // OPUr header: version 1, 2 channels, pre-skip, input rate 48000, reserved 0.
+    CHECK_EQ(bytes[0], 1);
+    CHECK_EQ(bytes[1], 2);
+    CHECK_EQ(bytes[4] | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24), 48000);
+    CHECK_EQ(bytes[8] | bytes[9] | bytes[10] | bytes[11], 0);
+    // Trailer: u16 0, u32 real = 96000.
+    std::size_t t = bytes.size() - 6;
+    CHECK_EQ(bytes[t] | bytes[t + 1], 0);
+    CHECK_EQ(bytes[t + 2] | (bytes[t + 3] << 8) | (bytes[t + 4] << 16) | (bytes[t + 5] << 24), frames);
     std::unique_ptr<Decoder> dec;
-    auto got = decodeAll(kFourccOpus, bytes, 4096, &dec);
+    auto got = decodeAll(kFourccOpusRaw, bytes, 4096, &dec);
     CHECK_EQ(dec->channels(), 2);
     CHECK_EQ(dec->rate(), 48000);
     CHECK_EQ(got.size() / 2, static_cast<std::size_t>(frames));   // exactly 2.0 s after trimming
@@ -103,15 +111,15 @@ TEST(opus_round_trip_48k_stereo) {              // 13.1
 
 TEST(opus_round_trip_44k1_and_crossfade) {      // 13.2
     const int rate = 44100, frames = 88200;      // 2.0 s
-    auto enc = makeEncoder(kFourccOpus, rate, 2, 128);
+    auto enc = makeEncoder(kFourccOpusRaw, rate, 2, 128);
     // Two consecutive intervals of one continuous tone.
     auto pcm1 = tone(997.0, 0.5, rate, frames, 2);
     auto pcm2 = tone(997.0, 0.5, rate, frames, 2, 2 * M_PI * 997.0 * frames / rate);
     auto b1 = encodeInterval(*enc, pcm1, 2);
     auto b2 = encodeInterval(*enc, pcm2, 2);
     std::unique_ptr<Decoder> d1, d2;
-    auto g1 = decodeAll(kFourccOpus, b1, 2048, &d1);
-    auto g2 = decodeAll(kFourccOpus, b2, 2048, &d2);
+    auto g1 = decodeAll(kFourccOpusRaw, b1, 2048, &d1);
+    auto g2 = decodeAll(kFourccOpusRaw, b2, 2048, &d2);
     long n1 = static_cast<long>(g1.size() / 2), n2 = static_cast<long>(g2.size() / 2);
     std::printf("  44.1k intervals decoded to %ld and %ld frames\n", n1, n2);
     CHECK(std::labs(n1 - 96000) <= 2);
@@ -141,6 +149,42 @@ TEST(opus_round_trip_44k1_and_crossfade) {      // 13.2
     // The two intervals are also continuous in level (SNR of the join region).
     std::vector<float> ref = tone(997.0, 0.5, 48000, static_cast<int>(joined.size() / 2), 2);
     (void)ref;
+}
+
+TEST(opus_byte_at_a_time_and_truncated) {       // 8.1: partial data, no trailer
+    const int rate = 48000, frames = 48000;
+    auto pcm = tone(997.0, 0.5, rate, frames, 2);
+    auto enc = makeEncoder(kFourccOpusRaw, rate, 2, 128);
+    auto bytes = encodeInterval(*enc, pcm, 2);
+    std::unique_ptr<Decoder> whole, bytewise;
+    auto g1 = decodeAll(kFourccOpusRaw, bytes, bytes.size(), &whole);
+    auto g2 = decodeAll(kFourccOpusRaw, bytes, 1, &bytewise);
+    CHECK_EQ(g1.size() / 2, static_cast<std::size_t>(frames));
+    CHECK(g1 == g2);
+    CHECK(whole->lapping() == bytewise->lapping());
+    CHECK(!whole->lapping().empty());
+    CHECK(whole->finished() && bytewise->finished());
+    // Count the packets and cut the stream before its trailer, in the middle
+    // of the last packet: every whole packet plays, nothing is trimmed and
+    // there are no lapping frames.
+    std::size_t pos = 12, packets = 0, last_start = 0;
+    for (;;) {
+        std::size_t len = bytes[pos] | (bytes[pos + 1] << 8);
+        if (len == 0) break;
+        last_start = pos;
+        pos += 2 + len;
+        ++packets;
+    }
+    CHECK_EQ(pos + 6, bytes.size());
+    std::vector<std::uint8_t> cut(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(last_start + 3));
+    std::unique_ptr<Decoder> trunc;
+    auto g3 = decodeAll(kFourccOpusRaw, cut, 1000, &trunc);
+    int pre_skip = bytes[2] | (bytes[3] << 8);
+    CHECK_EQ(g3.size() / 2, (packets - 1) * 960 - static_cast<std::size_t>(pre_skip));
+    CHECK(trunc->lapping().empty());
+    CHECK(trunc->finished());
+    CHECK(std::equal(g3.begin(), g3.end(), g1.begin()));
+    std::printf("  opus: %zu packets, %zu frames whole, %zu truncated\n", packets, g1.size() / 2, g3.size() / 2);
 }
 
 TEST(flac_round_trip) {                          // 13.3

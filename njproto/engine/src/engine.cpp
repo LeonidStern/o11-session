@@ -297,7 +297,7 @@ std::uint32_t Engine::uploadCodec() const {
     if (!has_mask_.load()) return 0;
     std::uint32_t m = codec_mask_.load();
     if ((m & kCapFlac) && prefer_flac_.load()) return kFourccFlac;
-    if (m & kCapOpus) return kFourccOpus;
+    if (m & kCapOpus) return kFourccOpusRaw;
     return 0;
 }
 
