@@ -612,11 +612,19 @@ TEST(codec_mask_and_silence_substitution) {     // acceptance 9
     CHECK_EQ(ro.masks[3].codecs, kCapFlac);
     CHECK(h.until([&] { return rf.masks.size() == 1 && rf.masks[0].codecs == kCapFlac; }));
     CHECK(h.until([&] { return ro.countChat("MSG", "", "[server] room audio is now FLAC, because flac@127.0.0.1's client can't play Opus") == 1; }));
+    // The server only relays to subscribers (6.3), and flac subscribes to opus
+    // with a SET_USERMASK sent when it reads the login USERINFO. That message
+    // travels on flac's connection and the upload below on opus's, and the
+    // server reads them in whatever order they arrive. A chat round trip on
+    // flac's connection makes sure its SET_USERMASK, sent before the chat,
+    // has been processed.
+    flac.say("subscribed");
+    CHECK(h.until([&] { return rf.countChat("MSG", "flac@127.0.0.1", "subscribed") == 1; }));
     // An Opus interval now: the FLAC client gets silence.
     Guid g3 = opus.beginInterval(0, kFourccOpus);
     opus.writeInterval(g3, bytes.data(), bytes.size(), true);
     CHECK(h.until([&] { return !rf.begins.empty(); }));
-    CHECK(guidIsZero(rf.begins[0].guid));
+    CHECK(!rf.begins.empty() && guidIsZero(rf.begins[0].guid));
     flac.disconnect();
     CHECK(h.until([&] { return ro.masks.size() == 5 && ro.masks[4].codecs == kCapOpus; }));
 
