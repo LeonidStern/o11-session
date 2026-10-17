@@ -371,6 +371,16 @@ void Engine::start()
   m_quit = false;
   m_running = true;
   m_thread = std::thread([this]() { threadProc(); });
+
+  // benchmarks, with no window: join a room once loaded (O11_CONNECT="host:port name") and pick
+  // Live's buffer (O11_LIVE_BUFFER_MS)
+  if (const char *ms = getenv("O11_LIVE_BUFFER_MS")) setLiveBuffer(Settings::nearestLiveBufferMs(atoi(ms)));
+  if (const char *c = getenv("O11_CONNECT"))
+  {
+    const std::string s = c;
+    const size_t space = s.find(' ');
+    connect(s.substr(0, space), space == std::string::npos ? "bench" : s.substr(space + 1));
+  }
 }
 
 void Engine::stop()
