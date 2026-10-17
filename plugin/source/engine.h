@@ -125,8 +125,9 @@ struct Snapshot
   bool liveServer = false;   // the server has Live (its UDP port is open)
   bool liveSwitchOn = false; // the room's Live switch (!live on)
   bool liveRoom = false;     // the room plays Live now
-  LiveReason liveReason = LiveNoReason; // why it plays intervals while the switch is on
+  LiveReason liveReason = LiveNoReason; // while Live, whose trouble suggests switching to intervals
   std::string liveReasonWho; // whose connection or client (display name), "" when no one's
+  int liveReasonOthers = 0;  // how many more have the same trouble
   int liveHeardMs = -1;      // about how late you hear the others while Live, -1 when not known
   int liveBufferMs = 20;     // your jitter buffer (Settings::liveBufferMs)
   int liveBufferInUseMs = 20; // what it is now: raised for the host's long blocks

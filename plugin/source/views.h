@@ -293,6 +293,10 @@ public:
   explicit Chip(const juce::Font &font);
   void set(const std::string &text, const std::string &who);
   void paint(juce::Graphics &g) override;
+  void mouseUp(const juce::MouseEvent &e) override;
+
+  std::function<void()> onClick; // when set, the chip is a button (a hand over it)
+  void setClick(std::function<void()> click);
 
 private:
   juce::Font m_font;

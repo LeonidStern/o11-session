@@ -588,6 +588,17 @@ void Chip::set(const std::string &text, const std::string &who)
   repaint();
 }
 
+void Chip::setClick(std::function<void()> click)
+{
+  onClick = std::move(click);
+  setMouseCursor(onClick ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::NormalCursor);
+}
+
+void Chip::mouseUp(const juce::MouseEvent &e)
+{
+  if (onClick && e.mouseWasClicked() && getLocalBounds().contains(e.getPosition())) onClick();
+}
+
 void Chip::paint(juce::Graphics &g)
 {
   const juce::Rectangle<float> r = getLocalBounds().toFloat();

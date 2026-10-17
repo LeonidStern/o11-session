@@ -64,7 +64,7 @@ std::string liveModeText(bool live, int heardMs);
 // connection's dropouts, 2 a client that can't play Live, 3 someone joining) and whose:
 // "Intervals: Anna's connection", "Intervals: your connection", "Intervals: Carol can't play
 // Live", "Intervals while Anna joins"; "" for no reason
-std::string liveWaitText(int reason, const std::string &who);
+std::string liveAdviceText(int reason, const std::string &who, int others);
 // how long ago something happened, in the room panel: "now", "12 s", "2 min", "1 h"
 std::string ageText(double seconds);
 // a server's line with the players' addresses taken out: "anna@203.0.113.9 set ..." is "anna set ..."

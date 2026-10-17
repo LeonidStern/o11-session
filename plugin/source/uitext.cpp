@@ -121,14 +121,19 @@ std::string liveModeText(bool live, int heardMs)
   return heardMs > 0 ? "Live " + msText(heardMs) : "Live";
 }
 
-std::string liveWaitText(int reason, const std::string &who)
+std::string liveAdviceText(int reason, const std::string &who, int others)
 {
   const bool you = who == "You";
+  const std::string more = others > 0 ? " and " + std::to_string(others) + " more" : "";
   switch (reason)
   {
-    case 1: return who.empty() ? "Intervals: a connection had dropouts" : you ? "Intervals: your connection" : "Intervals: " + who + "'s connection";
-    case 2: return who.empty() ? "Intervals: a player can't play Live" : you ? "Intervals: your client can't play Live" : "Intervals: " + who + " can't play Live";
-    case 3: return who.empty() || you ? "Intervals while you join" : "Intervals while " + who + " joins";
+    case 1:
+      if (who.empty()) return "Dropouts: try Intervals";
+      if (others > 0) return (you ? "You" : who) + more + " drop out: try Intervals";
+      return you ? "Your connection drops out: try Intervals" : who + " drops out: try Intervals";
+    case 2:
+      if (who.empty()) return "A player can't play Live: try Intervals";
+      return (you ? "Your client" : who) + more + " can't play Live: try Intervals";
     default: return "";
   }
 }

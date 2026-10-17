@@ -960,11 +960,13 @@ void O11Editor::updateRoom(const Snapshot &s, double)
 
   // what the room changes to at the next interval, and who voted for it (when the server says)
   int shown = 0;
-  auto chip = [&](bool on, const std::string &text, const std::string &tip, const Vote &vote, int value) {
+  auto chip = [&](bool on, const std::string &text, const std::string &tip, const Vote &vote, int value,
+                  std::function<void()> click = nullptr) {
     if (!on) return;
     Chip *c = m_chips[shown++];
     const std::string who = vote.value == value ? vote.who : std::string();
     c->set(text, who);
+    c->setClick(std::move(click));
     setTooltip(c, tip + (who.empty() ? "" : who == "You" ? ": you voted for it" : ": " + who + " voted for it"));
   };
   const int roomBpm = (int)lround(s.bpm);
@@ -972,17 +974,17 @@ void O11Editor::updateRoom(const Snapshot &s, double)
        "The room's tempo changes to " + std::to_string(roomBpm) + " BPM when the next interval starts", m_lastVote[0], roomBpm);
   chip(playing && s.bpi > 0 && s.bpi != s.intervalBeats, uitext::beatsText(s.bpi) + " from next interval",
        "The intervals last " + uitext::beatsText(s.bpi) + " from the next one on", m_lastVote[1], s.bpi);
-  // Live: what the room waits for, or the switch to come at the next interval
+  // Live: a player in trouble (the room stays Live; a click switches everyone to intervals), or
+  // the switch to come at the next interval
   const Vote nobody;
-  const std::string wait = liveHere && s.liveSwitchOn && !s.liveRoom ? uitext::liveWaitText((int)s.liveReason, s.liveReasonWho) : "";
-  if (!wait.empty())
-    chip(true, wait, s.liveReason == Snapshot::LiveCantLive
-                       ? "Live is on, but a player's client can't play Live, so the whole room plays intervals while they're here"
-                       : s.liveReason == Snapshot::LiveJoining
-                       ? "Live waits a moment for a player who just joined"
-                       : "Live is on, but a connection had dropouts, so the whole room plays intervals; it goes Live again once "
-                         "everyone's audio has been clean for a few seconds",
-         nobody, -1);
+  const std::string advice = liveHere && s.liveSwitchOn && s.liveRoom
+                               ? uitext::liveAdviceText((int)s.liveReason, s.liveReasonWho, s.liveReasonOthers) : "";
+  if (!advice.empty())
+    chip(true, advice, std::string(s.liveReason == Snapshot::LiveCantLive
+                                     ? "A player's client can't play Live, so the others hear them an interval late"
+                                     : "Live audio has dropouts that intervals wouldn't have")
+                         + ". Click to switch the room to intervals for everyone", nobody, -1,
+         [this]() { engine().setRoomLive(false); });
   else if (liveHere && s.liveSwitchOn && !s.liveRoom)
     chip(true, "Live from next interval", "Everyone goes Live together when the next interval starts", nobody, -1);
   else if (liveHere && !s.liveSwitchOn && s.liveRoom)
