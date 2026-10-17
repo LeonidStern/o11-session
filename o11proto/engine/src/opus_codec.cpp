@@ -179,10 +179,13 @@ public:
         if (dec_) opus_decoder_destroy(dec_);
     }
 
+    // One packet a step at most: decodeUntil() asks for as many as it needs,
+    // so a whole interval that arrives at once isn't decoded in one audio
+    // block.
     bool decodeStep() override {
         if (finished_ || bad_) return false;
         pullInput();
-        bool progress = false;
+        bool progress = false, more = false;
         for (;;) {
             if (!headers_done_) {
                 if (in_.size() - pos_ < kHeaderBytes) break;
@@ -213,8 +216,10 @@ public:
                 bad_ = true;
                 break;
             }
+            more = true;
+            break;
         }
-        if (!finished_ && !bad_ && in_ended_) {
+        if (!more && !finished_ && !bad_ && in_ended_) {
             // The loop stopped on incomplete data and no more will come (no
             // trailer): play to the last whole packet, no trimming.
             releaseHeld(-1);
@@ -222,7 +227,7 @@ public:
             progress = true;
         }
         if (bad_) releaseHeld(-1);
-        if (pos_ > 0) {
+        if (pos_ > 0 && (pos_ >= 8192 || pos_ == in_.size())) {
             in_.erase(in_.begin(), in_.begin() + static_cast<std::ptrdiff_t>(pos_));
             pos_ = 0;
         }

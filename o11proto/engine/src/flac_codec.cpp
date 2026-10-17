@@ -144,7 +144,8 @@ public:
                 finished_ = true;
                 break;
             }
-            if (!wrote_ && consumed_ >= in_.size()) break;
+            if (wrote_) break;                             // one frame a step: decodeUntil() asks for more
+            if (consumed_ >= in_.size()) break;
         }
         return progress;
     }
