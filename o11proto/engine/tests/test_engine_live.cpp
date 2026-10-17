@@ -8,8 +8,9 @@
 //
 // The cases: both hear each other live at low latency; `!live off` brings
 // the intervals back at once, and `!live on` brings Live back at a boundary;
-// a sender's stall and packet loss make the listener fall back at the next
-// boundary, and Live comes back later; `/live buffer 60` raises the delay.
+// a sender's stall of 1.5 s and packet loss put the room on intervals at
+// the next boundary (16.7: the room plays one way for everyone), and Live
+// comes back after the settle time; `/live buffer 60` raises the delay.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -319,10 +320,10 @@ TEST(both_hear_each_other_live) {
         REQUIRE(b > 0);
         CHECK(r.boundaryIn(s, b));
     }
-    const std::string said = r.side[1].findNotice("You hear alice live now, about ");
+    const std::string said = r.side[1].findNotice("The room is Live now, about ");
     std::printf("    %s\n", said.c_str());
     CHECK(said.size() > 0 && said.back() == '.' && said.find(" ms late.") != std::string::npos);
-    CHECK(!r.side[0].findNotice("You hear bob live now, about ").empty());
+    CHECK(!r.side[0].findNotice("The room is Live now, about ").empty());
     const long from = r.frames.load();
     for (int s = 0; s < 2; ++s) {
         int missing = 0, doubles = 0;
@@ -392,28 +393,24 @@ TEST(sender_stall_falls_back_at_boundary) {
     REQUIRE(r.liveAndCalm(20));
     const std::size_t seen = r.side[1].noticeCount();
     const long block = r.frames.load() / kBlock;
-    r.side[0].stall.store(kRate / 2 / kBlock);   // alice's host doesn't call for 0.5 s
-    REQUIRE(r.until([&] { return !r.side[1].e.userLive(0); }, 5));
+    r.side[0].stall.store(kRate * 3 / 2 / kBlock);   // alice's host doesn't call for 1.5 s
+    REQUIRE(r.until([&] { return !r.side[1].e.userLive(0); }, 6));
     const long b = r.switchFrom(1, block, true);
     REQUIRE(b > 0);
     std::printf("    bob back on intervals %.0f ms after the stall began\n", r.secondsOf(b - block) * 1000);
     CHECK(r.boundaryIn(1, b));
     CHECK(r.until(
-        [&] {
-            return !r.side[1]
-                        .findNotice("alice is back on intervals: their real-time audio stopped or had dropouts.", seen)
-                        .empty();
-        },
+        [&] { return !r.side[1].findNotice("The room is back on intervals: alice's connection had dropouts.", seen).empty(); },
         1));
     // Live again later, from a boundary, after the settle time: the stall's
-    // 0.5 s, 1 s of playing well and 3 s of settling at the least.
-    REQUIRE(r.until([&] { return r.side[1].e.userLive(0); }, 20));
+    // 1.5 s, 1 s of playing well and 5 s of settling at the least.
+    REQUIRE(r.until([&] { return r.side[1].e.userLive(0); }, 25));
     r.wait(0.1);                                 // the audio thread has recorded the switch
     const long on = r.switchFrom(1, b, false);
     REQUIRE(on > 0);
     std::printf("    bob hears alice live again %.1f s after the stall began\n", r.secondsOf(on - block));
     CHECK(r.boundaryIn(1, on));
-    CHECK(r.secondsOf(on - block) >= 4.5);
+    CHECK(r.secondsOf(on - block) >= 6.5);
     // Spec test 43: after the stall the buffer figure is still at most B + a frame + a host block.
     r.wait(0.2);
     const std::size_t at = r.side[1].noticeCount();
@@ -438,19 +435,22 @@ TEST(packet_loss_falls_back_at_boundary) {
     REQUIRE(b > 0);
     std::printf("    bob back on intervals %.0f ms after the loss began\n", r.secondsOf(b - block) * 1000);
     CHECK(r.boundaryIn(1, b));
-    CHECK(r.until([&] { return !r.side[1].findNotice("alice is back on intervals", seen).empty(); }, 1));
+    // Bob can't tell his own loss from alice's: with one other player, he names her.
+    CHECK(r.until(
+        [&] { return !r.side[1].findNotice("The room is back on intervals: alice's connection had dropouts.", seen).empty(); },
+        1));
     r.wait(2.5);
     CHECK(r.peak(1, b * kBlock, 2.5) > 0.3f);    // the intervals play
-    if (r.calmSince(block * kBlock)) CHECK(r.side[0].e.userLive(0));   // alice still hears bob live
+    CHECK(!r.side[0].e.userLive(0));             // for alice too: the room plays one way
     const long healed = r.frames.load() / kBlock;
     r.side[1].e.setLiveTestLoss(0);
-    REQUIRE(r.until([&] { return r.side[1].e.userLive(0); }, 20));
+    REQUIRE(r.until([&] { return r.side[1].e.userLive(0); }, 25));
     r.wait(0.1);                                 // the audio thread has recorded the switch
     const long on = r.switchFrom(1, healed, false);
     REQUIRE(on > 0);
     std::printf("    bob hears alice live again %.1f s after the loss ended\n", r.secondsOf(on - healed));
     CHECK(r.boundaryIn(1, on));
-    CHECK(r.secondsOf(on - healed) >= 3.0);      // the settle time
+    CHECK(r.secondsOf(on - healed) >= 5.0);      // the settle time
 }
 
 TEST(jitter_buffer_setting_takes_effect) {

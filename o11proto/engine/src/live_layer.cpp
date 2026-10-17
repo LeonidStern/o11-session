@@ -159,11 +159,18 @@ void LiveLayer::forget() {
     key = 0;
     room_on.store(false);
     may_send.store(false);
-    users.clear();
+    room = o11proto::live::LiveRoom();
+    has_room = false;
+    report_sent = o11proto::live::LiveReport();
+    report_ever = false;
+    report_at = TimePoint{};
+    room_noticed = 0;
+    cant_said.clear();
+    room_due_ns.store(0);
+    room_announce.store((++room_seq) << 1, std::memory_order_release);   // intervals, at the next boundary
     start_failed_said = no_answer_said = offer_said = false;
     started_at = retry_at = TimePoint{};
     buffer_changed = false;
-    grace_until = TimePoint{};
     std::lock_guard<std::mutex> lock(net_mutex);
     peers.clear();
     net_room_on = false;
@@ -210,6 +217,7 @@ void LiveLayer::apply(const o11proto::live::ServerLive& m) {
         p.id = r.id;
         p.name = r.name;
         p.bound = (r.flags & o11proto::live::kPeerBound) != 0;
+        p.sending = (r.flags & o11proto::live::kPeerSending) != 0;
         p.slot = -1;
         next.push_back(std::move(p));
     }
@@ -274,10 +282,12 @@ void LiveLayer::health(TimePoint now) {
         if (h.gen != g) {
             h = Health();
             h.gen = g;
+            h.last_audio_ns = now_ns;
         }
         const SinkStats& st = sinks[s]->stats;
         if (!slot_peer[s] || st.gen.load() != g || !room_on.load() || !running.load()) {
             h.healthy = false;
+            h.recent = h.lost2 = 0;
             continue;
         }
         // dropouts: underruns, overruns and xrun gaps
@@ -302,8 +312,68 @@ void LiveLayer::health(TimePoint now) {
         const int frame = st.block.load() > 0 ? st.block.load() : 240;
         const int limit = 2880 / frame;          // floor(0.03 x 2 x 48000 / frame)
         const bool active = st.active.load() && now_ns - st.active_since_ns.load() >= 1000000000LL;
+        h.recent = recent;
+        h.lost2 = lost2;
+        h.limit = limit;
+        if (st.active.load()) h.last_audio_ns = now_ns;
         h.healthy = active && recent <= 2 && lost2 <= limit;
     }
+}
+
+// ENGINE.md 16.7. Clean: Live runs here and every listed player that
+// sends sounds clean. Becoming clean takes each such slot healthy (6.4:
+// playing for 1 s, at most 2 dropouts and the loss limit in 2 s); a report
+// that is clean stays so until a slot has more than 2 dropouts in 2 s, more
+// losses than the limit, or no audio for more than 1 s while its player
+// still sends and no /stop came. So one gap of up to a second doesn't move
+// the room.
+o11proto::live::LiveReport LiveLayer::report(TimePoint now) {
+    namespace lv = o11proto::live;
+    lv::LiveReport r;
+    if (sending.load()) r.flags |= lv::kReportSending;
+    if (!running.load()) {
+        r.flags |= lv::kReportCantLive;
+        r.fault = msg.peer_id;
+        return r;
+    }
+    const std::int64_t now_ns = steadyNs(now);
+    const bool was_clean = report_ever && report_sent.clean() && !report_sent.cantLive();
+    std::vector<std::uint32_t> bad;
+    bool cant = false;
+    {
+        std::lock_guard<std::mutex> lock(net_mutex);
+        for (const auto& p : peers) {
+            if (p.slot < 0) {                   // more senders than slots: one this client can't hear
+                cant |= p.sending;
+                continue;
+            }
+            Health& h = slot_health[p.slot];
+            if (p.sending && !h.expected) h.last_audio_ns = std::max(h.last_audio_ns, now_ns);
+            h.expected = p.sending;
+            if (!p.sending) continue;           // nobody's fault (a stopped host, Transmit off)
+            const NetSlot& ns = net[p.slot];
+            const bool stopped = ns.has_stream && ns.stopped;
+            const bool silent = !stopped && now_ns - h.last_audio_ns > 1000000000LL;
+            const bool fails = h.recent > 2 || h.lost2 > h.limit || silent;
+            if (was_clean ? fails : !h.healthy) bad.push_back(p.id);
+        }
+    }
+    if (cant) {
+        r.flags |= lv::kReportCantLive;
+        r.fault = msg.peer_id;
+    } else if (bad.empty()) {
+        r.flags |= lv::kReportClean;
+    } else {
+        r.fault = bad.size() == 1 ? bad[0] : msg.peer_id;
+    }
+    return r;
+}
+
+void LiveLayer::applyRoom(const o11proto::live::LiveRoom& m, TimePoint now) {
+    room = m;
+    has_room = true;
+    room_due_ns.store(steadyNs(now) + 500000000LL);
+    room_announce.store(((++room_seq) << 1) | (m.live ? 1u : 0u), std::memory_order_release);
 }
 
 // ======================================================= network thread
@@ -737,6 +807,7 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
     // The source (6.7): channel 0 while every gate is open.
     const bool on = room_on.load() && running.load();
     const bool gate = on && may_send.load() && transmit && host_playing.load() && !host_offline.load() && l;
+    sending.store(gate);
     if (gap > 0 && gate_open_ && gate) {
         if (CaptureItem* c = capture.back()) {
             c->kind = CaptureItem::Gap;
@@ -776,7 +847,7 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
         LiveSink& k = *sinks[s];
         const std::uint32_t g = gen[s].load();
         if (g != audio_gen_[s]) {               // a new peer or a dropped source
-            k.reset();
+            k.drop();
             k.stats.clear(g);
             audio_gen_[s] = g;
         }
@@ -788,9 +859,13 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
         }
         k.configure(latency, longest_, rate);
         if (gap > 0) k.hostGap(gap, rate);
-        avail_[s] = false;
-        if (!on || frames > kLiveMaxHostBlock) continue;
+        avail_[s] = real_[s] = false;
+        if (frames > kLiveMaxHostBlock) continue;
+        // Also while Live is off: a stream that was just dropped conceals
+        // on, so that the mixer can fade it out (16.8).
         avail_[s] = k.render(outbuf_[s].get(), frames, rate, now) && !host_offline.load();
+        real_[s] = avail_[s] && k.playing();
+        if (!on) continue;
         std::int32_t seqs[16];
         const int n = k.dueRequests(now, seqs, 16);
         for (int i = 0; i < n; ++i) {

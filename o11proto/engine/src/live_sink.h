@@ -97,6 +97,15 @@ SinkSizes sinkSizes(double latency_ms, int host_block, int host_rate, int frame)
 // Clamps decoded samples to -2..+2, NaN to -2 (5.7).
 void clampDecoded(float* s, std::size_t n);
 
+// Seamless switching (ENGINE.md 16.8). Every crossfade between a user's
+// live and interval audio, and every fade of the live audio alone, takes
+// kLiveFadeMs. A slot that has no audio (lost, stopped or timed out) is
+// concealed for kLiveConcealBuffers times the buffer in use (B) before it
+// fades out: 80 ms at the default 20 ms. This is a time of its own, not the
+// 4 x B after which buffering counts an underrun.
+constexpr double kLiveFadeMs = 20.0;
+constexpr double kLiveConcealBuffers = 4.0;
+
 // One sink's playback, audio context only.
 class LiveSink {
 public:
@@ -112,10 +121,15 @@ public:
     // buffering (6.8).
     void configure(double latency_ms, int host_block, int host_rate);
     void reset();                               // no stream
+    // The stream was dropped (its slot's generation changed): what it holds
+    // plays out, then the concealment, for the mixer to fade out (16.8).
+    void drop();
     void apply(const SinkItem& it, std::int64_t now_ns);
     void hostGap(int host_frames, int host_rate);   // skip that much of the stream (6.9)
     // Renders `frames` frames at `rate` into `out` (interleaved stereo).
-    // False when there is no stream: then `out` is silence.
+    // False when there is no stream: then `out` is silence. After a stream
+    // ended or was dropped, the decoder's concealment goes on long enough
+    // for the mixer to fade it out (tailing()), and that counts as a stream.
     bool render(float* out, int frames, int rate, std::int64_t now_ns);
     // Incomplete blocks (all but the newest) not asked for in the last
     // 10 ms, at most `max`; returns how many were written to `seqs`.
@@ -123,6 +137,7 @@ public:
 
     bool hasStream() const { return phase_ != Idle; }
     bool playing() const { return phase_ == Playing; }
+    bool tailing() const { return phase_ == Idle && tail48_ > 0; }
     int heldBlocks() const { return newest_ >= next_ ? static_cast<int>(newest_ - next_ + 1) : 0; }
     const SinkSizes& sizes() const { return sizes_; }
     SinkStats stats;
@@ -144,6 +159,7 @@ private:
     void decodeNext(std::int64_t now_ns);       // one block into the 48 kHz queue
     void conceal();
     void sizesChanged();
+    void startTail();                           // a stream just went: concealment to fade out
 
     std::unique_ptr<Entry[]> ring_;
     std::unique_ptr<unsigned char[]> dec_mem_;
@@ -170,6 +186,7 @@ private:
     double fill_age_ = 0;                       // seconds of this estimate
     std::int64_t played48_ = 0;
     std::int64_t last_xrun48_ = -(1LL << 40);
+    int tail48_ = 0;                            // 48 kHz samples of concealment left after the stream
 };
 
 }  // namespace engine

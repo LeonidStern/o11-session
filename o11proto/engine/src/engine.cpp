@@ -58,7 +58,10 @@ void Engine::raisePeak(std::atomic<float>& p, float v) {
 // ------------------------------------------------------------ connection
 
 void Engine::wireClient() {
-    client_.on_message = [this](const RawMessage&) { ++messages_; };
+    client_.on_message = [this](const RawMessage& m) {
+        ++messages_;
+        liveRawMessage(m);
+    };
     client_.on_challenge = [this](const AuthChallenge&) { got_challenge_ = true; };
     client_.on_licence_decision = [this](const std::string& text) {
         return onLicence ? onLicence(text) : LicenceAnswer::Agree;
@@ -944,7 +947,7 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
             float vol = std::min(4.0f, std::max(0.0f, u->volume * rc.volume));
             float pan = std::min(1.0f, std::max(-1.0f, u->pan + rc.pan));
             bool muted = any_solo ? !rc.solo : (rc.mute || u->mute);
-            if (&rc == &u->ch[0] && liveCovers(*u)) muted = true;   // heard live instead (engine_live.cpp)
+            if (&rc == &u->ch[0] && u->live_mix) continue;   // mixed with its live audio by mixLive (engine_live.cpp)
             Decoder& dec = *rc.current;
             int srcRate = dec.rate();
             int needed = rc.rs.needed(srcRate, sampleRate, len);

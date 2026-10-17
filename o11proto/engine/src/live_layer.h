@@ -28,6 +28,7 @@
 #include "live_sink.h"
 #include "o11proto/connection.h"
 #include "o11proto/live.h"
+#include "o11proto/live_room.h"
 #include "o11proto/live_transport.h"
 
 struct OpusEncoder;
@@ -51,6 +52,28 @@ bool parseWholeNumber(const std::string& s, long* out);
 // A user name as Live texts show it (6.5).
 std::string liveDisplayName(const std::string& name);
 
+// One user's channel 0 in the mixer (audio context; ENGINE.md 16.8): its
+// interval audio and its live audio, each through a short delay line so
+// that the one coming in can be lined up with the one going out, and the
+// fade of each. Made by the control context, used by the audio context.
+struct LiveMix {
+    static constexpr int kRing = 2048;          // frames per path
+    static constexpr int kChunk = 256;          // frames mixed at a time
+    static constexpr int kIntervals = 0, kLive = 1;
+    std::unique_ptr<float[]> ring[2];           // interleaved stereo, by path
+    int w = 0;                                  // where the next frame is written, both paths
+    int delay[2] = {0, 0};                      // how far behind each path is read
+    float pos[2] = {1.0f, 0.0f};                // fade positions: 0 silent, 1 full
+    bool path_live = false;                     // the path that should be heard
+    float rho = 0;                              // the paths' correlation during this crossfade
+    int quiet = 1 << 30;                        // host frames since the live slot last had audio
+    float ibuf[2 * kChunk], lbuf[2 * kChunk];
+    LiveMix() {
+        ring[0].reset(new float[2 * kRing]());
+        ring[1].reset(new float[2 * kRing]());
+    }
+};
+
 struct LiveLayer {
     LiveLayer();
     ~LiveLayer();
@@ -67,12 +90,18 @@ struct LiveLayer {
     void forget();                              // a new connection: no Live state at all
     void health(TimePoint now);                 // works out each slot's health (6.4)
     int slotOf(const std::string& name) const;  // the slot of the listed peer with this name, or -1
+    // The health report to send now (ENGINE.md 16.7), from the last one sent.
+    o11proto::live::LiveReport report(TimePoint now);
+    // A new room message (0x08): the mixer takes it at its first boundary
+    // half a second from now.
+    void applyRoom(const o11proto::live::LiveRoom& m, TimePoint now);
     bool serverAnswered() const { return transport_.serverAnswered(); }
     double serverRoundTripMs() const { return transport_.serverRoundTripMs(); }
-    void setTestLoss(double f) {                // live::Transport's test hook
+    void setTestLoss(double f) {                // live::Transport's test hooks
         test_loss_ = f;
         transport_.setTestReceiveLoss(f);
     }
+    void setTestSendGap(int ms) { transport_.setTestSendGap(ms); }
 
     o11proto::live::ServerLive msg;
     bool has_msg = false;
@@ -87,26 +116,29 @@ struct LiveLayer {
         int ndrops = 0;
         int lost[20] = {};                      // lost blocks per 100 ms
         std::int64_t bucket = 0;                // the current 100 ms bucket
-        bool healthy = false;
+        int recent = 0;                         // dropouts in the last 2 s
+        int lost2 = 0, limit = 0;               // blocks lost for good in the last 2 s, and how many may be
+        std::int64_t last_audio_ns = 0;         // when it last played, or the peer last began to send
+        bool expected = false;                  // the peer sends: its slot should play
+        bool healthy = false;                   // 6.4: playing for 1 s with few dropouts and losses
     };
     Health slot_health[kLiveSlots];
     std::uint32_t slot_peer[kLiveSlots] = {};   // control's copy of the slots
     std::string slot_name[kLiveSlots];
-    // The engine's bookkeeping for switching and the chat lines (engine_live.cpp).
-    struct UserState {
-        bool healthy = false;
-        TimePoint healthy_since{};
-        bool fell_back = false;
-        TimePoint fell_back_at{};
-        bool want = false;
-        int want_slot = -1;
-        bool live_now = false;
-    };
-    std::map<std::string, UserState> users;     // by user name
+    // The room's mode (live_room.h): the latest room message, the health
+    // report last sent and the notices said (engine_live.cpp).
+    o11proto::live::LiveRoom room;
+    bool has_room = false;
+    std::uint64_t room_seq = 0;
+    o11proto::live::LiveReport report_sent;
+    bool report_ever = false;
+    TimePoint report_at{};
+    int room_noticed = 0;                       // the applied mode the notices last spoke of
+    std::string cant_said;                      // whose "can't do Live" was said
     bool start_failed_said = false, no_answer_said = false, offer_said = false;
     TimePoint started_at{}, retry_at{};
     bool buffer_changed = false;                // B changed during this connection
-    TimePoint buffer_changed_at{}, grace_until{};
+    TimePoint buffer_changed_at{};
     std::uint32_t changed_gen[kLiveSlots] = {}, changed_drops[kLiveSlots] = {};
 
     // ===================================================== shared state
@@ -117,6 +149,12 @@ struct LiveLayer {
     std::atomic<int> latency_ms{kLiveDefaultBufferMs};   // B, control -> audio
     std::atomic<int> host_block{0}, host_rate{0};        // H and sr, audio -> control
     std::atomic<std::int64_t> last_block_end_ns{0};      // audio -> network (6.3, item 6)
+    std::atomic<bool> sending{false};                    // the source's gate is open (audio -> control)
+    // The room's mode: control announces (a count and the mode in bit 0,
+    // and when it is due), the mixer applies at a boundary and says so.
+    std::atomic<std::uint64_t> room_announce{0};
+    std::atomic<std::int64_t> room_due_ns{0};
+    std::atomic<int> room_applied{0};                    // 1: the mixer plays the room Live
 
     std::unique_ptr<Spsc<SinkItem, 256>> queue[kLiveSlots];
     Spsc<CaptureItem, 1024> capture;
@@ -128,7 +166,12 @@ struct LiveLayer {
     // Captures channel 0 (l and r, or null without input) and plays the sinks.
     void audioBlock(const float* l, const float* r, bool transmit, int frames, int rate);
     bool available(int s) const { return avail_[s]; }
+    bool real(int s) const { return real_[s]; }  // the slot played its stream's audio, not concealment
     const float* out(int s) const { return outbuf_[s].get(); }
+    // The mixer's room state (engine_live.cpp).
+    std::uint64_t mix_announce = 0;             // the announcement it took last
+    bool mix_mode = false;                      // what that said
+    bool mix_live = false;                      // what it plays: the mode, while Live runs here
 
     // ================================================= network thread
 
@@ -138,6 +181,7 @@ struct LiveLayer {
         std::string name;
         bool bound = false;
         int slot = -1;
+        bool sending = false;                   // 0x07's kPeerSending
         bool start_sent = false;
         TimePoint pong_answered{}, start_answered{}, stop_answered{};
         double tokens = 16;
@@ -224,6 +268,7 @@ private:
     // audio context
     std::uint32_t audio_gen_[kLiveSlots] = {};
     bool avail_[kLiveSlots] = {};
+    bool real_[kLiveSlots] = {};
     std::unique_ptr<float[]> outbuf_[kLiveSlots];
     bool gate_open_ = false;
     std::int64_t expect_ns_ = 0, prev_start_ns_ = 0, prev_dur_ns_ = 0;

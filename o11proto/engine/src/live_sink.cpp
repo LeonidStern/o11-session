@@ -88,7 +88,15 @@ void LiveSink::configure(double latency_ms, int host_block, int host_rate) {
     }
 }
 
+void LiveSink::startTail() {
+    tail48_ = static_cast<int>((kLiveConcealBuffers * latency_ms_ + kLiveFadeMs + 10.0) * 48.0);
+}
+
 void LiveSink::reset() {
+    // After a stream, what was decoded plays out, then the concealment
+    // goes on from there, so that the mixer can fade it out without a step.
+    const bool tail = phase_ != Idle || tail48_ > 0;
+    if (phase_ != Idle) startTail();
     phase_ = Idle;
     stopping_ = false;
     for (int i = 0; i < kRing; ++i) ring_[i].state = Empty;
@@ -96,9 +104,17 @@ void LiveSink::reset() {
     newest_ = -1;
     last_played_ = -1;
     far_ = false;
-    fifo_n_ = fifo_at_ = 0;
+    if (!tail) fifo_n_ = fifo_at_ = 0;
     fill_ = -1;
     stats.active.store(false);
+}
+
+void LiveSink::drop() {
+    if (phase_ == Playing && !stopping_) {
+        stopping_ = true;                        // as after a /stop
+        return;
+    }
+    reset();
 }
 
 void LiveSink::emptyFrom(std::int32_t seq) {
@@ -146,12 +162,14 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         fill_ = -1;
         stats.block.store(block_);
         stats.active.store(false);
+        tail48_ = 0;
         return;
     case SinkItem::Stop:
         if (phase_ == Idle) return;
         stopping_ = true;
         if (phase_ == Dry || (phase_ == Buffering && heldBlocks() == 0)) {
             phase_ = Idle;                       // the stream ended; not an underrun
+            startTail();
             stats.active.store(false);
         } else if (phase_ == Buffering) {
             waited_ = sizes_.latency48;          // gives up waiting: plays out what it has
@@ -240,6 +258,11 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
     }
     switch (phase_) {
     case Idle:
+        if (tail48_ > 0) {                       // after the stream: concealment to fade out
+            conceal();
+            tail48_ -= block_;
+            break;
+        }
         std::memset(fifo_, 0, sizeof(float) * 2 * static_cast<std::size_t>(block_));
         return;
     case Dry:
@@ -250,8 +273,10 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
             stats.active.store(false);
             if (stopping_) {
                 phase_ = Idle;
-                std::memset(fifo_, 0, sizeof(float) * 2 * static_cast<std::size_t>(block_));
-                return;
+                startTail();
+                conceal();
+                tail48_ -= block_;
+                break;
             }
             phase_ = Dry;
             conceal();
@@ -296,7 +321,7 @@ void LiveSink::hostGap(int host_frames, int host_rate) {
 }
 
 bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
-    if (phase_ == Idle) {
+    if (phase_ == Idle && tail48_ <= 0) {
         std::memset(out, 0, sizeof(float) * 2 * static_cast<std::size_t>(frames));
         return false;
     }

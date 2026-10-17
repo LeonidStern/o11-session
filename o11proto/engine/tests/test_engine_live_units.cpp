@@ -324,6 +324,32 @@ TEST(sink_stop_and_reset) {
     CHECK(!p.sink.hasStream());
 }
 
+TEST(sink_conceals_after_the_stream) {         // 16.8: what the mixer fades out
+    for (int how = 0; how < 2; ++how) {          // a /stop, then a dropped stream
+        Playing p(10);
+        std::vector<float> out(2 * 240);
+        if (how == 0) {
+            p.sink.apply(item(SinkItem::Stop, 0), p.now);
+            for (int i = 0; i < 40 && p.sink.hasStream(); ++i) p.sink.render(out.data(), 240, 48000, p.now);
+        } else {
+            p.sink.reset();
+        }
+        CHECK(!p.sink.hasStream());
+        CHECK(p.sink.tailing());
+        int blocks = 0;
+        while (p.sink.render(out.data(), 240, 48000, p.now) && blocks < 1000) ++blocks;
+        const double ms = blocks * 5.0;
+        std::printf("    %s: concealment for %.0f ms after the stream\n", how == 0 ? "/stop" : "dropped", ms);
+        // 4 x B (80 ms at 20 ms) and the 20 ms fade, with up to 10 ms to spare
+        CHECK(ms >= kLiveConcealBuffers * 20 + kLiveFadeMs && ms <= kLiveConcealBuffers * 20 + kLiveFadeMs + 15);
+        CHECK(!p.sink.tailing());
+    }
+    Playing p(10);                               // a new stream ends the concealment
+    p.sink.reset();
+    p.sink.apply(item(SinkItem::Start, 100), p.now);
+    CHECK(!p.sink.tailing() && p.sink.hasStream());
+}
+
 TEST(sink_follows_clock_drift) {                // 6.9: a sender whose clock runs 200 ppm fast or slow
     for (double drift : {200e-6, -200e-6}) {
         LiveSink k;

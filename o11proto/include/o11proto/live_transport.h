@@ -57,6 +57,10 @@ public:
     bool running() const;
     // Any thread: changes Options::test_receive_loss while running.
     void setTestReceiveLoss(double fraction);
+    // Test hook, any thread: the data datagrams send() is given in the next
+    // `ms` milliseconds are dropped (send() still returns true), as a gap
+    // on the way to the relay would. Hellos still go out.
+    void setTestSendGap(int ms);
 
     // Network thread only. One data datagram to `dest` (0 = the room's
     // other senders); false when the payload is empty or too long, or the

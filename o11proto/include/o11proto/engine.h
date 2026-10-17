@@ -54,6 +54,7 @@ inline void panGains(float pan, float* left, float* right) {
 }
 
 struct LiveLayer;                                 // Live mode's state (engine/src/live_layer.h)
+struct LiveMix;                                   // a user's channel 0 in the Live mixer (same header)
 
 // Interval length of ENGINE.md 4.3, computed exactly as the reference does.
 inline int intervalLengthFor(int bpm, int bpi, int sampleRate) {
@@ -186,7 +187,16 @@ public:
     void setLiveHostState(bool playing, bool offline);   // the host's transport and offline rendering
     bool liveRunning() const;                   // the Live client (its UDP socket) runs
     bool userLive(int user) const;              // this user's channel 0 is heard live now
+    // The room plays one way for everyone (o11proto/live_room.h): Live, or
+    // intervals. liveRoomLive() is the mode this engine plays now, taken at
+    // an interval boundary; while on intervals, liveRoomReason() and
+    // liveRoomReasonUser() say why and whose ("" when no one's).
+    enum class LiveReason { None, Dropouts, CantLive, Joining };
+    bool liveRoomLive() const;
+    LiveReason liveRoomReason() const;
+    std::string liveRoomReasonUser() const;
     void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
+    void setLiveTestSendGap(int ms);            // test hook: the Live data sent in the next `ms` is lost
 
 private:
     struct UploadBlock {
@@ -238,6 +248,9 @@ private:
         int fade_channels = 0;
         bool ignoresIntervals() const { return (flags & (kChanVoice | kChanSession)) != 0; }
     };
+    struct LiveMixDeleter {
+        void operator()(LiveMix* p) const;
+    };
     struct RemoteUser {
         std::string name;
         float volume = 1.0f;
@@ -245,13 +258,16 @@ private:
         bool mute = false;
         std::uint32_t submask = 0;
         std::array<RemoteChannel, kMaxChannels> ch;
-        // Live mode: what the control context wants (a slot and its
-        // generation, or -1) and what the mixer plays, taken at a boundary.
+        // Live mode: the user's slot as the control context sees it (and
+        // its generation, or -1), the one the mixer plays, taken at a
+        // boundary, and channel 0's two paths in the mixer (null until the
+        // server has Live).
         int live_want = -1;
         std::uint32_t live_want_gen = 0;
         int live_slot = -1;
         std::uint32_t live_gen = 0;
         std::atomic<bool> live_now{false};
+        std::unique_ptr<LiveMix, LiveMixDeleter> live_mix;
     };
     struct Download {
         std::string user;
@@ -340,6 +356,8 @@ private:
     };
     void liveInit();
     void liveMessage(const live::ServerLive& m);
+    void liveRawMessage(const RawMessage& m);   // the room message (0x08)
+    void liveRoomNotices();
     void liveControl();                         // run()
     void liveReset();
     void liveStatus();
@@ -347,8 +365,8 @@ private:
     double liveOneWayMs(int slot, double* buffer_ms, double* network_ms, double* codec_ms) const;
     void liveAudioBlock(const float* const* in, int numIn, int frames, int sampleRate);   // process()
     void liveBoundary();                        // boundary(), before newIntervalStep()
-    bool liveCovers(const RemoteUser& u) const; // channel 0's interval is muted for Live
-    void mixLive(float* const* out, int numOut, int len, int at, int sampleRate);
+    void mixLive(float* const* out, int numOut, int len, int at, int sampleRate);   // channel 0 of Live users
+    void liveIntervalAudio(RemoteUser& u, int len, int sampleRate, float* dst);
     std::atomic<bool> live_enabled_{true};
     std::atomic<int> live_setting_ms_{20};
     std::unique_ptr<LiveLayer, LiveDeleter> live_;   // last: its network thread stops first

@@ -24,6 +24,7 @@ struct Transport::Impl {
     TimePoint last_hello;
     std::atomic<double> loss{0};                   // the test hook
     std::uint32_t rng = 0x9e3779b9u;              // and its generator
+    std::atomic<std::int64_t> gap_until_ns{0};     // the send gap's end (steady clock)
     bool lose() {
         const double l = loss.load(std::memory_order_relaxed);
         if (l <= 0) return false;
@@ -48,6 +49,10 @@ Transport::~Transport() { stop(); }
 
 bool Transport::running() const { return impl_->running; }
 void Transport::setTestReceiveLoss(double fraction) { impl_->loss.store(fraction); }
+void Transport::setTestSendGap(int ms) {
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+    impl_->gap_until_ns.store(now + static_cast<std::int64_t>(ms) * 1000000);
+}
 
 bool Transport::start(const Options& o, std::string& error) {
     stop();
@@ -113,6 +118,10 @@ bool Transport::send(std::uint32_t dest, const std::uint8_t* payload, std::size_
     putLE64(d + 8, m.opt.key);
     putLE32(d + 16, dest);
     std::memcpy(d + kClientHeader, payload, len);
+    const std::int64_t gap = m.gap_until_ns.load(std::memory_order_relaxed);
+    if (gap != 0 &&
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count() < gap)
+        return true;                           // the test's gap
     if (compat::send(m.fd, d, kClientHeader + len, 0) < 0) return false;
     sent_.fetch_add(1);
     return true;
