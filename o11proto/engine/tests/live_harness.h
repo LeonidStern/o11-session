@@ -431,7 +431,8 @@ inline std::vector<ClickBlock> clickBlocks(const float* x, long from, long to, i
 
 // How far behind `ref` the sound in x[from, to) is, within [lo, hi]
 // frames: the lag with the best normalized correlation.
-inline long bestLag(const float* x, const std::function<float(long)>& ref, long from, long to, long lo, long hi) {
+inline long bestLag(const float* x, const std::function<float(long)>& ref, long from, long to, long lo, long hi,
+                    double* correlation = nullptr) {
     long best = lo;
     double best_c = -2;
     std::vector<float> r(static_cast<std::size_t>(to - from + hi - lo));
@@ -450,6 +451,7 @@ inline long bestLag(const float* x, const std::function<float(long)>& ref, long 
             best = d;
         }
     }
+    if (correlation) *correlation = best_c;
     return best;
 }
 

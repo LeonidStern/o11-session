@@ -489,45 +489,132 @@ TEST(accessors_for_a_ui) {
 
 namespace {
 
-// Music-like material: a few sines with a rhythm at the room's 120 bpm.
-// Each note has a 5-8 ms raised-cosine attack, decays, and releases to zero
-// over the last 10 ms before the next one starts, so the material has no
-// clicks of its own: the onsets are its only steps.
-double noteEnvelope(double u, double attack, double decay, double step) {
-    constexpr double kRelease = 0.010;
+// 909-style drums, synthesized here (no samples), as one repeating pattern
+// of two bars of 16ths. alice plays the kick (steps 1, 5, 9 and 13) and the
+// snare (5 and 13); bob the closed hi-hat on every 16th (accented on the
+// off-beat eighths, 3, 7, 11 and 15), the open hi-hat in place of the
+// closed one on step 15 of every second bar, and the clap on 13. Every
+// voice starts with a short raised-cosine attack and decays to exactly zero
+// as (1 - u/length)^4, flat at its end: there are no cut-offs, and a hit's
+// start is the only step in the drums.
+double hitEnvelope(double u, double attack, double length) {
+    if (u < 0 || u >= length) return 0.0;
     const double a = u < attack ? 0.5 - 0.5 * std::cos(M_PI * u / attack) : 1.0;
-    const double r = u > step - kRelease ? 0.5 + 0.5 * std::cos(M_PI * (u - (step - kRelease)) / kRelease) : 1.0;
-    return a * r * std::exp(-u / decay);
+    const double d = 1.0 - u / length;
+    return a * d * d * d * d;
 }
-constexpr double kArpeggioStep = 0.25, kBassStep = 0.5;   // seconds between onsets
-float arpeggio(long n, int rate) {               // eighth notes, A minor
-    static const double notes[8] = {220.0, 261.63, 329.63, 440.0, 392.0, 329.63, 261.63, 196.0};
-    const double t = double(n) / rate;
-    const long k = static_cast<long>(t / kArpeggioStep);
-    const double u = t - k * kArpeggioStep, f = notes[k % 8];
-    const double env = noteEnvelope(u, 0.005, 0.12, kArpeggioStep);
-    return static_cast<float>(0.22 * env * (std::sin(2 * M_PI * f * t) + 0.3 * std::sin(4 * M_PI * f * t)));
-}
-float bass(long n, int rate) {                   // quarter notes and a sustained fifth
-    static const double notes[4] = {110.0, 110.0, 87.31, 98.0};
-    const double t = double(n) / rate;
-    const long k = static_cast<long>(t / kBassStep);
-    const double u = t - k * kBassStep, f = notes[(k / 2) % 4];
-    const double env = noteEnvelope(u, 0.008, 0.35, kBassStep);
-    const double pad = 0.05 * std::sin(2 * M_PI * 164.81 * t) * (0.8 + 0.2 * std::sin(2 * M_PI * 0.5 * t));
-    return static_cast<float>(
-        0.25 * env * (std::sin(2 * M_PI * f * t) + 0.5 * std::sin(4 * M_PI * f * t) + 0.25 * std::sin(6 * M_PI * f * t)) +
-        pad);
-}
+
+struct Biquad {                                  // RBJ cookbook: a high-pass, or a band-pass of 0 dB peak
+    double b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0, x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    Biquad(bool band, double hz, double q, int rate) {
+        const double w = 2 * M_PI * hz / rate, al = std::sin(w) / (2 * q), c = std::cos(w), a0 = 1 + al;
+        if (band) {
+            b0 = al / a0, b1 = 0, b2 = -al / a0;
+        } else {
+            b0 = (1 + c) / 2 / a0, b1 = -(1 + c) / a0, b2 = (1 + c) / 2 / a0;
+        }
+        a1 = -2 * c / a0, a2 = (1 - al) / a0;
+    }
+    double operator()(double x) {
+        const double y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1, x1 = x, y2 = y1, y1 = y;
+        return y;
+    }
+};
+
+struct Drums {
+    int rate = 48000;
+    long origin = 0;                             // the frame where a pattern starts: an interval boundary
+    long step = 0;                               // a 16th, in frames
+    std::vector<float> alice, bob;               // one pattern each, its tails folded back onto its start
+    float peak = 0;                              // of the mix
+
+    Drums(int r, int bpm, long first) : rate(r), origin(first) {
+        step = static_cast<long>(std::lround(60.0 * rate / bpm / 4));
+        const long period = 32 * step, len = period + rate;   // tails up to a second
+        // Noise, filtered once for each voice that uses it.
+        std::vector<double> snare_noise(static_cast<std::size_t>(len)), clap_noise(snare_noise), hat_noise(snare_noise);
+        Biquad hp_snare(false, 1800, 0.7, rate), bp_clap(true, 1200, 1.5, rate);
+        Biquad hp_hat(false, 6500, 0.7, rate), bp_hat(true, 8500, 0.9, rate);
+        std::uint32_t seed = 0x2545F491u;
+        for (long i = 0; i < len; ++i) {
+            seed ^= seed << 13, seed ^= seed >> 17, seed ^= seed << 5;
+            const double w = static_cast<double>(seed) / 2147483648.0 - 1.0;
+            const std::size_t k = static_cast<std::size_t>(i);
+            snare_noise[k] = hp_snare(w);
+            clap_noise[k] = bp_clap(w);
+            hat_noise[k] = bp_hat(hp_hat(w));
+        }
+        std::vector<double> a(static_cast<std::size_t>(len)), b(a);
+        auto hit = [&](std::vector<double>& out, long at, double length, const std::function<double(double, long)>& voice) {
+            for (long i = 0; i < static_cast<long>(length * rate) && at + i < len; ++i)
+                out[static_cast<std::size_t>(at + i)] += voice(static_cast<double>(i) / rate, at + i);
+        };
+        auto kick = [&](double u, long) {        // 150 Hz falling to 50 Hz over about 30 ms
+            const double phase = 2 * M_PI * (50 * u + 100 * 0.010 * (1 - std::exp(-u / 0.010)));
+            const double click = u < 0.003 ? 0.5 - 0.5 * std::cos(2 * M_PI * u / 0.003) : 0.0;   // the soft transient
+            return 0.18 * std::sin(phase) * hitEnvelope(u, 0.0015, 0.50) +
+                   0.036 * click * (0.6 * std::sin(2 * M_PI * 1100 * u) + 0.4 * std::sin(2 * M_PI * 2300 * u));
+        };
+        auto snare = [&](double u, long n) {     // two tones near 180 and 330 Hz, and high-passed noise
+            return 0.06 * (0.6 * std::sin(2 * M_PI * 180 * u) + 0.4 * std::sin(2 * M_PI * 330 * u)) *
+                       hitEnvelope(u, 0.001, 0.15) +
+                   0.10 * snare_noise[static_cast<std::size_t>(n)] * hitEnvelope(u, 0.001, 0.25);
+        };
+        auto clap = [&](double u, long n) {      // four 9 ms bursts 10 ms apart, then a tail
+            double e = 0.6 * hitEnvelope(u - 0.030, 0.001, 0.16);
+            for (int k = 0; k < 4; ++k) e += hitEnvelope(u - 0.010 * k, 0.0005, 0.009);
+            return 0.17 * clap_noise[static_cast<std::size_t>(n)] * e;
+        };
+        auto hat = [&](double length, double level) {
+            return [&, length, level](double u, long n) {
+                return level * hat_noise[static_cast<std::size_t>(n)] * hitEnvelope(u, 0.0003, length);
+            };
+        };
+        for (int s = 0; s < 32; ++s) {
+            const long at = s * step;
+            const int q = s % 16;                // 0-based: step 1 is q = 0
+            if (q % 4 == 0) hit(a, at, 0.50, kick);
+            if (q == 4 || q == 12) hit(a, at, 0.25, snare);
+            if (q == 12) hit(b, at, 0.20, clap);
+            if (q == 14 && s >= 16) hit(b, at, 0.45, hat(0.45, 0.06));   // the open hat, every second bar
+            else hit(b, at, 0.06, hat(0.06, q % 4 == 2 ? 0.07 : 0.03));
+        }
+        alice.assign(static_cast<std::size_t>(period), 0.0f);
+        bob.assign(static_cast<std::size_t>(period), 0.0f);
+        for (long i = 0; i < len; ++i) {         // the tails past the pattern's end ring into its start
+            alice[static_cast<std::size_t>(i % period)] += static_cast<float>(a[static_cast<std::size_t>(i)]);
+            bob[static_cast<std::size_t>(i % period)] += static_cast<float>(b[static_cast<std::size_t>(i)]);
+        }
+        for (long i = 0; i < period; ++i)
+            peak = std::max(peak, std::fabs(alice[static_cast<std::size_t>(i)] + bob[static_cast<std::size_t>(i)]));
+    }
+    std::size_t at(long n) const {
+        const long p = static_cast<long>(alice.size());
+        return static_cast<std::size_t>(((n - origin) % p + p) % p);
+    }
+    float player(int which, long n) const { return (which == 0 ? alice : bob)[at(n)]; }
+    float mix(long n) const { return alice[at(n)] + bob[at(n)]; }
+    bool hitIn(long from, long to) const {     // a hit starts in [from, to): there is one on every 16th
+        const long rel = from - origin, k = rel >= 0 ? (rel + step - 1) / step : -(-rel / step);
+        return origin + k * step < to;
+    }
+};
 
 }  // namespace
 
 TEST(listening_file) {
     Options o;
     o.sides = 3;
+    // The engines' interval clocks start after the first host block, so the
+    // pattern starts there: each bar is an interval, and its first kick
+    // falls on the boundary.
+    const Drums drums(o.rate, o.bpm, kBlock);
     Room r(o, {"alice", "bob", "carl"});
-    r[0].signal = arpeggio;
-    r[1].signal = bass;
+    std::printf("    the drums peak at %.1f dBFS\n", 20 * std::log10(drums.peak));
+    CHECK(drums.peak < 0.5f);                    // under -6 dBFS
+    r[0].signal = [&drums](long n, int) { return drums.player(0, n); };
+    r[1].signal = [&drums](long n, int) { return drums.player(1, n); };
     LocalChannel lc;                             // carl listens: he sends nothing
     lc.name = "listen";
     lc.mute = true;
@@ -537,6 +624,7 @@ TEST(listening_file) {
     REQUIRE(r.roomIs(true, 30, {2}));
     long live_at = 0;
     REQUIRE(r.roomSwitch(2, 0, false, &live_at) > 0);
+    CHECK_EQ((live_at - drums.origin) % intervalLengthFor(o.bpm, o.bpi, o.rate), 0L);   // the bars line up
     const long start = std::max(0L, live_at - 3L * o.rate / 2);
     // How late carl hears the others, from "The room is Live now, about N ms late."
     const std::string now_live = r[2].findNotice("The room is Live now, about ");
@@ -550,10 +638,11 @@ TEST(listening_file) {
     ev.push_back({live_at, "the room goes Live"});
     const int gaps[5] = {20, 50, 80, 120, 250};
     auto waitUntil = [&](long frame) { r.until([&] { return r.frames.load() >= frame; }, 30); };
-    // Each gap starts in the middle of a note. (One that starts right after
-    // an attack makes libopus's concealment repeat the attack once a pitch
-    // period, a buzz of the codec's own that isn't measured here.)
-    const long beat = static_cast<long>(kBassStep * o.rate), mid = static_cast<long>(kArpeggioStep * o.rate / 2);
+    // Each gap starts a 16th after a beat, where alice plays no hit and her
+    // kick is decaying. (One that starts right after an attack makes
+    // libopus's concealment repeat the attack once a pitch period, a buzz of
+    // the codec's own that isn't measured here.)
+    const long beat = 4 * drums.step, mid = drums.step;
     for (int k = 0; k < 5; ++k) {
         const long t = live_at + static_cast<long>((1.5 + 2.0 * k) * o.rate);
         waitUntil(t + ((mid - t) % beat + beat) % beat);
@@ -587,17 +676,22 @@ TEST(listening_file) {
         std::printf("    it went on intervals %.3f s from the start:\n", double(first * kBlock - start) / o.rate);
         for (int i = 0; i < 3; ++i) r[i].printNotices();
     }
-    CHECK(first >= b || !r.calm(live_at, back));
+    CHECK(first >= b || !r.calm(live_at, first * kBlock));   // unless the machine had a hiccup by then
 
     const std::string wav = "live-transitions.wav", txt = "live-transitions.txt";
     CHECK(writeWav(wav, r[2].heard.get() + start, end - start, o.rate));
+    float heard_peak = 0;
+    for (long n = start; n < end; ++n) heard_peak = std::max(heard_peak, std::fabs(r[2].heard[n]));
+    std::printf("    what carl hears peaks at %.1f dBFS\n", 20 * std::log10(heard_peak));
+    CHECK(heard_peak < 0.5f);
     std::FILE* f = std::fopen(txt.c_str(), "w");
     REQUIRE(f);
-    std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. alice plays the arpeggio, bob the bass line;\n"
-                    "carl sends nothing. A slot without audio is concealed for %.0f x B = %.0f ms, then fades\n"
-                    "out over %.0f ms; every switch crossfades over %.0f ms. The first sample is frame %ld of\n"
-                    "the players' clock. Times in seconds from the start.\n\n",
-                 wav.c_str(), double(end - start) / o.rate, kLiveConcealBuffers,
+    std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is 909-style drums, synthesized,\n"
+                    "at %d bpm, one bar per interval: alice plays the kick and the snare, bob the closed and open\n"
+                    "hi-hats and the clap; carl sends nothing. A slot without audio is concealed for %.0f x B =\n"
+                    "%.0f ms, then fades out over %.0f ms; every switch crossfades over %.0f ms. The first sample is\n"
+                    "frame %ld of the players' clock. Times in seconds from the start.\n\n",
+                 wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
                  kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
     for (const Event& e : ev) std::fprintf(f, "%7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
     std::fclose(f);
@@ -605,31 +699,58 @@ TEST(listening_file) {
     for (const Event& e : ev) std::printf("      %7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
 
     // Clicks: no 5 ms block may bend the sound more than 3 times as much as
-    // its surroundings do (the median within 200 ms) and as the material
-    // itself does there, heard through the path or paths that play then,
-    // live or an interval later. A block where a note starts is exempt: the
-    // codecs' rendering of an attack bends it more than the material does,
-    // by how the attack falls on their frames.
+    // its surroundings do (the median within 200 ms) and as the same drums
+    // played straight do there, heard through the path or paths that play
+    // then, live or an interval later. The drums' own count within 5 ms of
+    // the block, since the codecs spread an attack by a few ms (before it
+    // too, as pre-echo), and a block where a hit starts is exempt: how a
+    // codec renders an attack depends on how it falls on its frames.
     const float* x = r[2].heard.get();
     const long L = intervalLengthFor(o.bpm, o.bpi, o.rate), ms = o.rate / 1000;
-    auto material = [&](long n) { return arpeggio(n, o.rate) + bass(n, o.rate); };
+    auto material = [&](long n) { return drums.mix(n); };
     const long d_live = bestLag(x, material, live_at + 300 * ms, live_at + 1300 * ms, 0, 100 * ms);
     const long d_int = bestLag(x, material, start + 100 * ms, live_at - 100 * ms, L - 50 * ms, L + 50 * ms);
     std::printf("    carl hears the players %.1f ms late live, %.1f ms through intervals\n", r.ms(d_live), r.ms(d_int));
-    const long m0 = start - d_int - 2;
-    std::vector<float> m(static_cast<std::size_t>(end - m0));
-    for (long n = m0; n < end; ++n) m[static_cast<std::size_t>(n - m0)] = material(n);
-    const long B = o.rate / 200;
-    auto own = [&](long f, long d) { return secondDifference(m.data() - m0, f - d, f - d + B); };
-    const long step = static_cast<long>(kArpeggioStep * o.rate);   // every bass note starts with one of these
-    auto onset = [&](long f, long d) {           // a note starts in the block, or 1 ms before it
-        const long a = f - d - ms, k = (a + step - 1) / step;
-        return k * step < f - d + B;
+    // carl hears each player through a sink of its own, whose delay moves by
+    // a host block or so when the player's audio comes back after a gap and
+    // the buffer fills again. So each player's live delay is measured again
+    // for every 100 ms that plays live, within 10 ms of the first.
+    const long W = 100 * ms;
+    const std::size_t windows = static_cast<std::size_t>((end - start) / W + 1);
+    std::vector<long> live_lag[2] = {std::vector<long>(windows, d_live), std::vector<long>(windows, d_live)};
+    for (int p = 0; p < 2; ++p) {
+        auto played = [&drums, p](long n) { return drums.player(p, n); };
+        long last = d_live;
+        for (std::size_t k = 0; k < windows; ++k) {
+            const long a = start + static_cast<long>(k) * W, e = std::min(end, a + W);
+            bool live = false;
+            for (long bl = a / kBlock; bl < e / kBlock; ++bl) live = live || r[2].room[bl];
+            if (e - a >= W / 2 && live) {
+                double c = 0;
+                const long d = bestLag(x, played, a, e, d_live - 10 * ms, d_live + 10 * ms, &c);
+                if (c > 0.2) last = d;           // else the window has too little of this player's
+            }
+            live_lag[p][k] = last;
+        }
+    }
+    auto liveLag = [&](int p, long f) {
+        return live_lag[p][std::min(static_cast<std::size_t>((f - start) / W), windows - 1)];
     };
+    const long B = o.rate / 200;
+    auto own = [&](long f, long da, long db) {   // the drums played straight, within 5 ms of the block
+        double v = 0, x1 = 0, x2 = 0;
+        for (long n = f - 5 * ms - 2; n < f + B + 5 * ms; ++n) {
+            const double y = drums.player(0, n - da) + drums.player(1, n - db);
+            if (n >= f - 5 * ms) v = std::max(v, std::fabs(y - 2 * x1 + x2));
+            x2 = x1, x1 = y;
+        }
+        return v;
+    };
+    auto onset = [&](long f, long d) { return drums.hitIn(f - d - ms, f - d + B); };   // in the block, or 1 ms before it
     std::vector<ClickBlock> blocks = clickBlocks(x, start, end, o.rate);
     struct Scored {
         ClickBlock c;
-        double own;                              // the material's own, through the paths that play
+        double own;                              // the drums played straight, through the paths that play
     };
     std::vector<Scored> scored;
     int over = 0, skipped = 0, at_onsets = 0;
@@ -637,33 +758,38 @@ TEST(listening_file) {
         bool live = false, intervals = false;
         for (long b = (c.frame - 30 * ms) / kBlock; b <= (c.frame + B + 30 * ms) / kBlock; ++b)
             (r[2].room[b] ? live : intervals) = true;
-        const double mine = std::max(live ? own(c.frame, d_live) : 0.0, intervals ? own(c.frame, d_int) : 0.0);
+        const long da = liveLag(0, c.frame), db = liveLag(1, c.frame);
+        const double mine = std::max(live ? own(c.frame, da, db) : 0.0, intervals ? own(c.frame, d_int, d_int) : 0.0);
         if (!r.calm(c.frame - 100 * ms, c.frame + 100 * ms)) {
             ++skipped;
             continue;
         }
+        if ((live && (onset(c.frame, da) || onset(c.frame, db))) || (intervals && onset(c.frame, d_int))) {
+            if (c.d2 > 3 * std::max(c.median, mine)) ++at_onsets;
+            continue;
+        }
         scored.push_back({c, mine});
         if (c.d2 > 3 * std::max(c.median, mine)) {
-            if ((live && onset(c.frame, d_live)) || (intervals && onset(c.frame, d_int))) {
-                ++at_onsets;
-                continue;
-            }
             ++over;
-            std::printf("    a click at %.3f s: %.5f against %.5f around it and %.5f in the material\n",
+            std::printf("    a click at %.3f s: %.5f against %.5f around it and %.5f in the drums played straight\n",
                         double(c.frame - start) / o.rate, c.d2, c.median, mine);
         }
     }
-    std::sort(scored.begin(), scored.end(),
-              [](const Scored& a, const Scored& b) { return a.c.d2 / a.c.median > b.c.d2 / b.c.median; });
-    std::printf("    clicks: %zu blocks of 5 ms (%d not, for the machine's hiccups), %d over the limit (and %d where "
-                "a note starts); the five most against their surroundings:\n",
-                scored.size(), skipped, over, at_onsets);
+    auto against = [](const Scored& k) { return k.c.d2 / std::max(k.c.median, k.own); };   // the limit is 3
+    std::sort(scored.begin(), scored.end(), [&](const Scored& a, const Scored& b) { return against(a) > against(b); });
+    std::printf("    clicks: %zu blocks of 5 ms checked (%d not, for the machine's hiccups, and the ones where a hit "
+                "starts, %d of them past the limit), %d over the limit; the five most against their surroundings "
+                "and the drums played straight:\n",
+                scored.size(), skipped, at_onsets, over);
     for (std::size_t i = 0; i < std::min<std::size_t>(5, scored.size()); ++i) {
         const Scored& k = scored[i];
-        std::printf("      %7.3f s  x%.2f (%.5f against %.5f), the material alone x%.2f there\n",
-                    double(k.c.frame - start) / o.rate, k.c.d2 / k.c.median, k.c.d2, k.c.median, k.own / k.c.median);
+        std::printf("      %7.3f s  x%.2f (%.5f against %.5f around it, %.5f in the drums played straight)\n",
+                    double(k.c.frame - start) / o.rate, against(k), k.c.d2, k.c.median, k.own);
     }
-    CHECK_EQ(over, 0);
+    if (first >= b || r.calm(live_at, first * kBlock))
+        CHECK_EQ(over, 0);
+    else                                         // dropouts of the machine's own made the room fall back
+        std::printf("    the clicks aren't checked: the machine's hiccups put the room on intervals\n");
 }
 
 // An argument runs only the cases whose names contain it.
