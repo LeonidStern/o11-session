@@ -5,10 +5,11 @@ servers: your track's input goes to the room, and the other players come back
 on the plug-in's outputs, in time with the room's intervals. This folder is
 the plug-in built on [JUCE 8.0.9](https://juce.com) over `njproto`, the
 clean-room NINJAM client, server and engine in this repository. It replaces
-`ninjam/vst3`, the plug-in on Steinberg's SDK and VSTGUI over Cockos' NJClient,
-whose UI, engine wrapper, tests and CI it ports.
+`ninjam/vst3` in the older Jamsa repository (`LeonidStern/Jamsa`), the plug-in
+on Steinberg's SDK and VSTGUI over Cockos' NJClient, whose UI, engine wrapper,
+tests and CI it ports.
 
-Nothing in here derives from the GPL code of NINJAM (`ninjam/njclient*`,
+Nothing in here derives from the GPL code of NINJAM in that repository (`ninjam/njclient*`,
 `ninjam/mpb*`, `ninjam/netmsg*`, `ninjam/audiostream*`, `ninjam/server`,
 `WDL`, `jmde`): the protocol, the codecs and the mixing are `njproto`'s.
 
