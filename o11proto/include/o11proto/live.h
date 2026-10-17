@@ -30,6 +30,7 @@ constexpr std::uint8_t kFlagUdpOpen = 0x02;
 constexpr std::uint8_t kFlagMaySend = 0x04;
 // peer record flags
 constexpr std::uint8_t kPeerBound = 0x01;
+constexpr std::uint8_t kPeerSending = 0x02;        // its own report says it sends (live_room.h)
 
 // ---------------------------------------------------------------- UDP side
 
@@ -70,7 +71,7 @@ inline bool validFrame(int frame) { return frame == 120 || frame == 240 || frame
 
 struct PeerRecord {
     std::uint32_t id = 0;
-    std::uint8_t flags = 0;                        // kPeerBound
+    std::uint8_t flags = 0;                        // kPeerBound, kPeerSending
     std::string name;
 };
 

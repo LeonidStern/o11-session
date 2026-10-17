@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "o11proto/live.h"
+#include "o11proto/live_room.h"
 #include "o11proto/server.h"
 #include "udp_compat.h"
 
@@ -125,6 +126,13 @@ struct Server::Live {
         bool buckets = false;                  // filled at the first datagram that reaches the check
         double bytes = 0, dgrams = 0;
         TimePoint refill;
+        // the room's mode (live_room.h)
+        TimePoint joined;
+        bool was_bound = false;                // bound at some time since joining
+        bool has_report = false;
+        live::LiveReport report;
+        bool was_clean = false;                // has reported clean at some time
+        std::vector<std::uint8_t> last_room;   // the last room message sent
     };
 
     LiveConfig cfg;
@@ -144,6 +152,11 @@ struct Server::Live {
     std::uint64_t in = 0, out = 0;
     std::array<std::uint64_t, kReasons> dropped{};
     std::uint8_t buf[2048];
+    // The room's mode: worked out at every tick from the players' reports.
+    live::RoomRule rule;
+    TimePoint epoch = Clock::now();            // the rule's clock starts here
+    std::string reason_name;                   // the reason user's name, "" for none
+    bool logged_on = false;                    // the room's Live was on at the last log line
 
     bool allowed() const { return cfg.mode != LiveMode::No; }
     bool open() const { return fd != kInvalidSocket; }
@@ -287,6 +300,8 @@ void Server::setLiveConfig(const LiveConfig& config) {
 bool Server::liveUdpOpen() const { return live_ && live_->open(); }
 std::uint16_t Server::liveUdpPort() const { return live_ ? live_->port : 0; }
 bool Server::liveRoomOn() const { return live_ && live_->roomOn(); }
+bool Server::liveRoomLive() const { return live_ && live_->rule.state().live; }
+std::string Server::liveRoomReasonUser() const { return live_ ? live_->reason_name : std::string(); }
 socket_t Server::liveSocket() const { return live_ ? live_->fd : kInvalidSocket; }
 
 int Server::livePollTimeout(int timeout_ms) const {
@@ -302,6 +317,7 @@ void Server::liveJoined(Conn& c) {
     Live::Player p;
     udp::parseIPv4(c.addr, p.tcp_ip);
     p.channels = c.maxchan > 0;
+    p.joined = Clock::now();
     live_->players[c.id] = std::move(p);
     live_->dirty = true;
 }
@@ -356,8 +372,15 @@ void Server::liveTick(TimePoint now) {
         L.dropped.fill(0);
         L.stats_since = now;
     }
-    if (!L.dirty) return;
-    L.dirty = false;
+    if (L.dirty) {
+        L.dirty = false;
+        liveSendMessages();
+    }
+    liveRoomTick(now);
+}
+
+void Server::liveSendMessages() {
+    Live& L = *live_;
 
     // Keys first: a player without one is neither known nor a sender.
     if (L.allowed()) {
@@ -398,7 +421,9 @@ void Server::liveTick(TimePoint now) {
                 if (!s) continue;
                 live::PeerRecord r;
                 r.id = static_cast<std::uint32_t>(sid);
-                r.flags = L.open() && L.players[sid].bound ? live::kPeerBound : 0;
+                const Live::Player& q = L.players[sid];
+                r.flags = L.open() && q.bound ? live::kPeerBound : 0;
+                if (q.has_report && q.report.sending()) r.flags |= live::kPeerSending;
                 r.name = s->name;
                 m.peers.push_back(std::move(r));
             }
@@ -408,6 +433,78 @@ void Server::liveTick(TimePoint now) {
         p.last = bytes;
         p.told = true;
         send(*c, live::kMsgServerLive, bytes);
+    }
+}
+
+// ------------------------------------------------------ the room's mode
+
+// A Live client's report (0x85); other types the server doesn't know are ignored.
+void Server::liveClientMessage(Conn& c, const RawMessage& m) {
+    if (!live_ || m.type != live::kMsgClientLiveReport) return;
+    auto it = live_->players.find(c.id);
+    live::LiveReport r;
+    if (it == live_->players.end() || !live::decode(m.payload, r)) return;
+    Live::Player& p = it->second;
+    if (!p.has_report || p.report.sending() != r.sending()) live_->dirty = true;   // the others' peer flags
+    p.has_report = true;
+    p.report = r;
+    p.was_clean |= r.clean();
+}
+
+// The rule of live_room.h over the room's users, then the room message
+// (0x08) to every Live player whose last one differs.
+void Server::liveRoomTick(TimePoint now) {
+    Live& L = *live_;
+    auto secs = [&](TimePoint t) { return std::chrono::duration<double>(t - L.epoch).count(); };
+    std::vector<live::RoomRule::Player> in;
+    for (Conn* o : loggedIn()) {
+        if (o->hidden()) continue;
+        live::RoomRule::Player r;
+        r.id = static_cast<std::uint32_t>(o->id);
+        auto it = L.players.find(o->id);
+        if (it == L.players.end()) {           // no Live client
+            r.listener = o->maxchan <= 0;
+        } else {
+            const Live::Player& p = it->second;
+            r.live_client = p.key != 0;
+            r.listener = !p.channels;
+            r.sender = L.isSender(o->id);
+            r.bound = L.open() && p.bound;
+            r.was_bound = p.was_bound;
+            r.has_report = p.has_report;
+            r.report = p.report;
+            r.was_clean = p.was_clean;
+            r.joined = secs(p.joined);
+        }
+        in.push_back(r);
+    }
+    const live::RoomRule::State before = L.rule.state();
+    const live::RoomRule::State& st = L.rule.update(secs(now), L.roomOn(), in);
+    Conn* who = st.user ? connById(static_cast<int>(st.user)) : nullptr;
+    L.reason_name = who ? who->name : std::string();
+    if (st != before && (L.roomOn() || L.logged_on)) {
+        std::string s = "[live room] the room ";   // not "[live]": that is the traffic line
+        const std::string u = who ? displayName(who) : std::string("someone");
+        if (!L.roomOn()) s += "is on intervals: Live is off";
+        else if (st.live) s += "is Live";
+        else if (st.reason == live::RoomReason::Dropouts) s += "is on intervals: " + u + "'s connection had dropouts";
+        else if (st.reason == live::RoomReason::CantLive) s += "is on intervals: " + u + " can't do Live";
+        else if (st.reason == live::RoomReason::Joining) s += "is on intervals while " + u + " joins";
+        else s += "is on intervals";
+        log(s);
+        L.logged_on = L.roomOn();
+    }
+    live::LiveRoom m;
+    m.live = st.live;
+    m.reason = st.reason;
+    m.user = L.reason_name;
+    const std::vector<std::uint8_t> bytes = live::encode(m);
+    for (auto& kv : L.players) {
+        Live::Player& p = kv.second;
+        Conn* c = connById(kv.first);
+        if (!c || !c->logged_in || p.last_room == bytes || (!L.allowed() && p.last_room.empty())) continue;
+        p.last_room = bytes;
+        send(*c, live::kMsgServerLiveRoom, bytes);
     }
 }
 
@@ -523,6 +620,7 @@ void Server::liveReadable() {
             }
             if (!p->bound) L.dirty = true;
             p->bound = true;
+            p->was_bound = true;
             p->addr = from;
             p->local = local.ip;
             p->has_local = has_local && !gone;

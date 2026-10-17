@@ -28,6 +28,7 @@ add_library(o11proto STATIC
   src/server.cpp
   src/server_live.cpp
   src/live.cpp
+  src/live_room.cpp
   src/live_transport.cpp
 )
 target_include_directories(o11proto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -55,7 +56,7 @@ foreach(t test_codec test_sha1 test_loopback)
 endforeach()
 
 # Live mode (PROTOCOL.md 15): the relay's conformance tests and the client transport.
-foreach(t test_live_server test_live_transport)
+foreach(t test_live_server test_live_transport test_live_room)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(${t} o11proto)

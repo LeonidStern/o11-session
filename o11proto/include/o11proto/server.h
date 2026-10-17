@@ -134,6 +134,10 @@ public:
     bool liveUdpOpen() const;
     std::uint16_t liveUdpPort() const;           // 0 while the UDP port is closed
     bool liveRoomOn() const;                     // allowed, UDP open and switched on
+    // The room's mode (live_room.h): Live for everyone, or intervals and
+    // the user that keeps it there ("" when none).
+    bool liveRoomLive() const;
+    std::string liveRoomReasonUser() const;
 
 private:
     struct Channel {
@@ -245,9 +249,12 @@ private:
     int livePollTimeout(int timeout_ms) const;
     void liveReadable();                         // takes every datagram waiting
     void liveTick(TimePoint now);                // freshness, the log line, SERVER_LIVE
+    void liveSendMessages();                     // SERVER_LIVE to whoever needs a new one
+    void liveRoomTick(TimePoint now);            // the room's mode and SERVER_LIVE_ROOM
     void liveJoined(Conn& c);                    // after the login sequence
     void liveLeft(Conn& c);
     bool liveCommand(Conn& c, const std::string& text);   // true: it was !live
+    void liveClientMessage(Conn& c, const RawMessage& m);  // a type the server doesn't know otherwise
 };
 
 }  // namespace o11proto

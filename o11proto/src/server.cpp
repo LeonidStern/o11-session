@@ -467,7 +467,7 @@ void Server::handleMessage(Conn& c, const RawMessage& m) {
     case kMsgClientUploadWrite: handleUploadWrite(c, m.payload); break;
     case kMsgChat: handleChat(c, m.payload); break;
     case kMsgKeepalive: break;
-    default: break;                             // unknown types are ignored
+    default: liveClientMessage(c, m); break;    // Live's reports; other unknown types are ignored
     }
 }
 
