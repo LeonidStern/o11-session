@@ -18,6 +18,7 @@
 #include <string>
 
 #include "njproto/server.h"
+#include "socket_compat.h"
 
 using namespace njproto;
 
@@ -152,12 +153,15 @@ int main(int argc, char** argv) {
 
     Server server;
     if (!server.start(cfg)) {
-        std::fprintf(stderr, "cannot listen on port %u: %s\n", cfg.port, std::strerror(errno));
+        std::fprintf(stderr, "cannot listen on port %u: %s\n", cfg.port,
+                     compat::errorString(compat::lastError()).c_str());
         return 1;
     }
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
-    std::signal(SIGPIPE, SIG_IGN);
+#ifndef _WIN32
+    std::signal(SIGPIPE, SIG_IGN);   // Windows has no SIGPIPE
+#endif
     if (!quiet) std::fprintf(stderr, "[njserver] ready on port %u\n", server.port());
     while (!g_stop) server.poll(200);
     server.stop();

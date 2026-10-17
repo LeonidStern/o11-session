@@ -5,6 +5,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#ifdef _WIN32
+#include <malloc.h>   // alloca
+#else
+#include <cstdlib>    // alloca (glibc, BSD libc)
+#endif
 
 namespace njproto {
 namespace engine {

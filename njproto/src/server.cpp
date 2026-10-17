@@ -2,19 +2,15 @@
 #include "njproto/server.h"
 
 #include <algorithm>
-#include <arpa/inet.h>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
-#include <netinet/in.h>
-#include <poll.h>
 #include <random>
 #include <sstream>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "njproto/sha1.h"
+#include "socket_compat.h"
 
 namespace njproto {
 
@@ -144,20 +140,20 @@ bool Server::start(const ServerConfig& config) {
     }
     effective_codec_ = computeEffectiveCodec();
 
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (!compat::startup()) return false;
+    socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == kInvalidSocket) return false;
+    compat::setListenReuse(fd);
     sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port = htons(cfg_.port);
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
     if (!cfg_.bind_address.empty() && inet_pton(AF_INET, cfg_.bind_address.c_str(), &sa.sin_addr) != 1) {
-        ::close(fd);
+        compat::closeSocket(fd);
         return false;
     }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0 || ::listen(fd, 64) != 0) {
-        ::close(fd);
+        compat::closeSocket(fd);
         return false;
     }
     setNonBlocking(fd);
@@ -169,9 +165,9 @@ bool Server::start(const ServerConfig& config) {
 }
 
 void Server::stop() {
-    if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
+    if (listen_fd_ != kInvalidSocket) {
+        compat::closeSocket(listen_fd_);
+        listen_fd_ = kInvalidSocket;
     }
     conns_.clear();
     transfers_.clear();
@@ -213,7 +209,7 @@ void Server::runFor(int ms) {
 }
 
 void Server::poll(int timeout_ms) {
-    if (listen_fd_ < 0) return;
+    if (listen_fd_ == kInvalidSocket) return;
     std::vector<pollfd> pfds;
     pfds.reserve(conns_.size() + 1);
     pollfd lp{};
@@ -227,8 +223,8 @@ void Server::poll(int timeout_ms) {
         if (c->c.wantWrite()) p.events |= POLLOUT;
         pfds.push_back(p);
     }
-    int rc = ::poll(pfds.data(), pfds.size(), timeout_ms);
-    if (rc < 0 && errno != EINTR) return;
+    int rc = compat::poll(pfds.data(), pfds.size(), timeout_ms);
+    if (rc < 0 && !compat::isInterrupted(compat::lastError())) return;
     if (rc > 0) {
         for (std::size_t i = 1; i < pfds.size(); ++i) {
             Conn& c = *conns_[i - 1];
@@ -270,8 +266,8 @@ void Server::acceptPending() {
     for (;;) {
         sockaddr_storage ss;
         socklen_t len = sizeof(ss);
-        int fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&ss), &len);
-        if (fd < 0) return;
+        socket_t fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&ss), &len);
+        if (fd == kInvalidSocket) return;
         auto c = std::make_unique<Conn>();
         c->c.adopt(fd);
         c->id = next_id_++;
@@ -286,7 +282,7 @@ void Server::acceptPending() {
         for (const auto& o : conns_) {
             if (o->logged_in || !o->c.isOpen()) continue;
             std::uint8_t peek;
-            if (::recv(o->c.fd(), &peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0) continue;
+            if (compat::recv(o->c.fd(), &peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0) continue;
             ++pending;
             if (o->addr == c->addr) ++pending_here;
         }

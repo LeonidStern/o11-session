@@ -8,7 +8,17 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_compile_options(-Wall -Wextra)
+if(MSVC)
+  add_compile_options(/W4)
+else()
+  add_compile_options(-Wall -Wextra)
+endif()
+if(WIN32)
+  # Winsock2 needs the lean windows.h; NOMINMAX keeps std::min/max usable;
+  # _CRT_SECURE_NO_WARNINGS silences MSVC over strerror/fopen/strtol;
+  # _USE_MATH_DEFINES gives M_PI from <cmath>.
+  add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+endif()
 
 add_library(njproto STATIC
   src/message.cpp
@@ -18,8 +28,14 @@ add_library(njproto STATIC
   src/server.cpp
 )
 target_include_directories(njproto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(WIN32)
+  target_link_libraries(njproto PUBLIC ws2_32)
+endif()
 
+# The internal socket layer (src/socket_compat.h) is shared with njserver
+# and the loopback test, which also touch sockets directly.
 add_executable(njserver tools/njserver.cpp)
+target_include_directories(njserver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(njserver njproto)
 
 add_executable(njcli tools/njcli.cpp)
@@ -28,6 +44,7 @@ target_link_libraries(njcli njproto)
 enable_testing()
 foreach(t test_codec test_sha1 test_loopback)
   add_executable(${t} tests/${t}.cpp)
+  target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(${t} njproto)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()

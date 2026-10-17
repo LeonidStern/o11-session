@@ -85,7 +85,7 @@ public:
 
     bool start(const ServerConfig& config);
     void stop();
-    bool running() const { return listen_fd_ >= 0; }
+    bool running() const { return listen_fd_ != kInvalidSocket; }
     std::uint16_t port() const { return port_; }
 
     // One iteration of the event loop, waiting up to timeout_ms.
@@ -188,7 +188,7 @@ private:
     static std::string codecName(std::uint32_t bits);
 
     ServerConfig cfg_;
-    int listen_fd_ = -1;
+    socket_t listen_fd_ = kInvalidSocket;
     std::uint16_t port_ = 0;
     int next_id_ = 1;
     std::vector<std::unique_ptr<Conn>> conns_;

@@ -17,19 +17,30 @@ namespace njproto {
 using Clock = std::chrono::steady_clock;
 using TimePoint = Clock::time_point;
 
+// The platform's socket handle: an int on POSIX, a SOCKET (UINT_PTR) on
+// Windows. Defined here, without pulling in any socket header, so that the
+// public API can carry one; src/socket_compat.h checks the match.
+#ifdef _WIN32
+using socket_t = std::uintptr_t;
+constexpr socket_t kInvalidSocket = ~static_cast<socket_t>(0);
+#else
+using socket_t = int;
+constexpr socket_t kInvalidSocket = -1;
+#endif
+
 class Connection {
 public:
     Connection() = default;
-    explicit Connection(int fd);
+    explicit Connection(socket_t fd);
     ~Connection();
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
     // Takes ownership of an already connected (or connecting) socket and
     // makes it non-blocking with TCP_NODELAY.
-    void adopt(int fd);
-    int fd() const { return fd_; }
-    bool isOpen() const { return fd_ >= 0; }
+    void adopt(socket_t fd);
+    socket_t fd() const { return fd_; }
+    bool isOpen() const { return fd_ != kInvalidSocket; }
     void close();
 
     // Queues one framed message. Returns false when the queue is over the
@@ -61,7 +72,7 @@ public:
     const std::string& peerAddress() const { return peer_; }
 
 private:
-    int fd_ = -1;
+    socket_t fd_ = kInvalidSocket;
     std::vector<std::uint8_t> inbuf_;
     std::deque<std::vector<std::uint8_t>> outq_;   // framed messages
     std::size_t out_off_ = 0;                      // bytes of outq_.front() already sent
@@ -71,9 +82,9 @@ private:
 };
 
 // Small socket helpers used by both sides.
-bool setNonBlocking(int fd);
-bool setNoDelay(int fd);
-std::string peerAddressOf(int fd);
+bool setNonBlocking(socket_t fd);
+bool setNoDelay(socket_t fd);
+std::string peerAddressOf(socket_t fd);
 // Replaces the last octet of a dotted IPv4 address with 'x' (section 4.2).
 std::string maskAddress(const std::string& ip);
 

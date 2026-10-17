@@ -1,15 +1,13 @@
 // njproto - client state machine. See PROTOCOL.md sections 4-9.
 #include "njproto/client.h"
 
-#include <cerrno>
+#include <chrono>
 #include <cstring>
-#include <netdb.h>
-#include <poll.h>
 #include <random>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <thread>
 
 #include "njproto/sha1.h"
+#include "socket_compat.h"
 
 namespace njproto {
 
@@ -48,24 +46,25 @@ bool Client::connect(const std::string& host, std::uint16_t port, const Options&
     keepalive_seconds_ = kDefaultKeepaliveSeconds;
     licence_pending_ = false;
 
+    if (!compat::startup()) return false;
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
     if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res)
         return false;
-    int fd = -1;
+    socket_t fd = kInvalidSocket;
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
         fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
+        if (fd == kInvalidSocket) continue;
         setNonBlocking(fd);
-        int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
-        if (rc == 0 || errno == EINPROGRESS) break;
-        ::close(fd);
-        fd = -1;
+        int rc = ::connect(fd, ai->ai_addr, static_cast<socklen_t>(ai->ai_addrlen));
+        if (rc == 0 || compat::isInProgress(compat::lastError())) break;
+        compat::closeSocket(fd);
+        fd = kInvalidSocket;
     }
     freeaddrinfo(res);
-    if (fd < 0) return false;
+    if (fd == kInvalidSocket) return false;
     conn_.adopt(fd);
     state_ = State::Connecting;
     return true;
@@ -106,19 +105,26 @@ void Client::poll(int timeout_ms) {
     pfd.fd = conn_.fd();
     pfd.events = POLLIN;
     if (state_ == State::Connecting || conn_.wantWrite()) pfd.events |= POLLOUT;
-    int rc = ::poll(&pfd, 1, timeout_ms);
-    if (rc < 0 && errno != EINTR) {
+    int rc = compat::poll(&pfd, 1, timeout_ms);
+    if (rc < 0 && !compat::isInterrupted(compat::lastError())) {
         fail("poll failed");
         return;
+    }
+    if (state_ == State::Connecting && !(rc > 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP)))) {
+        int err = 0;
+        if (compat::connectFailed(conn_.fd(), err)) {   // Windows only; see socket_compat.h
+            fail("connect failed: " + compat::errorString(err));
+            return;
+        }
     }
     if (rc > 0) {
         if (state_ == State::Connecting) {
             if (pfd.revents & (POLLOUT | POLLERR | POLLHUP)) {
                 int err = 0;
                 socklen_t len = sizeof(err);
-                getsockopt(conn_.fd(), SOL_SOCKET, SO_ERROR, &err, &len);
+                compat::getOpt(conn_.fd(), SOL_SOCKET, SO_ERROR, &err, &len);
                 if (err != 0) {
-                    fail(std::string("connect failed: ") + std::strerror(err));
+                    fail("connect failed: " + compat::errorString(err));
                     return;
                 }
                 state_ = State::AwaitingChallenge;
@@ -164,7 +170,7 @@ void Client::runFor(int ms) {
     TimePoint deadline = Clock::now() + std::chrono::milliseconds(ms);
     while (Clock::now() < deadline) {
         if (!conn_.isOpen()) {
-            usleep(10000);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
         poll(50);

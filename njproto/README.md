@@ -13,8 +13,8 @@ A clean-room C++17 implementation of the NINJAM network protocol, written from
 
 Audio encoding and decoding are out of scope: the client takes opaque encoded
 bytes per interval and hands received bytes to the caller. The server never
-looks inside audio data. Dependencies: the C++17 standard library and POSIX
-sockets only.
+looks inside audio data. Dependencies: the C++17 standard library and the
+platform's sockets only (POSIX, or Winsock2 on Windows).
 
 ## Build
 
@@ -22,8 +22,10 @@ sockets only.
     cmake --build build-njproto
     cd build-njproto && ctest
 
-Builds with g++ on Linux at `-Wall -Wextra` without warnings. The loopback test
-takes about ten seconds because it waits for real keepalive and transfer timeouts.
+Builds with g++ on Linux at `-Wall -Wextra` without warnings, and on Windows
+with MSVC or MinGW (the socket layer lives in `src/socket_compat.h`; CMake links
+`ws2_32` there). The loopback test takes about ten seconds because it waits for
+real keepalive and transfer timeouts.
 
 The client engine (`njproto_engine`, `njjam`, the `test_engine_*` tests) needs
 libopus and libFLAC, found with pkg-config. Pass

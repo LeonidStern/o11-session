@@ -1,11 +1,7 @@
 // Client-against-server tests over loopback, following PROTOCOL.md section 13.
 // Everything runs in one thread: the harness pumps the server and all clients.
-#include <arpa/inet.h>
 #include <map>
-#include <netinet/in.h>
 #include <string>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <vector>
 
 #include "check.h"
@@ -13,6 +9,7 @@
 #include "njproto/connection.h"
 #include "njproto/server.h"
 #include "njproto/sha1.h"
+#include "socket_compat.h"
 
 using namespace njproto;
 
@@ -119,13 +116,14 @@ struct RawPeer {
     std::vector<RawMessage> received;
     bool closed = false;
     bool connect(std::uint16_t port) {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        compat::startup();
+        socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in sa{};
         sa.sin_family = AF_INET;
         sa.sin_port = htons(port);
         inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
         if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-            ::close(fd);
+            compat::closeSocket(fd);
             return false;
         }
         c.adopt(fd);
@@ -834,7 +832,7 @@ TEST(protocol_errors_close_connection) {
     CHECK(pumpRaw(h, p, [&] { return p.find(kMsgAuthChallenge) != nullptr; }));
     // Oversized payload length in the header.
     std::vector<std::uint8_t> bad = {0x80, 0x01, 0x40, 0x00, 0x00};
-    ::send(p.c.fd(), bad.data(), bad.size(), 0);
+    compat::send(p.c.fd(), bad.data(), bad.size(), 0);
     CHECK(pumpRaw(h, p, [&] { return p.closed; }));
     CHECK(a.loggedIn());
     // Messages before login other than AUTH_USER are ignored, not fatal.

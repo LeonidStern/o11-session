@@ -1,29 +1,20 @@
 // njproto - non-blocking framed TCP connection.
 #include "njproto/connection.h"
 
-#include <arpa/inet.h>
-#include <cerrno>
 #include <cstring>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
+
+#include "socket_compat.h"
 
 namespace njproto {
 
-bool setNonBlocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return false;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
-}
+bool setNonBlocking(socket_t fd) { return compat::setNonBlocking(fd); }
 
-bool setNoDelay(int fd) {
+bool setNoDelay(socket_t fd) {
     int one = 1;
-    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
+    return compat::setOpt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
 }
 
-std::string peerAddressOf(int fd) {
+std::string peerAddressOf(socket_t fd) {
     sockaddr_storage ss;
     socklen_t len = sizeof(ss);
     if (getpeername(fd, reinterpret_cast<sockaddr*>(&ss), &len) != 0) return "";
@@ -47,11 +38,11 @@ std::string maskAddress(const std::string& ip) {
     return ip.substr(0, dot + 1) + "x";
 }
 
-Connection::Connection(int fd) { adopt(fd); }
+Connection::Connection(socket_t fd) { adopt(fd); }
 
 Connection::~Connection() { close(); }
 
-void Connection::adopt(int fd) {
+void Connection::adopt(socket_t fd) {
     close();
     fd_ = fd;
     setNonBlocking(fd_);
@@ -64,14 +55,14 @@ void Connection::adopt(int fd) {
 }
 
 void Connection::close() {
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
+    if (fd_ != kInvalidSocket) {
+        compat::closeSocket(fd_);
+        fd_ = kInvalidSocket;
     }
 }
 
 bool Connection::send(std::uint8_t type, const std::vector<std::uint8_t>& payload) {
-    if (fd_ < 0) return false;
+    if (fd_ == kInvalidSocket) return false;
     if (outq_.size() >= kMaxSendQueue) return false;
     std::vector<std::uint8_t> frame;
     frame.reserve(kHeaderSize + payload.size());
@@ -82,10 +73,10 @@ bool Connection::send(std::uint8_t type, const std::vector<std::uint8_t>& payloa
 }
 
 bool Connection::readAvailable() {
-    if (fd_ < 0) return false;
+    if (fd_ == kInvalidSocket) return false;
     std::uint8_t buf[16384];
     for (;;) {
-        ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+        compat::ssize_type n = compat::recv(fd_, buf, sizeof(buf), 0);
         if (n > 0) {
             inbuf_.insert(inbuf_.end(), buf, buf + n);
             last_recv_ = Clock::now();
@@ -93,8 +84,9 @@ bool Connection::readAvailable() {
             continue;
         }
         if (n == 0) return false;                        // EOF
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-        if (errno == EINTR) continue;
+        int err = compat::lastError();
+        if (compat::isWouldBlock(err)) return true;
+        if (compat::isInterrupted(err)) continue;
         return false;
     }
 }
@@ -114,13 +106,15 @@ bool Connection::nextMessage(RawMessage& out, bool& error) {
 }
 
 bool Connection::flush() {
-    if (fd_ < 0) return false;
+    if (fd_ == kInvalidSocket) return false;
     while (!outq_.empty()) {
         const auto& front = outq_.front();
-        ssize_t n = ::send(fd_, front.data() + out_off_, front.size() - out_off_, MSG_NOSIGNAL);
+        compat::ssize_type n =
+            compat::send(fd_, front.data() + out_off_, front.size() - out_off_, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-            if (errno == EINTR) continue;
+            int err = compat::lastError();
+            if (compat::isWouldBlock(err)) return true;
+            if (compat::isInterrupted(err)) continue;
             return false;
         }
         out_off_ += static_cast<std::size_t>(n);
@@ -133,7 +127,7 @@ bool Connection::flush() {
 }
 
 bool Connection::keepalive(int interval_seconds, TimePoint now) {
-    if (fd_ < 0) return false;
+    if (fd_ == kInvalidSocket) return false;
     if (interval_seconds <= 0) interval_seconds = kDefaultKeepaliveSeconds;
     auto interval = std::chrono::seconds(interval_seconds);
     if (now - last_recv_ > 3 * interval) return false;

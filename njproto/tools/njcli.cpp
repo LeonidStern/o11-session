@@ -17,6 +17,9 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 #include "njproto/client.h"
 
@@ -139,7 +142,12 @@ int main(int argc, char** argv) {
         }
     }
     opt.auto_subscribe = subscribe_all;
-    if (!dump_dir.empty() && ::mkdir(dump_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+#ifdef _WIN32
+    int mkdir_rc = dump_dir.empty() ? 0 : ::_mkdir(dump_dir.c_str());
+#else
+    int mkdir_rc = dump_dir.empty() ? 0 : ::mkdir(dump_dir.c_str(), 0755);
+#endif
+    if (mkdir_rc != 0 && errno != EEXIST) {
         std::fprintf(stderr, "cannot create %s: %s\n", dump_dir.c_str(), std::strerror(errno));
         return 2;
     }
