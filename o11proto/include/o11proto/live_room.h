@@ -78,7 +78,8 @@ bool decode(const std::vector<std::uint8_t>& p, LiveRoom& out);
 // can do Live, is bound and reports clean. Anything else puts it on
 // intervals at once, naming a user; it returns to Live after all of that
 // held for kSettleSeconds, or kRepeatSettleSeconds when it fell back for a
-// connection problem twice within kRepeatWindowSeconds.
+// connection problem twice within kRepeatWindowSeconds. While it waits, the
+// reason stays, unless its user has left: then there is none (None, 0).
 class RoomRule {
 public:
     static constexpr double kSettleSeconds = 5;

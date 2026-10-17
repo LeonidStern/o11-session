@@ -63,6 +63,7 @@ struct Options {
     std::uint32_t codec = kCapOpus;              // the interval codec: kCapOpus or kCapFlac
     int bpm = 120, bpi = 4;                      // 2 s intervals
     bool live_on = true;
+    bool live_server = true;                     // false: a server without Live (LiveMode::No)
 };
 
 struct Room {
@@ -78,10 +79,15 @@ struct Room {
     // The machine's own hiccups: a wake more than 10 ms late. After one the
     // host catches up, which plays the listeners' buffers faster than the
     // audio can arrive; the checks that need a steady stream skip them.
+    // The audio thread's wakes don't show every hiccup (it may also run at a
+    // real-time priority the others lack), so a plain thread watches too:
+    // when it wakes that late, the network threads may have been as late,
+    // and a listener's buffer ran dry.
     std::atomic<long> late_us{0}, late_blocks{0}, slow_us{0}, sum_us{0}, calls{0}, slow_calls{0};
+    std::atomic<long> plain_late_us{0}, plain_late_count{0};
     std::mutex hm;
     std::vector<long> hiccups;                   // the frames they came at
-    std::thread audio;
+    std::thread audio, watch;
 
     explicit Room(const Options& o, const std::vector<std::string>& names) : opt(o) {
         max_frames = static_cast<long>(kMaxSeconds) * opt.rate;
@@ -95,7 +101,7 @@ struct Room {
         cfg.opus_kbps = 128;
         cfg.bpm = static_cast<std::uint16_t>(opt.bpm);
         cfg.bpi = static_cast<std::uint16_t>(opt.bpi);
-        cfg.live.mode = opt.live_on ? LiveMode::On : LiveMode::Yes;
+        cfg.live.mode = !opt.live_server ? LiveMode::No : opt.live_on ? LiveMode::On : LiveMode::Yes;
         if (!server.start(cfg)) std::printf("    the server didn't start\n");
         server_thread = std::thread([this] {
             while (!server_stop.load()) server.poll(1);
@@ -123,18 +129,37 @@ struct Room {
     }
     ~Room() {
         std::printf("    the host: woke at most %.1f ms late (%ld blocks over 10 ms), the longest process() %.1f ms, "
-                    "the mean %.3f ms, %ld over 2 ms\n",
+                    "the mean %.3f ms, %ld over 2 ms; a plain thread woke at most %.1f ms late (%ld times over 10 ms)\n",
                     late_us.load() / 1000.0, late_blocks.load(), slow_us.load() / 1000.0,
-                    calls.load() ? sum_us.load() / 1000.0 / calls.load() : 0.0, slow_calls.load());
+                    calls.load() ? sum_us.load() / 1000.0 / calls.load() : 0.0, slow_calls.load(),
+                    plain_late_us.load() / 1000.0, plain_late_count.load());
         audio_stop.store(true);
         if (audio.joinable()) audio.join();
+        if (watch.joinable()) watch.join();
         for (auto& s : side) s->e.disconnect();
         for (int i = 0; i < 20; ++i) pump();
         server_stop.store(true);
         server_thread.join();
     }
     Side& operator[](int i) { return *side[static_cast<std::size_t>(i)]; }
-    void startHost() { audio = std::thread([this] { audioLoop(); }); }
+    void startHost() {
+        audio = std::thread([this] { audioLoop(); });
+        watch = std::thread([this] { watchLoop(); });
+    }
+
+    void watchLoop() {
+        while (!audio_stop.load()) {
+            const auto t = Clock::now() + std::chrono::milliseconds(1);
+            std::this_thread::sleep_until(t);
+            const long late = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t).count());
+            if (late > plain_late_us.load()) plain_late_us.store(late);
+            if (late > 10000) {
+                plain_late_count.fetch_add(1);
+                std::lock_guard<std::mutex> lock(hm);
+                hiccups.push_back(frames.load());
+            }
+        }
+    }
 
     // The host: one block of every engine every kBlock frames. After a late
     // wake it calls again at once to catch up, as hosts do; a stall is a
@@ -368,6 +393,64 @@ inline void print(const char* what, const Transition& t) {
 
 inline bool seamless(const Transition& t) {
     return t.step_ratio <= 1.5 && t.silence_ms <= 1.0 && t.rms_low_db >= -1.0 && t.rms_high_db <= 1.0;
+}
+
+// Clicks: for each 5 ms block from `from`, the largest second difference
+// |x[n] - 2 x[n-1] + x[n-2]| (a step, or a bend, in the sound), against the
+// median of the blocks within 200 ms either side of it.
+struct ClickBlock {
+    long frame = 0;                              // where the block starts
+    double d2 = 0;
+    double median = 0;
+};
+inline double secondDifference(const float* x, long from, long to) {
+    double m = 0;
+    for (long n = from; n < to; ++n) m = std::max(m, double(std::fabs(x[n] - 2 * x[n - 1] + x[n - 2])));
+    return m;
+}
+inline std::vector<ClickBlock> clickBlocks(const float* x, long from, long to, int rate) {
+    const long B = rate / 200, around = 40;      // 5 ms blocks; 200 ms either side
+    std::vector<ClickBlock> v;
+    for (long f = std::max(from, 2L); f + B <= to; f += B) {
+        ClickBlock c;
+        c.frame = f;
+        c.d2 = secondDifference(x, f, f + B);
+        v.push_back(c);
+    }
+    std::vector<double> w;
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        w.clear();
+        const std::size_t lo = i >= static_cast<std::size_t>(around) ? i - around : 0;
+        const std::size_t hi = std::min(v.size(), i + around + 1);
+        for (std::size_t k = lo; k < hi; ++k) w.push_back(v[k].d2);
+        std::nth_element(w.begin(), w.begin() + static_cast<std::ptrdiff_t>(w.size() / 2), w.end());
+        v[i].median = std::max(1e-9, w[w.size() / 2]);
+    }
+    return v;
+}
+
+// How far behind `ref` the sound in x[from, to) is, within [lo, hi]
+// frames: the lag with the best normalized correlation.
+inline long bestLag(const float* x, const std::function<float(long)>& ref, long from, long to, long lo, long hi) {
+    long best = lo;
+    double best_c = -2;
+    std::vector<float> r(static_cast<std::size_t>(to - from + hi - lo));
+    for (long k = 0; k < static_cast<long>(r.size()); ++k) r[static_cast<std::size_t>(k)] = ref(from - hi + k);
+    for (long d = lo; d <= hi; ++d) {
+        double c = 0, ex = 0, er = 0;
+        for (long n = from; n < to; ++n) {
+            const double a = x[n], b = r[static_cast<std::size_t>(n - d - (from - hi))];
+            c += a * b;
+            ex += a * a;
+            er += b * b;
+        }
+        const double v = ex > 0 && er > 0 ? c / std::sqrt(ex * er) : 0;
+        if (v > best_c) {
+            best_c = v;
+            best = d;
+        }
+    }
+    return best;
 }
 
 // ------------------------------------------------------------ WAV

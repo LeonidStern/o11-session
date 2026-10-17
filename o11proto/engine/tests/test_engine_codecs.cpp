@@ -73,6 +73,24 @@ double rms(const float* p, std::size_t n) {
     return std::sqrt(s / static_cast<double>(n ? n : 1));
 }
 
+// A note every 12000 frames at 48 kHz: a 5 ms raised-cosine attack, a decay,
+// and a 10 ms release to zero before the next onset.
+float note(long n) {
+    const double t = static_cast<double>(n) / 48000.0, step = 0.25, rel = 0.010;
+    const long k = n / 12000;
+    const double u = t - static_cast<double>(k) * step, f = k % 2 ? 329.63 : 220.0;
+    const double a = u < 0.005 ? 0.5 - 0.5 * std::cos(M_PI * u / 0.005) : 1.0;
+    const double r = u > step - rel ? 0.5 + 0.5 * std::cos(M_PI * (u - (step - rel)) / rel) : 1.0;
+    return static_cast<float>(0.4 * a * r * std::exp(-u / 0.12) * (std::sin(2 * M_PI * f * t) + 0.3 * std::sin(4 * M_PI * f * t)));
+}
+
+double maxSecondDifference(const std::vector<float>& x, std::size_t from, std::size_t to) {
+    double m = 0;
+    for (std::size_t i = std::max<std::size_t>(from, 2); i < to && i < x.size(); ++i)
+        m = std::max(m, std::fabs(static_cast<double>(x[i]) - 2.0 * x[i - 1] + x[i - 2]));
+    return m;
+}
+
 }  // namespace
 
 TEST(opus_round_trip_48k_stereo) {              // 13.1
@@ -130,7 +148,7 @@ TEST(opus_round_trip_44k1_and_crossfade) {      // 13.2
     CHECK(n == 128);
     std::vector<float> joined(g1);
     for (std::size_t i = 0; i < n; ++i) {
-        float s = static_cast<float>(i + 1) / static_cast<float>(n);
+        float s = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * (static_cast<double>(i) + 0.5) / static_cast<double>(n)));
         for (int c = 0; c < 2; ++c) {
             std::size_t k = i * 2 + static_cast<std::size_t>(c);
             g2[k] = g2[k] * s + lap[k] * (1.0f - s);
@@ -149,6 +167,49 @@ TEST(opus_round_trip_44k1_and_crossfade) {      // 13.2
     // The two intervals are also continuous in level (SNR of the join region).
     std::vector<float> ref = tone(997.0, 0.5, 48000, static_cast<int>(joined.size() / 2), 2);
     (void)ref;
+}
+
+// 6.4 and 8.3: an interval boundary 270 frames after a note's onset, the
+// hard case. The old stream's padding must continue its slope (the LPC fit),
+// and the new stream must be right from its first frame (the pre-roll), or
+// the crossfade between them ticks.
+TEST(opus_join_after_an_onset) {
+    const long L = 96000, start = 270;
+    auto enc = makeEncoder(kFourccOpusRaw, 48000, 1, 128);
+    std::vector<std::vector<float>> got(3), lap(3);
+    for (int k = 0; k < 3; ++k) {
+        std::vector<float> pcm(static_cast<std::size_t>(L));
+        for (long i = 0; i < L; ++i) pcm[static_cast<std::size_t>(i)] = note(start + k * L + i);
+        std::unique_ptr<Decoder> dec;
+        got[static_cast<std::size_t>(k)] = decodeAll(kFourccOpusRaw, encodeInterval(*enc, pcm, 1), 4096, &dec);
+        lap[static_cast<std::size_t>(k)] = dec->lapping();
+        CHECK_EQ(got[static_cast<std::size_t>(k)].size(), static_cast<std::size_t>(L));
+        CHECK(lap[static_cast<std::size_t>(k)].size() >= 128);
+    }
+    for (std::size_t k = 1; k < 3; ++k) {
+        const long b = start + static_cast<long>(k) * L;
+        // The old stream's real end, then its lapping frames: continuous.
+        std::vector<float> ol(got[k - 1].end() - 400, got[k - 1].end());
+        ol.insert(ol.end(), lap[k - 1].begin(), lap[k - 1].begin() + 128);
+        // Joined as 8.3: the lapping crossfaded into the new stream.
+        std::vector<float> joined(got[k - 1].end() - 400, got[k - 1].end()), nw(got[k].begin(), got[k].begin() + 400);
+        for (std::size_t i = 0; i < 128; ++i) {
+            const float s = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * (static_cast<double>(i) + 0.5) / 128.0));
+            nw[i] = nw[i] * s + lap[k - 1][i] * (1.0f - s);
+        }
+        joined.insert(joined.end(), nw.begin(), nw.end());
+        std::vector<float> src(800);
+        for (long i = 0; i < 800; ++i) src[static_cast<std::size_t>(i)] = note(b - 400 + i);
+        const double d_src = maxSecondDifference(src, 380, 700);
+        const double d_lap = maxSecondDifference(ol, 398, 404);
+        const double d_join = maxSecondDifference(joined, 380, 700);
+        const double first = std::fabs(static_cast<double>(got[k][0]) - note(b));
+        std::printf("  boundary %zu: d2 %.5f into the lapping, %.5f across the join, %.5f in the source; "
+                    "the new stream's first frame off by %.4f\n", k, d_lap, d_join, d_src, first);
+        CHECK(d_lap <= 2.0 * d_src);
+        CHECK(d_join <= 2.0 * d_src);
+        CHECK(first <= 0.01);
+    }
 }
 
 TEST(opus_byte_at_a_time_and_truncated) {       // 8.1: partial data, no trailer
@@ -309,6 +370,18 @@ TEST(resampler_and_lpc) {
     double level = 20 * std::log10(rms(ext.data(), 128) / rms(cont.data(), 128));
     std::printf("  lpc first 128 level %.2f dB\n", level);
     CHECK(std::fabs(level) <= 3.0);
+    // ... and a note 270 frames after its onset, with no kink where it starts
+    // (the autocorrelation fit of libvorbis' lpc.c kinks about 4 times as much).
+    std::vector<float> h(1024 + 128);
+    for (long i = 0; i < 1024 + 128; ++i) h[static_cast<std::size_t>(i)] = note(12000 + 270 - 1024 + i);
+    std::vector<float> joined(h.begin(), h.begin() + 1024);
+    joined.resize(1024 + 128);
+    lpcExtrapolate(h.data(), 1024, kLpcOrder, joined.data() + 1024, 128);
+    const double kink = maxSecondDifference(joined, 1024, 1027), truth = maxSecondDifference(h, 1018, 1030);
+    double err = 0;
+    for (std::size_t i = 1024; i < 1024 + 128; ++i) err = std::max(err, std::fabs(static_cast<double>(joined[i]) - h[i]));
+    std::printf("  lpc after an onset: d2 %.5f where it starts (the note %.5f), off by at most %.3f over 128\n", kink, truth, err);
+    CHECK(kink <= 1.5 * truth);
     std::vector<float> zeros(1024, 0.0f);
     lpcExtrapolate(zeros.data(), 1024, kLpcOrder, ext.data(), 960);
     CHECK(ext[0] == 0.0f && ext[500] == 0.0f);

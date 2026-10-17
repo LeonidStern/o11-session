@@ -60,37 +60,41 @@ void lpcExtrapolate(const float* history, int n, int order, float* out, int coun
         std::fill(out, out + count, 0.0f);
         return;
     }
-    // Autocorrelation.
-    std::vector<double> r(static_cast<std::size_t>(order) + 1, 0.0);
-    for (int k = 0; k <= order; ++k) {
-        double s = 0;
-        for (int i = k; i < n; ++i) s += static_cast<double>(history[i]) * history[i - k];
-        r[static_cast<std::size_t>(k)] = s;
-    }
-    if (r[0] <= 1e-12) {                          // silence
+    double energy = 0;
+    for (int i = 0; i < n; ++i) energy += static_cast<double>(history[i]) * history[i];
+    if (energy <= 1e-12) {                        // silence
         std::fill(out, out + count, 0.0f);
         return;
     }
-    // Mild lag window (Gaussian, ~20 Hz at 48 kHz) and white-noise correction.
-    for (int k = 1; k <= order; ++k) {
-        double w = 2.0 * M_PI * 20.0 * k / 48000.0;
-        r[static_cast<std::size_t>(k)] *= std::exp(-0.5 * w * w);
-    }
-    r[0] *= 1.0 + 1e-5;
-    // Levinson-Durbin.
+    // Burg's fit: each reflection coefficient minimises the forward and
+    // backward prediction errors over the samples themselves, with no window
+    // and no zeros assumed outside them, and the Levinson recursion turns
+    // them into the predictor. The autocorrelation fit (as libvorbis' lpc.c)
+    // treats the history as zero beyond its ends, so its extrapolation can
+    // start with a kink where the audio changes within the 1024 samples
+    // (a note's attack); Burg's continues the slope.
+    const std::size_t sn = static_cast<std::size_t>(n);
+    std::vector<double> f(history, history + n), bk(f);
     std::vector<double> a(static_cast<std::size_t>(order) + 1, 0.0), tmp(a);
-    double err = r[0];
-    for (int i = 1; i <= order; ++i) {
-        double acc = r[static_cast<std::size_t>(i)];
-        for (int j = 1; j < i; ++j) acc -= a[static_cast<std::size_t>(j)] * r[static_cast<std::size_t>(i - j)];
-        double k = err > 0 ? acc / err : 0.0;
+    a[0] = 1.0;
+    for (int m = 0; m < order; ++m) {
+        double num = 0, den = 0;
+        for (std::size_t i = static_cast<std::size_t>(m) + 1; i < sn; ++i) {
+            num += f[i] * bk[i - 1];
+            den += f[i] * f[i] + bk[i - 1] * bk[i - 1];
+        }
+        if (den <= 1e-18) break;
+        const double k = -2.0 * num / den;
         tmp = a;
-        a[static_cast<std::size_t>(i)] = k;
-        for (int j = 1; j < i; ++j)
-            a[static_cast<std::size_t>(j)] = tmp[static_cast<std::size_t>(j)] - k * tmp[static_cast<std::size_t>(i - j)];
-        err *= (1.0 - k * k);
-        if (err <= 0) break;
+        for (int j = 1; j <= m + 1; ++j)
+            a[static_cast<std::size_t>(j)] = tmp[static_cast<std::size_t>(j)] + k * tmp[static_cast<std::size_t>(m + 1 - j)];
+        for (std::size_t i = sn - 1; i > static_cast<std::size_t>(m); --i) {
+            const double fi = f[i];
+            f[i] = fi + k * bk[i - 1];
+            bk[i] = bk[i - 1] + k * fi;
+        }
     }
+    for (int i = 1; i <= order; ++i) a[static_cast<std::size_t>(i)] = -a[static_cast<std::size_t>(i)];   // y[t] = sum a[j] y[t-j]
     // Bandwidth expansion for stability.
     double g = 1.0;
     for (int i = 1; i <= order; ++i) {

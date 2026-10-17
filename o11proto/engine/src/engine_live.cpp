@@ -109,6 +109,27 @@ bool Engine::userLive(int user) const {
 
 bool Engine::liveRoomLive() const { return live_->room_applied.load() == 1; }
 
+bool Engine::liveServerHas() const { return live_->has_msg && live_->msg.udpOpen(); }
+
+bool Engine::liveRoomSwitchOn() const { return live_->has_msg && live_->msg.roomOn(); }
+
+int Engine::liveHeardMs() const {
+    const LiveLayer& L = *live_;
+    if (!liveRoomLive()) return -1;
+    std::vector<double> v;
+    for (int s = 0; s < kLiveSlots; ++s) {
+        const SinkStats& st = L.sinks[s]->stats;
+        if (!L.slot_peer[s] || st.gen.load() != L.gen[s].load() || !st.active.load()) continue;
+        const double ms = liveOneWayMs(s, nullptr, nullptr, nullptr);
+        if (ms >= 0) v.push_back(ms);
+    }
+    if (v.empty()) return -1;
+    std::sort(v.begin(), v.end());
+    const std::size_t k = v.size() / 2;
+    const double median = v.size() % 2 ? v[k] : (v[k - 1] + v[k]) / 2;
+    return static_cast<int>(std::nearbyint(median));   // rounded as num() rounds
+}
+
 Engine::LiveReason Engine::liveRoomReason() const {
     const LiveLayer& L = *live_;
     if (liveRoomLive() || !L.has_msg || !L.msg.roomOn() || !L.has_room || L.room.live) return LiveReason::None;
@@ -253,19 +274,15 @@ void Engine::liveControl() {
 void Engine::liveRoomNotices() {
     LiveLayer& L = *live_;
     const int applied = L.room_applied.load();
-    const bool reasoned = L.has_msg && L.msg.roomOn() && L.has_room && !L.room.live;
     const std::string& u = L.room.user;
+    const bool reasoned = L.has_msg && L.msg.roomOn() && L.has_room && !L.room.live && !u.empty();
     const bool mine = !u.empty() && u == client_.username();
     const std::string who = liveDisplayName(u);
     if (applied != L.room_noticed) {
         if (applied == 1) {
-            double worst = -1;
-            for (int s = 0; s < kLiveSlots; ++s) {
-                const SinkStats& st = L.sinks[s]->stats;
-                if (L.slot_peer[s] && st.gen.load() == L.gen[s].load() && st.active.load())
-                    worst = std::max(worst, liveOneWayMs(s, nullptr, nullptr, nullptr));
-            }
-            liveNotice("The room is Live now" + (worst >= 0 ? ", about " + num(worst) + " ms late." : std::string(".")),
+            const int heard = liveHeardMs();
+            liveNotice("The room is Live now" +
+                           (heard >= 0 ? ", about " + std::to_string(heard) + " ms late." : std::string(".")),
                        false);
             L.cant_said.clear();
         } else if (reasoned && L.room.reason == live::RoomReason::Dropouts) {
@@ -638,7 +655,7 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
     const float step = static_cast<float>(1000.0 / (kLiveFadeMs * sampleRate));
     const int hold = static_cast<int>(kLiveConcealBuffers * L.latency_ms.load() * sampleRate / 1000.0);
     constexpr int R = LiveMix::kRing - 1;
-    constexpr float kHalfPi = 1.57079632679f;
+    constexpr float kPi = 3.14159265359f, kHalfPi = 1.57079632679f;
     for (auto& up : users_) {
         RemoteUser& u = *up;
         if (!u.live_mix) continue;
@@ -699,7 +716,11 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                     float& q = m.pos[p];
                     if (q < target[p]) q = std::min(target[p], q + step);
                     else if (q > target[p]) q = std::max(target[p], q - step);
-                    g[p] = q >= 1.0f ? 1.0f : (q <= 0.0f ? 0.0f : std::sin(kHalfPi * q));
+                    // Equal power, sin(pi/2 x s) with s a raised cosine of the
+                    // position: no step in the slope at either end, where a
+                    // plain sin(pi/2 x q) starts or stops with one (a tick).
+                    const float sq = 0.5f - 0.5f * std::cos(kPi * q);
+                    g[p] = q >= 1.0f ? 1.0f : (q <= 0.0f ? 0.0f : std::sin(kHalfPi * sq));
                 }
                 if (m.rho > 0 && g[0] > 0 && g[0] < 1 && g[1] > 0 && g[1] < 1) {
                     const float e = g[0] * g[0] + g[1] * g[1];
