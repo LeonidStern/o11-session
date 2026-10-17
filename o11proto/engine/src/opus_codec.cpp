@@ -52,6 +52,7 @@ public:
             pre_skip_ = static_cast<int>(la);
         }
         resampler_.reset(rate, kOpusRate, channels);
+        history_.assign(static_cast<std::size_t>(kLpcHistory) * static_cast<std::size_t>(channels), 0.0f);
     }
     ~OpusEnc() override {
         if (enc_) opus_encoder_destroy(enc_);
@@ -63,12 +64,17 @@ public:
         opus_encoder_ctl(enc_, OPUS_RESET_STATE);
         pending_.clear();
         real_ = 0;
-        history_.assign(static_cast<std::size_t>(kLpcHistory) * static_cast<std::size_t>(channels_), 0.0f);
+        // Pre-roll: the stream starts with the last kPreRoll samples before
+        // it (zeros before the first), which the pre-skip drops again. A fresh
+        // encoder's first samples come out poorly; with the pre-roll they are
+        // past its start, so the crossfade into this stream (8.3) is clean.
+        const std::size_t ch = static_cast<std::size_t>(channels_);
+        pending_.assign(history_.end() - static_cast<std::ptrdiff_t>(static_cast<std::size_t>(kPreRoll) * ch), history_.end());
 
         std::uint8_t head[kHeaderBytes];
         head[0] = 1;                                         // version
         head[1] = static_cast<std::uint8_t>(channels_);
-        put16(head + 2, static_cast<std::uint16_t>(pre_skip_));
+        put16(head + 2, static_cast<std::uint16_t>(streamPreSkip()));
         put32(head + 4, static_cast<std::uint32_t>(rate_));  // input rate, informational
         put32(head + 8, 0);                                  // reserved
         emit(head, sizeof(head));
@@ -87,11 +93,12 @@ public:
 
     void finish() override {
         if (!enc_ || !stream_open_) return;
-        // Pad to the next multiple of 960 of real + pre_skip with an LPC
-        // extrapolation (full level for 128 samples, then a raised-cosine fade).
-        long total = real_ + pre_skip_;
+        // Pad the pre-roll, real and padding to the next multiple of 960 of
+        // real + the stream's pre-skip with an LPC extrapolation (full level
+        // for 128 samples, then a raised-cosine fade).
+        long total = real_ + streamPreSkip();
         long target = ((total + kOpusFrame - 1) / kOpusFrame) * kOpusFrame;
-        long pad = target - real_;
+        long pad = target - kPreRoll - real_;
         if (pad > 0) {
             const std::size_t ch = static_cast<std::size_t>(channels_);
             std::vector<float> ext(static_cast<std::size_t>(pad) * ch);
@@ -120,6 +127,9 @@ public:
     }
 
 private:
+    static constexpr int kPreRoll = 240;   // 5 ms
+    int streamPreSkip() const { return pre_skip_ + kPreRoll; }
+
     void rememberHistory(const std::vector<float>& rs) {
         const std::size_t ch = static_cast<std::size_t>(channels_);
         std::size_t hframes = static_cast<std::size_t>(kLpcHistory);
@@ -154,10 +164,10 @@ private:
 
     OpusEncoder* enc_ = nullptr;
     bool stream_open_ = false;
-    int pre_skip_ = 0;
+    int pre_skip_ = 0;                 // the encoder's lookahead
     Resampler resampler_;
     std::vector<float> pending_;       // resampled, interleaved, not yet encoded
-    std::vector<float> history_;       // last 1024 frames for the LPC padding
+    std::vector<float> history_;       // last 1024 frames, for the pre-roll and the LPC padding
     long real_ = 0;                    // real (unpadded) samples this interval
 };
 

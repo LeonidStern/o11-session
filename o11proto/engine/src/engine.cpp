@@ -922,7 +922,11 @@ void Engine::newIntervalStep() {
                 std::size_t have = std::min(n, rc.current->available());
                 float* d = const_cast<float*>(rc.current->data());
                 for (std::size_t i = 0; i < have; ++i) {
-                    float s = static_cast<float>(i + 1) / static_cast<float>(n);
+                    // A raised cosine, flat at both ends: a linear ramp bends the
+                    // sound where it starts and ends, a tick when the lapping
+                    // frames (an extrapolation) and the new interval differ.
+                    const double u = (static_cast<double>(i) + 0.5) / static_cast<double>(n);
+                    float s = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * u));
                     for (int c = 0; c < ch; ++c) {
                         std::size_t k = i * static_cast<std::size_t>(ch) + static_cast<std::size_t>(c);
                         d[k] = d[k] * s + rc.fade[k] * (1.0f - s);

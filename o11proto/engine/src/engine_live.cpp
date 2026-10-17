@@ -638,7 +638,7 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
     const float step = static_cast<float>(1000.0 / (kLiveFadeMs * sampleRate));
     const int hold = static_cast<int>(kLiveConcealBuffers * L.latency_ms.load() * sampleRate / 1000.0);
     constexpr int R = LiveMix::kRing - 1;
-    constexpr float kHalfPi = 1.57079632679f;
+    constexpr float kPi = 3.14159265359f, kHalfPi = 1.57079632679f;
     for (auto& up : users_) {
         RemoteUser& u = *up;
         if (!u.live_mix) continue;
@@ -699,7 +699,11 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                     float& q = m.pos[p];
                     if (q < target[p]) q = std::min(target[p], q + step);
                     else if (q > target[p]) q = std::max(target[p], q - step);
-                    g[p] = q >= 1.0f ? 1.0f : (q <= 0.0f ? 0.0f : std::sin(kHalfPi * q));
+                    // Equal power, sin(pi/2 x s) with s a raised cosine of the
+                    // position: no step in the slope at either end, where a
+                    // plain sin(pi/2 x q) starts or stops with one (a tick).
+                    const float sq = 0.5f - 0.5f * std::cos(kPi * q);
+                    g[p] = q >= 1.0f ? 1.0f : (q <= 0.0f ? 0.0f : std::sin(kHalfPi * sq));
                 }
                 if (m.rho > 0 && g[0] > 0 && g[0] < 1 && g[1] > 0 && g[1] < 1) {
                     const float e = g[0] * g[0] + g[1] * g[1];
