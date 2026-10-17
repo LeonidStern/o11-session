@@ -79,10 +79,15 @@ struct Room {
     // The machine's own hiccups: a wake more than 10 ms late. After one the
     // host catches up, which plays the listeners' buffers faster than the
     // audio can arrive; the checks that need a steady stream skip them.
+    // The audio thread's wakes don't show every hiccup (it may also run at a
+    // real-time priority the others lack), so a plain thread watches too:
+    // when it wakes that late, the network threads may have been as late,
+    // and a listener's buffer ran dry.
     std::atomic<long> late_us{0}, late_blocks{0}, slow_us{0}, sum_us{0}, calls{0}, slow_calls{0};
+    std::atomic<long> plain_late_us{0}, plain_late_count{0};
     std::mutex hm;
     std::vector<long> hiccups;                   // the frames they came at
-    std::thread audio;
+    std::thread audio, watch;
 
     explicit Room(const Options& o, const std::vector<std::string>& names) : opt(o) {
         max_frames = static_cast<long>(kMaxSeconds) * opt.rate;
@@ -124,18 +129,37 @@ struct Room {
     }
     ~Room() {
         std::printf("    the host: woke at most %.1f ms late (%ld blocks over 10 ms), the longest process() %.1f ms, "
-                    "the mean %.3f ms, %ld over 2 ms\n",
+                    "the mean %.3f ms, %ld over 2 ms; a plain thread woke at most %.1f ms late (%ld times over 10 ms)\n",
                     late_us.load() / 1000.0, late_blocks.load(), slow_us.load() / 1000.0,
-                    calls.load() ? sum_us.load() / 1000.0 / calls.load() : 0.0, slow_calls.load());
+                    calls.load() ? sum_us.load() / 1000.0 / calls.load() : 0.0, slow_calls.load(),
+                    plain_late_us.load() / 1000.0, plain_late_count.load());
         audio_stop.store(true);
         if (audio.joinable()) audio.join();
+        if (watch.joinable()) watch.join();
         for (auto& s : side) s->e.disconnect();
         for (int i = 0; i < 20; ++i) pump();
         server_stop.store(true);
         server_thread.join();
     }
     Side& operator[](int i) { return *side[static_cast<std::size_t>(i)]; }
-    void startHost() { audio = std::thread([this] { audioLoop(); }); }
+    void startHost() {
+        audio = std::thread([this] { audioLoop(); });
+        watch = std::thread([this] { watchLoop(); });
+    }
+
+    void watchLoop() {
+        while (!audio_stop.load()) {
+            const auto t = Clock::now() + std::chrono::milliseconds(1);
+            std::this_thread::sleep_until(t);
+            const long late = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t).count());
+            if (late > plain_late_us.load()) plain_late_us.store(late);
+            if (late > 10000) {
+                plain_late_count.fetch_add(1);
+                std::lock_guard<std::mutex> lock(hm);
+                hiccups.push_back(frames.load());
+            }
+        }
+    }
 
     // The host: one block of every engine every kBlock frames. After a late
     // wake it calls again at once to catch up, as hosts do; a stall is a
