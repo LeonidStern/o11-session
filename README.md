@@ -113,9 +113,9 @@ The sound is the same to 0.1 dB.
 **Compatibility:** the classic server's own protocol test suite passes 28 of
 28 cases against the O11 Session server.
 
-Every change is built and tested automatically on macOS, Windows and Linux,
-including Tracktion's pluginval at its strictest level and a full two-player
-session through a hosted room.
+Every change is built and tested automatically on macOS, and each release
+candidate on macOS, Windows and Linux, including Tracktion's pluginval at its
+strictest level and a full two-player session through a hosted room.
 
 ## Coming next
 
