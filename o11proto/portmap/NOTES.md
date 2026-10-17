@@ -73,3 +73,20 @@ listed here.
   treated as a permanent lease (rechecked every 1800 s), as section 4 reads.
 - `log` is copied when `start()` is called; setting it afterwards has no
   effect on the running thread.
+
+## UDP for Live mode
+
+`start(port, true)` maps UDP on the same port number as TCP, through the
+same router (live-mode-spec 4.11). The choices:
+
+- UDP is mapped right after TCP with the same lease (UPnP: 3600 s, or 0 when
+  the router is permanent-only; NAT-PMP: 3600 s asked) and renewed with it.
+- A UDP failure never stops the TCP mapping: it logs one line without the
+  `[portmap] ` prefix (`warning: Live: the router did not forward UDP port N
+  ...`) and the success line names TCP only. A NAT-PMP UDP mapping that got
+  another public port is kept, counted as not working and removed on stop
+  (quirk 10).
+- On stop UDP is removed first, without a line; the removal line then says
+  `TCP and UDP port N` or `TCP port N`.
+- The fake router learned two scenarios: `udp718` (UPnP refuses UDP with
+  error 718) and `natpmpshift` (NAT-PMP grants UDP one port higher).

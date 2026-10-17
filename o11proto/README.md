@@ -38,7 +38,9 @@ libopus and libFLAC, found with pkg-config. Pass
              [--require-codec opus|flac] [--opus-kbps N|none]
              [--keepalive N] [--max-users N] [--max-pending TOTAL PER_IP]
              [--max-channels N] [--topic TEXT] [--motd LINE]... [--licence FILE]
-             [--mask-ip] [--vote-threshold PCT] [--login-timeout N] [--port-map] [--quiet]
+             [--mask-ip] [--vote-threshold PCT] [--login-timeout N] [--port-map]
+             [--live no|yes|on|require] [--live-kbps N] [--live-frame N]
+             [--live-max-peers N] [--live-port N] [--live-strict-address yes|no] [--quiet]
 
 Defaults: Opus relayed besides Vorbis, room Opus bitrate 128 kbps (a value
 outside 32-510 is ignored with a warning; `none` means clients send at their
@@ -69,7 +71,19 @@ Anonymous users (`--anon`) get `c` and `v`, plus `m` with `--anon-multi`. Exampl
 
 `--port-map` asks the home router to forward the listening port to this
 machine (see below); the mapper's lines appear in the server log and the
-mapping is removed when the server exits.
+mapping is removed when the server exits. With Live mode open it forwards the
+UDP port of the same number too.
+
+`--live` turns on Live mode (PROTOCOL.md section 15): players who are on Live
+hear each other in real time through a UDP relay on the TCP port's number.
+`yes` opens the UDP port with the room's Live switch off, `on` with it on, and
+`require` is `yes` that refuses to start when the UDP port can't be opened.
+Players switch it with `!live on` / `!live off` in chat. `--live-kbps`,
+`--live-frame` and `--live-max-peers` set what the server tells the clients;
+`--live-port` announces another UDP port (a router that forwards a different
+external port); `--live-strict-address no` accepts UDP from any address of a
+player who knows the key (for players whose UDP leaves through another
+address than their TCP).
 
 ## Router port mapping
 

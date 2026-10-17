@@ -4,7 +4,9 @@
 // UPnP-IGD first and NAT-PMP second, on its own thread. It renews the mapping
 // before it expires, keeps trying when no router answers and removes the
 // mapping when stopped. Everything it has to say goes through `log`, one line
-// per event, each starting with "[portmap] ".
+// per event, each starting with "[portmap] ", except the Live warning that the
+// UDP port could not be forwarded (PROTOCOL.md 15.11), which starts with
+// "warning: Live: ".
 #ifndef O11PROTO_PORTMAP_H
 #define O11PROTO_PORTMAP_H
 
@@ -22,7 +24,9 @@ public:
     PortMapper& operator=(const PortMapper&) = delete;
 
     // Non-blocking. Replaces any mapping made for a previous port (stop() first).
-    void start(int port);
+    // With `udp` (a server whose Live UDP port is open), the UDP port of the
+    // same number is mapped too. Call start() again when either changes.
+    void start(int port, bool udp = false);
     // Blocks until the mapping is removed; bounded by the router timeouts.
     void stop();
 

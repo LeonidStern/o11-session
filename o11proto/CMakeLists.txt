@@ -26,10 +26,12 @@ add_library(o11proto STATIC
   src/connection.cpp
   src/client.cpp
   src/server.cpp
+  src/server_live.cpp
+  src/live.cpp
 )
 target_include_directories(o11proto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(WIN32)
-  target_link_libraries(o11proto PUBLIC ws2_32)
+  target_link_libraries(o11proto PUBLIC ws2_32 bcrypt)
 endif()
 
 # The internal socket layer (src/socket_compat.h) is shared with o11server
@@ -48,6 +50,14 @@ foreach(t test_codec test_sha1 test_loopback)
   target_link_libraries(${t} o11proto)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# Live mode (PROTOCOL.md 15): the relay's conformance tests.
+find_package(Threads REQUIRED)
+add_executable(test_live_server tests/test_live_server.cpp)
+target_include_directories(test_live_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_live_server o11proto Threads::Threads)
+add_test(NAME test_live_server COMMAND test_live_server)
+set_tests_properties(test_live_server PROPERTIES TIMEOUT 120)
 
 # ---------------------------------------------------------------- engine
 # The client engine (ENGINE.md) needs libopus and libFLAC.

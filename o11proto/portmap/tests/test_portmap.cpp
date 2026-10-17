@@ -1,4 +1,5 @@
-// Acceptance tests of PORTMAP.md section 8 against the fake router in
+// Acceptance tests of PORTMAP.md section 8, and of the UDP mapping for Live
+// (PROTOCOL.md 15.11, the Live spec's test 27), against the fake router in
 // fake_router.py (started per scenario; it prints "READY <http-port>" and
 // reports what it holds at GET /mappings).
 //
@@ -153,6 +154,12 @@ struct Log {
         return n;
     }
     bool has(const std::string& needle) { return count(needle) > 0; }
+    std::string lastPortmap() {
+        std::lock_guard<std::mutex> lock(m);
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it)
+            if (it->compare(0, 10, "[portmap] ") == 0) return *it;
+        return "";
+    }
     bool allPrefixed() {
         std::lock_guard<std::mutex> lock(m);
         for (const auto& l : lines)
@@ -308,6 +315,149 @@ TEST(private_ipv4) {
         CHECK(isPrivateIPv4(a));
     for (const char* a : {"172.32.0.1", "100.128.0.1", "93.184.216.34", "8.8.8.8"})
         CHECK(!isPrivateIPv4(a));
+}
+
+// ------------------------------------------------- UDP for Live (15.11)
+
+static bool holds(const FakeRouter& fake, const std::string& line) {
+    for (const auto& l : fake.mappings())
+        if (l == line) return true;
+    return false;
+}
+
+TEST(live_upnp_tcp_and_udp) {
+    FakeRouter fake("public");
+    CHECK(fake.ok());
+    pointAt(fake);
+    Log log;
+    PortMapper pm;
+    log.attach(pm);
+    pm.start(kPort, true);
+    CHECK(log.waitFor("UPnP: people can connect to 93.184.216.34:2049", 5000));
+    CHECK(log.has("[portmap] asking the router to forward TCP and UDP port 2049 to this machine"));
+    CHECK(holds(fake, "upnp TCP 2049 2049 127.0.0.1 3600 O11 Session"));
+    CHECK(holds(fake, "upnp UDP 2049 2049 127.0.0.1 3600 O11 Session"));
+    pm.stop();
+    CHECK(log.has("[portmap] UPnP: removed the forward for TCP and UDP port 2049"));
+    CHECK_EQ(fake.countMappings("upnp "), 0);
+    CHECK(log.allPrefixed());
+}
+
+TEST(live_upnp_permanent_and_private) {
+    {
+        FakeRouter fake("permanent");
+        CHECK(fake.ok());
+        pointAt(fake);
+        Log log;
+        PortMapper pm;
+        log.attach(pm);
+        pm.start(kPort, true);
+        CHECK(log.waitFor("people can connect to", 5000));
+        CHECK(holds(fake, "upnp UDP 2049 2049 127.0.0.1 0 O11 Session"));   // TCP's lease
+        pm.stop();
+        CHECK_EQ(fake.countMappings("upnp "), 0);
+    }
+    {
+        FakeRouter fake("private");
+        CHECK(fake.ok());
+        pointAt(fake);
+        Log log;
+        PortMapper pm;
+        log.attach(pm);
+        pm.start(kPort, true);
+        CHECK(log.waitFor("which is not public", 5000));
+        CHECK(log.has("UPnP: router forwards TCP and UDP port 2049 to this machine, but the router's own"));
+        pm.stop();
+    }
+}
+
+TEST(live_natpmp_tcp_and_udp) {
+    FakeRouter fake("refuse718");
+    CHECK(fake.ok());
+    pointAt(fake);
+    Log log;
+    PortMapper pm;
+    log.attach(pm);
+    pm.start(kPort, true);
+    CHECK(log.waitFor("NAT-PMP: people can connect to 93.184.216.34:2049", 8000));
+    CHECK(holds(fake, "natpmp TCP 2049 2049 3600"));
+    CHECK(holds(fake, "natpmp UDP 2049 2049 3600"));
+    CHECK(!log.has("warning: Live"));
+    pm.stop();
+    CHECK(log.has("[portmap] NAT-PMP: removed the forward for TCP and UDP port 2049"));
+    CHECK_EQ(fake.countMappings("natpmp TCP"), 0);
+    CHECK_EQ(fake.countMappings("natpmp UDP"), 0);
+}
+
+TEST(live_upnp_udp_refused) {
+    FakeRouter fake("udp718");
+    CHECK(fake.ok());
+    pointAt(fake);
+    Log log;
+    PortMapper pm;
+    log.attach(pm);
+    pm.start(kPort, true);
+    CHECK(log.waitFor("people can connect to", 5000));
+    CHECK(holds(fake, "upnp TCP 2049 2049 127.0.0.1 3600 O11 Session"));
+    CHECK_EQ(fake.countMappings("upnp UDP"), 0);
+    CHECK_EQ(log.count("warning: Live: the router did not forward UDP port 2049 (UPnP: the router forwards it to "
+                       "another machine), so players outside your network can't play Live with you; they still "
+                       "hear you through intervals"),
+             1);
+    CHECK(log.lastPortmap().find("people can connect to 93.184.216.34:2049") != std::string::npos);
+    pm.stop();
+    CHECK(log.has("[portmap] UPnP: removed the forward for TCP port 2049"));
+    CHECK_EQ(fake.countMappings("upnp "), 0);
+}
+
+TEST(live_natpmp_udp_other_port) {
+    FakeRouter fake("natpmpshift");
+    CHECK(fake.ok());
+    pointAt(fake);
+    Log log;
+    PortMapper pm;
+    log.attach(pm);
+    pm.start(kPort, true);
+    CHECK(log.waitFor("NAT-PMP: people can connect to 93.184.216.34:2049", 8000));
+    CHECK(log.has("warning: Live: the router did not forward UDP port 2049 (NAT-PMP: it gave public port 2050, "
+                  "not 2049)"));
+    CHECK(holds(fake, "natpmp UDP 2049 2050 3600"));            // kept, but not counted as working
+    pm.stop();
+    CHECK(log.has("[portmap] NAT-PMP: removed the forward for TCP port 2049"));
+    CHECK_EQ(fake.countMappings("natpmp UDP"), 0);
+}
+
+TEST(live_no_router) {
+    setEnv("O11_UPNP_ROOTDESC", "http://127.0.0.1:" + std::to_string(closedPort()) + "/rootDesc.xml");
+    setEnv("O11_NATPMP_GATEWAY", "127.0.0.1");
+    Log log;
+    PortMapper pm;
+    log.attach(pm);
+    pm.start(kPort, true);
+    CHECK(log.waitFor("[portmap] could not find a router that supports UPnP or NAT-PMP. Forward TCP port 2049 on "
+                      "your router to this machine by hand, and UDP port 2049 for Live, or turn on UPnP in the "
+                      "router's settings. Will keep trying every 5 minutes.",
+                      10000));
+    pm.stop();
+}
+
+TEST(live_restart_adds_udp) {
+    FakeRouter fake("public");
+    CHECK(fake.ok());
+    pointAt(fake);
+    Log log;
+    PortMapper pm;
+    log.attach(pm);
+    pm.start(kPort);
+    CHECK(log.waitFor("people can connect to", 5000));
+    CHECK_EQ(fake.countMappings("upnp UDP"), 0);
+    pm.start(kPort, true);                                     // a reload opened the UDP port
+    auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (Clock::now() < deadline && !holds(fake, "upnp UDP 2049 2049 127.0.0.1 3600 O11 Session"))
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(holds(fake, "upnp UDP 2049 2049 127.0.0.1 3600 O11 Session"));
+    pm.stop();
+    CHECK_EQ(fake.countMappings("upnp "), 0);
 }
 
 TEST_MAIN()

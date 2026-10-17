@@ -42,6 +42,28 @@ struct UserAccount {
     std::uint32_t privs = kPrivChat | kPrivVote;
 };
 
+// Live mode options (PROTOCOL.md 15.5). Values out of range are logged and
+// replaced by their default when the server starts or the options change.
+enum class LiveMode {
+    No,         // no Live
+    Yes,        // the room starts with Live off
+    On,         // the room starts with Live on
+    Require,    // like Yes, but start() fails when the UDP port can't be opened
+};
+struct LiveConfig {
+    LiveMode mode = LiveMode::No;
+    int kbps = 128;                            // the room's Live Opus bitrate, 32-510
+    int frame = 240;                           // Opus frame at 48 kHz: 120, 240 or 480
+    int max_peers = 8;                         // senders per room, 1-64
+    int announce_port = 0;                     // UDP port announced instead of the real one; 0 = the real one
+    bool strict_address = true;                // UDP must come from the player's TCP address
+    // Test hooks; the environment variables NINJAM_LIVE_FRESH_SECONDS and
+    // NINJAM_LIVE_STATS_SECONDS (decimal seconds, above 0) override them
+    // when the UDP port opens.
+    double fresh_seconds = 20;                 // a player stays bound this long after a verified hello
+    double stats_seconds = 60;                 // period of the relay's traffic line
+};
+
 struct ServerConfig {
     std::uint16_t port = 2049;                 // 0 = any free port (see Server::port())
     std::string bind_address;                  // empty = all interfaces
@@ -74,6 +96,8 @@ struct ServerConfig {
     int transfer_timeout_seconds = kTransferTimeoutSeconds;
     int max_uploads_per_user = 64;
     std::function<void(const std::string&)> log;   // optional
+    // Live mode (section 15): UDP on the TCP port's number.
+    LiveConfig live;
 };
 
 class Server {
@@ -101,6 +125,15 @@ public:
     const std::string& topic() const { return topic_; }
     std::uint32_t effectiveCodec() const { return effective_codec_; }
     std::uint32_t opusKbps() const { return opus_kbps_; }
+
+    // Live mode (section 15, server_live.cpp). setLiveConfig() applies new
+    // Live options while running, as a configuration reload does: it opens
+    // or closes the UDP port, and a room whose switch nobody chose with
+    // !live takes the new default.
+    void setLiveConfig(const LiveConfig& live);
+    bool liveUdpOpen() const;
+    std::uint16_t liveUdpPort() const;           // 0 while the UDP port is closed
+    bool liveRoomOn() const;                     // allowed, UDP open and switched on
 
 private:
     struct Channel {
@@ -199,6 +232,22 @@ private:
     std::uint32_t effective_codec_ = kCapOpus;
     std::uint32_t opus_kbps_ = 0;
     std::map<std::string, std::map<int, Vote>> votes_;   // "bpm"/"bpi" -> conn id -> vote
+
+    // Live mode: the relay and the TCP side (server_live.cpp).
+    struct Live;
+    struct LiveDeleter {
+        void operator()(Live* p) const;
+    };
+    std::unique_ptr<Live, LiveDeleter> live_;
+    bool liveStart();                            // false: Require and no UDP port
+    void liveShutdown();                         // closes the UDP port
+    socket_t liveSocket() const;
+    int livePollTimeout(int timeout_ms) const;
+    void liveReadable();                         // takes every datagram waiting
+    void liveTick(TimePoint now);                // freshness, the log line, SERVER_LIVE
+    void liveJoined(Conn& c);                    // after the login sequence
+    void liveLeft(Conn& c);
+    bool liveCommand(Conn& c, const std::string& text);   // true: it was !live
 };
 
 }  // namespace o11proto

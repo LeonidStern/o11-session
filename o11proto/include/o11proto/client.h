@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "o11proto/connection.h"
+#include "o11proto/live.h"
 #include "o11proto/message.h"
 
 namespace o11proto {
@@ -43,6 +44,7 @@ public:
         bool login_when_licence_refused = false;       // true: send AUTH_USER without bit 0 and let the server refuse
         bool send_keepalives = true;                   // false only for tests
         bool auto_subscribe = false;                   // subscribe to every user seen (mask ~0)
+        bool live = false;                             // set client_caps bit 16: Live mode (PROTOCOL.md 15)
     };
 
     struct RemoteChannel {
@@ -72,6 +74,9 @@ public:
     std::function<void(const Guid&, bool complete)> on_download_end;  // false = timed out
     std::function<void(const ChatMessage&)> on_chat;
     std::function<void(const CodecMask&)> on_codec_mask;
+    // Live mode (Options::live): each accepted Live message (0x07), a full
+    // state that replaces the previous one.
+    std::function<void(const live::ServerLive&)> on_live;
     std::function<void(const RawMessage&)> on_message;           // every message, before decoding
     std::function<void(const std::string& reason)> on_disconnect;
 
@@ -106,6 +111,13 @@ public:
     const CodecMask& codecMask() const { return codec_mask_; }
     const std::map<std::string, RemoteUser>& users() const { return users_; }
     const std::string& failReason() const { return fail_reason_; }
+    // Live mode: the latest Live message of this connection, and where Live
+    // UDP goes (the IPv4 address of the server end of the TCP connection, ""
+    // when it isn't IPv4, and the TCP port connected to).
+    bool hasLiveMessage() const { return has_live_; }
+    const live::ServerLive& liveMessage() const { return live_; }
+    const std::string& serverAddress() const { return server_addr_; }
+    std::uint16_t serverPort() const { return server_port_; }
     int keepaliveSeconds() const { return keepalive_seconds_; }
 
     // Sends (or, before login, remembers) the full channel list (section 6.1).
@@ -161,6 +173,10 @@ private:
     std::vector<ChannelInfoRecord> channels_;
     std::map<std::string, RemoteUser> users_;
     std::map<Guid, TimePoint> downloads_;   // open downloads, last activity
+    bool has_live_ = false;
+    live::ServerLive live_;
+    std::string server_addr_;
+    std::uint16_t server_port_ = 0;
 };
 
 }  // namespace o11proto

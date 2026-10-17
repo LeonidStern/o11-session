@@ -234,6 +234,74 @@ implemented as written and no longer listed as a choice.
   reason) only happens when the effective codec is neither the chosen one nor
   blocked by a user lacking the chosen codec; it is kept as a fallback.
 
+## Live mode (section 15)
+
+Clean-room implementation of the Live specification, revision 2
+(2026-10-17). The only inputs were that document, `PROTOCOL.md`, `ENGINE.md`,
+`PORTMAP.md` and the o11proto sources; no AOO, NINJAM or Jamsa source was
+read. Live is o11proto's own: nothing exists only to talk to the reference
+build, but the wire formats are the specification's. Where the
+specification lets a new implementation choose (its quirks, section 10),
+the choice is listed here.
+
+### Server
+
+- **Configuration.** There is no configuration file, so the options are
+  `ServerConfig::live` (`LiveConfig`) and the `o11server --live*` flags, and
+  `Server::setLiveConfig()` is the reload of 3.5: it opens or closes the UDP
+  port and gives a room whose switch nobody chose with `!live` the new
+  default. The UDP port is the TCP port's number, so a reload never moves it.
+  Out-of-range values are logged as `warning: LiveKbps N is outside 32-510,
+  using 128` (and the same for `LiveFrame`, `LiveMaxPeers`, `LivePort`) and
+  replaced by their default; those texts are ours.
+- **One room.** No lobby and no private rooms, so quirk 16 can't arise; the
+  reload applies to the one room.
+- **The room's order** (3.3) is the order the server accepted the
+  connections in, which is connection id order. The peer id is the
+  connection id.
+- **Senders** are the first `LiveMaxPeers` Live players in that order that
+  have a key and channels (quirk 17: a player without a key takes no place).
+  A player told `maxchan` 0 (a server-wide `max_channels` of 0) is a listener
+  only: it gets the message without may send, is known to the relay and can
+  bind, but is sent no audio. Hidden users (privilege `h`) are not Live
+  players.
+- **No randomness** (quirk 18). When the cookie secret can't be drawn, the
+  log says `Error opening UDP port N for Live! Could not read the system's
+  random source.` (or the warning form for Live yes and on) instead of the
+  busy-port text. A player whose key can't be drawn after four tries gets no
+  `0x07` (quirk 13 kept), and one warning line is logged.
+- **Previous epoch** (quirk 6): skipped at epoch 0 instead of wrapping.
+- **Unverified hellos** are answered and counted as dropped (`unverified
+  hello`) in the traffic line, as the reference does (quirk 19).
+- **Rate tokens** are charged before the room-off, may-send and destination
+  checks (quirk 4), and the bucket starts full at a player's first datagram.
+- **Bound changes** are noticed per player and the messages compared per
+  player, so a bind sends a `0x07` only to the players whose message changed
+  (quirk 5 does not arise).
+- **Bind address.** The UDP socket binds `bind_address` like TCP (all
+  interfaces when empty).
+- **Replying from the right address** (4.9): `IP_PKTINFO` on Linux,
+  `IP_RECVDSTADDR` and `IP_SENDSRCADDR` on the BSDs and macOS. Windows has
+  neither here, so there the routing table chooses, which is right on a
+  machine with one address; test 24 (several addresses) is skipped there.
+  When the address a player was answered from disappears, the relay sends
+  from the routing table's choice until that player's next verified hello.
+- **Test hooks.** `NINJAM_LIVE_FRESH_SECONDS` and `NINJAM_LIVE_STATS_SECONDS`
+  are kept under the specification's names; they are read when the UDP port
+  opens, and `LiveConfig::fresh_seconds` / `stats_seconds` are the same knobs
+  for code.
+- **Texts.** The `!live` broadcasts say "O11 Session players" where the
+  reference names its own product.
+- **Port mapping** maps UDP on the TCP port's number and ignores `LivePort`
+  (quirk 23 kept: a router forwarding another public port is the host's own
+  setup, which is what `LivePort` is for). A NAT-PMP UDP mapping on another
+  public port is kept and warned about (quirk 10). See `portmap/NOTES.md`.
+- **Tests.** Conformance test 20 (a steady stream for some time) runs for 2 s
+  instead of a minute; test 5 (listeners only) runs with a server-wide
+  `max_channels` of 0, since o11proto has no per-user channel limit. The
+  forwarding-latency test asks for p99 under 2 ms on Linux and under 20 ms
+  elsewhere, where shared build machines schedule more coarsely.
+
 ## Tools
 
 - `o11cli` always prints JSON lines (`--json` is accepted and changes nothing)

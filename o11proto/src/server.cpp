@@ -161,10 +161,15 @@ bool Server::start(const ServerConfig& config) {
     if (getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &len) == 0) port_ = ntohs(sa.sin_port);
     listen_fd_ = fd;
     log("listening on port " + std::to_string(port_));
+    if (!liveStart()) {                         // Live require without its UDP port
+        stop();
+        return false;
+    }
     return true;
 }
 
 void Server::stop() {
+    liveShutdown();                             // the UDP port closes before the users go
     if (listen_fd_ != kInvalidSocket) {
         compat::closeSocket(listen_fd_);
         listen_fd_ = kInvalidSocket;
@@ -211,7 +216,7 @@ void Server::runFor(int ms) {
 void Server::poll(int timeout_ms) {
     if (listen_fd_ == kInvalidSocket) return;
     std::vector<pollfd> pfds;
-    pfds.reserve(conns_.size() + 1);
+    pfds.reserve(conns_.size() + 2);
     pollfd lp{};
     lp.fd = listen_fd_;
     lp.events = POLLIN;
@@ -223,10 +228,18 @@ void Server::poll(int timeout_ms) {
         if (c->c.wantWrite()) p.events |= POLLOUT;
         pfds.push_back(p);
     }
-    int rc = compat::poll(pfds.data(), pfds.size(), timeout_ms);
+    const std::size_t nconn = pfds.size();
+    if (liveSocket() != kInvalidSocket) {       // Live UDP, last
+        pollfd up{};
+        up.fd = liveSocket();
+        up.events = POLLIN;
+        pfds.push_back(up);
+    }
+    int rc = compat::poll(pfds.data(), pfds.size(), livePollTimeout(timeout_ms));
     if (rc < 0 && !compat::isInterrupted(compat::lastError())) return;
+    if (rc > 0 && pfds.size() > nconn && pfds[nconn].revents) liveReadable();
     if (rc > 0) {
-        for (std::size_t i = 1; i < pfds.size(); ++i) {
+        for (std::size_t i = 1; i < nconn; ++i) {
             Conn& c = *conns_[i - 1];
             if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
                 if (!c.c.readAvailable()) {
@@ -242,6 +255,7 @@ void Server::poll(int timeout_ms) {
         }
     }
     handleTimers(Clock::now());
+    liveTick(Clock::now());
 
     // Flush everything, then reap closed connections.
     for (auto& c : conns_) {
@@ -399,6 +413,7 @@ void Server::dropConnection(Conn& c, const std::string& why) {
 void Server::removeUser(Conn& c) {
     if (!c.logged_in) return;
     c.logged_in = false;
+    liveLeft(c);
     UserInfoChange change;
     bool had_zero = false;
     for (int i = 0; i < kMaxChannels; ++i) {
@@ -660,6 +675,7 @@ void Server::finishLogin(Conn& c, const std::string& name, std::uint32_t privs, 
         roomCodecChanged(&c, !was_empty);
         effective_codec_ = now;
     }
+    liveJoined(c);
 }
 
 // A status account polls the server: it gets the room state and is closed
@@ -825,6 +841,7 @@ void Server::handleChat(Conn& c, const std::vector<std::uint8_t>& p) {
     if (!decode(p, m)) return;                  // includes the trailing-NUL rule
     const std::string& cmd = m.fields[0];
     if (cmd == "MSG") {
+        if (liveCommand(c, m.fields[1])) return;   // works without the chat privilege
         if (!(c.privs & kPrivChat)) {
             sendServerMsg(c, "No MSG permission");
             return;
@@ -930,7 +947,7 @@ void Server::handleBangCommand(Conn& c, const std::string& text) {
         sendCodecMaskToAll();
     } else {
         sendChat(c, ChatMessage("PRIVMSG", "*",
-                                "Unknown !command. Commands available: !vote, !topic, !codec, !bitrate"));
+                                "Unknown !command. Commands available: !vote, !topic, !codec, !bitrate, !live"));
     }
 }
 

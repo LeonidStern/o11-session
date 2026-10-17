@@ -45,6 +45,10 @@ bool Client::connect(const std::string& host, std::uint16_t port, const Options&
     downloads_.clear();
     keepalive_seconds_ = kDefaultKeepaliveSeconds;
     licence_pending_ = false;
+    has_live_ = false;                          // Live state is per connection
+    live_ = live::ServerLive();
+    server_addr_.clear();
+    server_port_ = port;
 
     if (!compat::startup()) return false;
     addrinfo hints{};
@@ -129,6 +133,8 @@ void Client::poll(int timeout_ms) {
                 }
                 state_ = State::AwaitingChallenge;
                 conn_.touchRecv();
+                server_addr_ = peerAddressOf(conn_.fd());
+                if (server_addr_.find(':') != std::string::npos) server_addr_.clear();   // IPv6: no Live
             }
         }
         if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
@@ -258,6 +264,14 @@ void Client::handleMessage(const RawMessage& m) {
     }
     case kMsgKeepalive:
         break;
+    case live::kMsgServerLive: {
+        live::ServerLive l;
+        if (!opt_.live || state_ != State::LoggedIn || !live::decode(m.payload, l)) return;
+        live_ = std::move(l);
+        has_live_ = true;
+        if (on_live) on_live(live_);
+        break;
+    }
     default:
         break;                                  // unknown types are ignored
     }
@@ -300,6 +314,7 @@ void Client::answerLicence(bool agree) {
 
 void Client::sendLogin(bool licence_agreed) {
     std::uint32_t caps = opt_.codec_caps & kCapCodecMask;
+    if (opt_.live) caps |= live::kCapLive;
     if (licence_pending_) {
         if (!licence_agreed && !opt_.login_when_licence_refused) {
             fail("licence not agreed");
