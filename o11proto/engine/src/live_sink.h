@@ -16,6 +16,7 @@
 #include "live_aoo.h"
 
 struct OpusDecoder;
+struct OpusEncoder;
 
 namespace o11proto {
 namespace engine {
@@ -116,12 +117,14 @@ constexpr double kLiveConcealBuffers = 4.0;
 // sound goes on at its level and in its phase, a decaying one decays, noise
 // dies away, and nothing comes out louder than the last 5 ms played. After
 // `limit` samples of it (the time the mixer plays a concealment before it
-// has faded it out) it ends in silence. When the stream's audio comes
-// back, the decoder has started afresh: its first kSkip samples need the
-// frame before them (the MDCT overlap) and are not used, and the
-// prediction crossfades into the audio over the next kFade. Opus's own
-// concealment isn't used: at 5 ms frames it fades a held note within 40 ms
-// and makes a burst of its own where the loss begins.
+// has faded it out) it ends in silence, though the prediction goes on
+// unheard for kGoesOn more: what is fitted to and what primes the decoder
+// is the stream's best guess (the prediction, and the audio decoded before
+// it is crossfaded), not what was heard. When the stream's audio comes
+// back, the sink first primes its decoder (LiveSink::prime()), and the
+// concealment crossfades into the audio over kFade. Opus's own concealment
+// isn't used: at 5 ms frames it fades a held note within 40 ms and makes a
+// burst of its own where the loss begins.
 class Concealer {
 public:
     static constexpr int kDense = 24, kSparse = 8, kOrder = kDense + kSparse;
@@ -129,8 +132,8 @@ public:
     static constexpr int kRing = 512;           // a power of two above kMaxLag
     static constexpr int kFit = 2880;           // 60 ms at 48 kHz
     static constexpr int kGuard = 240;          // the level it keeps under: the last 5 ms
-    static constexpr int kSkip = 120;           // 2.5 ms, Opus's overlap at 48 kHz
     static constexpr int kFade = 240;
+    static constexpr int kGoesOn = 48000;       // 1 s
 
     void clear();                               // nothing played yet: concealment is silence
     void setLimit(int samples) { limit_ = samples; }
@@ -140,13 +143,20 @@ public:
     void cut();
     bool concealing() const { return state_ == Concealing; }   // the block played last was concealment
     bool joining() const { return state_ == Joining; }
-    // `decoded` (from a decoder reset for it) joined to the concealment, in
+    // `decoded` (from a decoder primed for it) joined to the concealment, in
     // place; again for the next block until the crossfade is done.
     void join(float* decoded, int frames);
-    void played(const float* x, int frames);    // every block played, to fit to
+    void played(const float* x, int frames) { remember(x, frames); }   // every block decoded and not joined
+    // The last `frames` of the best guess (at most kFit), interleaved
+    // stereo, silence before the first.
+    void recent(float* out, int frames) const;
+    // The next `frames` of the prediction, as if it went on unheard, without
+    // taking them (at most kRing - kMaxLag).
+    void peek(float* out, int frames);
 
 private:
     enum State { Off, Concealing, Joining };
+    void remember(const float* x, int frames);  // to the history
     void fit();
     float predict(int c);                       // the next sample of channel c, unscaled
     static double dot(const double* a, const double* b, int n);
@@ -229,6 +239,7 @@ private:
     std::int64_t turn() const { return (played48_ - align_) / block_; }   // the block whose turn it is on align_
     void decodeNext(std::int64_t now_ns);       // one block into the 48 kHz queue
     void conceal();
+    void prime();
     int concealSamples() const;                 // after a stream: B x kLiveConcealBuffers, the fade, 10 ms
     void sizesChanged();
     void startTail();                           // a stream just went: concealment to fade out
@@ -236,6 +247,14 @@ private:
     std::unique_ptr<Entry[]> ring_;
     std::unique_ptr<unsigned char[]> dec_mem_;
     OpusDecoder* dec_ = nullptr;
+    // The decoder's primer: an encoder of our own, and what it codes.
+    static constexpr int kPrimeHistory = 1024;  // CELT's longest pitch period
+    static constexpr int kMaxPrime = 2 * 960;
+    std::unique_ptr<unsigned char[]> enc_mem_;
+    OpusEncoder* enc_ = nullptr;
+    int lookahead_ = 120;
+    float prime_[2 * kMaxPrime];
+    bool fresh_ = false;                        // the decoder is in the state the stream began in
     std::unique_ptr<Concealer> concealer_;
     Phase phase_ = Idle;
     bool stopping_ = false;                     // /stop came: play out, then end

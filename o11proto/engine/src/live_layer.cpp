@@ -699,12 +699,10 @@ void LiveLayer::startStream(int rate, TimePoint now) {
         src_.format = nextId(src_.next_format); // a new format id each time the format is set
     }
     opus_encoder_ctl(src_.enc, OPUS_RESET_STATE);
+    // Opus's prediction from one frame to the next stays on: without it the
+    // codec's noise is 9 dB louder on a held tone. A sink primes its
+    // decoder after a loss instead (live_sink.cpp, LiveSink::prime()).
     opus_encoder_ctl(src_.enc, OPUS_SET_BITRATE(src_.kbps * 1000));
-    // Each frame stands alone (no energy prediction from the frame before,
-    // no pitch pre-filter), so that a sink's first packet after a loss
-    // decodes at its own level: with prediction, the decoder's energies
-    // from before the loss made a burst of up to +24 dB (ENGINE.md 16.6).
-    opus_encoder_ctl(src_.enc, OPUS_SET_PREDICTION_DISABLED(1));
     src_.kbps_changed = src_.frame_changed = false;
     src_.stream = nextId(src_.next_stream);
     src_.seq = 0;
