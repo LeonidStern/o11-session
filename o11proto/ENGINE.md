@@ -17,7 +17,8 @@ purpose: Vorbis (a client built from this document decodes and sends Opus and
 FLAC only), recording to disk, voice-chat and session channel modes (protocol
 7.6 and 7.7: such channels are treated as silent and never created locally),
 per-channel effect callbacks, custom mixers, lobby mode and DAW seek playback.
-A later revision may add lossless local capture and the Live (UDP) mode.
+A later revision may add lossless local capture. Section 16 adds the Live
+(UDP) mode.
 
 ## 1. Conventions
 
@@ -762,3 +763,256 @@ also be run against the reference server)**
   boundary semantics (4.4), exact resampler positions and undithered exact
   values (6.4), playback phase reset (8.5), tests 13.3, 13.10 and 13.13
   restated.
+
+## 16. Live mode
+
+Live mode (PROTOCOL.md section 15) lets the Live players of a room hear each
+other's channel 0 in real time over UDP, in place of that channel's
+intervals. The intervals keep flowing for everyone, also while a player is
+heard live, so the engine can go back to them at any moment. This section is
+the engine's side, written from the Live mode specification, revision 2
+(2026-10-17), called "the Live spec" below and cited by its section numbers
+("Live 6.4"). It doesn't repeat that document's texts and wire details; it
+says how the engine maps them onto sections 2-11, and what it chose where
+the Live spec leaves room (more in `engine/NOTES.md`). The audio payload is
+the subset of AOO in Live 5 (PROTOCOL.md 15.9), written from that description
+alone, with libopus as the only codec library.
+
+### 16.1 Contexts
+
+- A third context, the **network thread**, is the thread of
+  `live::Transport` (PROTOCOL.md 15.6): one per connection, started and
+  stopped from `run()`. It runs the client's AOO source (encoding, `/start`,
+  `/stop`, pings, resends) and the network side of its eight sinks (the
+  receive filter, pongs, start and stop requests, the source timeout). It
+  wakes at least every millisecond.
+- The control context and the network thread share one mutex; neither is
+  real time.
+- The audio context never takes that mutex and allocates nothing for Live.
+  It talks to the network thread through single-producer single-consumer
+  queues allocated when the engine is made (capture: 1024 items of up to 64
+  frames; per slot: 256 received items; resend requests: 1024) and to the
+  control context through atomics. The Opus decoders are set up in memory
+  allocated with the engine.
+- Each slot has a **generation**. It changes when the slot gets a new peer or
+  that peer's stream is dropped (the peer left, the room went off, the Live
+  client restarted). Items of an older generation are discarded, the sink
+  starts again empty, and its statistics restart.
+
+### 16.2 API
+
+| Call | Context | Meaning |
+|---|---|---|
+| `onLiveNotice(text, error)` | from `run()` and `liveCommand()` | the Live chat lines (Live 6.1, 6.5, 6.10-6.12); `error` marks the error style |
+| `setLiveEnabled(bool)`, `liveEnabled()` | control | announce Live (caps bit 16) at the next `connect()`; default on |
+| `setLiveBufferMs(ms)`, `liveBufferMs()` | control | the jitter buffer setting, clamped to 5..200, default 20 (Live 6.8) |
+| `liveBufferInUseMs()` | any | *B*, the buffer in use |
+| `parseLiveBufferSetting(value, &ms)` | static | reads a saved `live_buffer_ms=` value: false unless a whole decimal number, clamped to 5..200 |
+| `liveCommand(text)` | control | handles `/live …` (Live 6.10, 6.11): true when the text was a `/live` command; it is never sent |
+| `setLiveHostState(playing, offline)` | any | the host's transport state and offline rendering (Live 6.1, 6.7); default playing, not offline |
+| `liveRunning()` | any | the Live client (its UDP socket) runs |
+| `userLive(user)` | control | the mixer plays this user's channel 0 live now |
+| `setLiveTestLoss(fraction)` | control | test hook: drop that share of the datagrams received |
+
+The application saves the setting itself (the plug-in state's
+`live_buffer_ms=<N>` line) and gives `/live` lines to `liveCommand()` before
+treating them as chat. `o11jam` prints the Live lines as `[NAME] live: …`,
+passes `--say "/live …"` to `liveCommand()`, and `--no-live` turns Live off
+for its engines.
+
+### 16.3 Starting and stopping (Live 6.1)
+
+- `connect()` sets caps bit 16 when Live is enabled, and each `0x07` the
+  client accepts replaces the engine's copy.
+- `run()` runs the Live client while the client is logged in and the latest
+  `0x07` has UDP open: to the IPv4 address of the TCP connection's server
+  end, at the message's UDP port (the TCP port when that is 0). It restarts
+  when the peer id, the key, the address or the port changes, and stops when
+  UDP open clears, at disconnection, and on a new connection until its first
+  `0x07`. Stopping sends the source's `/stop`s before the socket closes.
+- A failed start is said once per connection (the Live spec's line and
+  reasons) and tried again every 10 s.
+- While the host renders offline nothing is sent and the slots' audio is not
+  used, so the intervals play.
+
+### 16.4 Peers, slots and the receive filter (Live 6.2, 6.3)
+
+- Listed peers, slots and active sinks are as Live 6.2: up to 64 listed, 8
+  slots, a peer keeps its slot, freed slots go to unslotted peers in list
+  order when a message is applied, and every listed peer is an active sink
+  of the source.
+- The receive filter is Live 6.3, items 1-6. A `/start` must be Opus, 1 or 2
+  channels, 48000 Hz, with a block of 120, 240 or 480. Also dropped: the OSC
+  forms of `/data` and of the data request, blocks split into frames (taken
+  as lost), and blocks for a channel onset other than 0.
+- "The host isn't calling the audio callback": no `process()` has started
+  within 0.25 s after the end of the last block, or none has run yet.
+
+### 16.5 The source (Live 5.7-5.10, 6.7)
+
+- **The signal** is local channel 0's source input (two inputs when stereo,
+  L = R when mono), as captured for upload (5.3): no volume applied.
+- **The gate** is open while all of these hold: room on, may send, channel 0
+  exists with transmit (`broadcast`) on, `maxchan` > 0, the host is playing
+  and not rendering offline, and channel 0's input exists in this block.
+  Closing it sends `/stop` to each sink; opening it starts a new stream.
+- `process()` copies the signal in chunks of at most 64 frames into the
+  capture queue. The network thread resamples it to 48 kHz (cubic
+  interpolation, when the host rate isn't 48 kHz), encodes each frame with
+  libopus (stereo, 48 kHz, restricted low delay, the room's bitrate clamped
+  to 32-510 kbps, the room's frame size or 240), and sends each packet once as
+  binary `/data` to destination 0 (flags `0x01`, rate 48000.0).
+- `/start` goes to each listed peer with the first packet of a stream, to a
+  peer listed mid-stream at once, and on a start request; a peer no longer
+  listed gets a `/stop`. The source keeps 512 sent blocks (at least 1 s) for
+  resends, within the budgets of Live 5.10. It pings each sink every second
+  while it streams, and answers pings, start requests and stop requests at
+  most once per 100 ms per peer.
+- A frame-size change in `0x07` starts a new stream with a new format id; a
+  bitrate change applies from the next packet.
+- Stream ids and format ids come from a full-period generator over 0..2^31-1,
+  seeded from the system's randomness, so they don't repeat within 2^31.
+
+### 16.6 The sinks (Live 5.9, 6.8, 6.9)
+
+- **The buffer in use** *B* = min(200, max(setting, 5, ceil(2000 × *H* / *sr*
+  + 5))) ms, where *H* is the longest host block of the last 30 s. Each
+  sink's latency is *B*; its capacity is max(2*B*, *B* + 2*H* / *sr* + 5 ms),
+  in blocks as Live 5.9, at most 250. A change of *B* makes every sink buffer
+  again.
+- **New blocks** follow Live 5.9: old blocks, the wrap, the far block (a jump
+  only after a second far block that follows it), missing blocks, overruns.
+- **Buffering** plays Opus concealment until the sink has waited *B* and
+  holds *B*'s blocks. It then drops the oldest blocks above that number, so
+  that a burst that arrived while it waited doesn't add delay, and plays.
+  The buffer figure (Live 6.10) is what it then holds, at most what it
+  waited. After 4 × *B* without enough blocks it counts an underrun and
+  waits again. A `/stop` makes it play out what it has.
+- **Playing.** Each block is decoded when its turn comes (libopus, stereo
+  float), concealed when it is missing (lost for good) or an xrun block, and
+  every decoded sample is clamped to −2..+2, NaN to −2.
+- **Clock drift.** The 48 kHz stream is resampled to the host rate by cubic
+  (Catmull-Rom) interpolation whose step follows the buffer. The fill
+  (blocks held plus decoded frames not yet played) is smoothed over 0.5 s;
+  after 1 s of playing its level is kept as the reference. While the smoothed
+  fill is more than 2 ms from that reference, the step is the nominal one ×
+  (1 + 0.1/s × the distance beyond the 2 ms), limited to ±0.5 %; within them
+  it is the nominal step. So the stream plays at its own pitch, and only a
+  real difference between the two machines' clocks moves the step. This
+  takes the place of AOO's time DLL (`engine/NOTES.md`). Every new start of
+  playback and every host gap takes a new reference.
+- **Host gaps.** A block that starts more than max(20 ms, 2*H* / *sr*) after
+  the previous one ended is noted; at the next block that isn't early (that
+  starts at least 90 % of the previous block's length after it), if the host
+  is still that far behind, the gap (at most 0.5 s) is reported: the source
+  sends the xrun blocks of Live 5.4 and every sink skips that much of its
+  stream. A host that catches up in time reports nothing.
+- **Requests.** At every audio block a sink asks for its missing blocks but
+  the newest, at most 16 per check, each one again after 10 ms. The network
+  thread sends at most one request message per slot per 10 ms (up to 32
+  requests). A sink pings its source every second from the first block of a
+  stream, sends a stop request after 1 s without audio and every 1 s after
+  that, and drops a source silent for 5 s.
+- Sinks play only while the room is on and the Live client runs, and only
+  for host blocks of at most 16384 frames; longer blocks play intervals.
+
+### 16.7 Health and switching (Live 6.4, 6.5)
+
+- `run()` works out each slot's health at every pass: healthy while the room
+  is on, the Live client runs, the slot has a peer, its sink has played for
+  at least 1 s without buffering again, there were at most 2 dropouts
+  (underruns, overruns and xrun gaps) in the last 2 s, and at most
+  floor(2880 / frame size) blocks were lost for good in the last 2 s (counted
+  in 100 ms buckets).
+- For each user it then works out *want*: the slot of the listed peer with
+  the user's name is healthy, and has been for the settle time (3 s if the
+  user fell back in the last 60 s, else 0). For 2.5 s after *B* changes a user
+  wanted on the same slot stays wanted.
+- The mixer takes *want* at each interval boundary, before the steps of 8.2,
+  and stops a user's Live at once when the slot's generation changed, the
+  room went off or the Live client stopped. `userLive()` reports the mixer's
+  state, and `run()` says the Live spec's lines when it changes: `You hear
+  <U> live now, about <N> ms late.` and, while the room is on, `<U> is back
+  on intervals: their real-time audio stopped or had dropouts.`
+
+### 16.8 Mixing (Live 6.6)
+
+- For each piece of a block, after the remote channels (8.5): for each user
+  whose channel 0 is present (subscribed or not) and whom the mixer plays
+  live, the slot's stereo audio for this block is added to channel 0's output
+  pair with channel 0's volume, pan, mute and solo, the pan law of 5.4, the
+  mono rule (both sides at half volume) and the double clip of Live 6.6.
+  Channel 0's peak meter follows the Live samples.
+- While that is so, channel 0's interval is mixed muted: it keeps decoding
+  and its position. When the slot's audio isn't available for a block, the
+  interval plays unmuted in that block.
+
+### 16.9 `/live` and the other lines (Live 6.10-6.12)
+
+- `liveCommand()` answers `/live`, `/live on|off` (sent as `!live on|off`),
+  `/live buffer [N]` and the other forms with the Live spec's texts, with
+  "O11 Session" where the reference names its own product. `/live buffer`
+  works without a connection.
+- The statistics behind `/live` are Live 6.10's: the sink's smoothed round
+  trip from its pings, the buffer figure, the codec latency (the `/start`'s
+  latency and codec delay, after its clamps, plus the sink's own), the
+  one-way estimate, the loss since the stream last went active, and the
+  dropout counts since the slot was assigned. The dropout count is the
+  reference's (underruns + overruns + blocks lost for good).
+- The offer and the no-answer line of Live 6.12 are said once per connection
+  (the no-answer line again after a restart).
+
+### 16.10 Constants
+
+| Name | Value |
+|---|---|
+| slots / listed peers | 8 / 64 |
+| jitter buffer setting | 5-200 ms, default 20 |
+| sink ring / largest capacity | 256 / 250 blocks |
+| longest host block played live | 16384 frames |
+| source history | 512 blocks |
+| resend budgets | 0.5 × blocks/s for all (burst 32), 0.25 × blocks/s per sink (burst 16) |
+| resend check | each audio block, ≤ 16 blocks, again after 10 ms; ≤ 1 message per slot per 10 ms |
+| pings / answer limit | 1 s / 100 ms per peer |
+| stop requests / source timeout | after 1 s silent, every 1 s / 5 s |
+| host not running | 0.25 s after the end of the last block |
+| health | active ≥ 1 s; ≤ 2 dropouts and ≤ floor(2880 / frame) lost in 2 s |
+| settle / its window / buffer-change grace | 3 s / 60 s / 2.5 s |
+| drift control | fill smoothed over 0.5 s, reference after 1 s, dead band ±2 ms, 0.1 per second beyond it, at most ±0.5 % |
+| host-gap threshold | max(20 ms, 2*H* / *sr*), early below 90 %, reported ≤ 0.5 s |
+| decoded sample clamp | −2.0..+2.0 |
+| failed start retry / no-answer line | 10 s / 5 s |
+
+### 16.11 Tests
+
+- `test_engine_live_units`: message sizes and bytes (`/start` 116, `/stop`
+  44, pings 36 and 32, pongs 56, the requests), the receive filter's
+  parsing, the version rule, the `/start` clamps and format checks, binary
+  `/data` and xrun blocks, the resend request (the Live spec's example), the
+  sink's sizes (Live 5.9's examples and test 39), the far block (test 41),
+  overruns and the wrap, missing blocks and their requests, an underrun and
+  the buffer figure after a burst (test 43), `/stop`, a sender clock 200 ppm
+  fast or slow for 150 s (no underrun or overrun, the fill within a block of
+  where it settled), the decoder clamp (test 40), display names, the buffer
+  setting's parsing and `/live` without a connection.
+- `test_engine_live`: two engines through `o11server` with Live on, in real
+  time (an audio thread calls `process()` every 270 frames at 48 kHz, tone
+  bursts at uneven gaps on channel 0):
+  - both hear each other live from a boundary, with the chat line; over 15
+    bursts each way the delay has a median under 100 ms and a 95th
+    percentile under 150 ms (about 27 ms on loopback), and no burst is heard
+    a second time (the interval copy is muted);
+  - `!live off` early in an interval brings the intervals back within 0.5 s,
+    mid-interval, without the fall-back line; `!live on` brings Live back at
+    a boundary;
+  - the sender's host stalling 0.5 s, and 40 % loss on the listener's
+    datagrams, each make the listener fall back at the next boundary with the
+    fall-back line and hear the intervals; Live comes back later at a
+    boundary, after the settle time; after the stall the buffer figure is at
+    most 31 ms (test 43);
+  - `/live buffer 60` raises the measured delay by 28-52 ms (about 40), the
+    user stays live, `/live` shows `Jitter buffer 60 ms` and an estimate
+    within −5..+10 ms of the measured delay (test 38's bound).
+  The machine's own scheduling hiccups (a wake more than 10 ms late) can make
+  a listener fall back; the checks that need a steady stream are made only
+  when none happened.

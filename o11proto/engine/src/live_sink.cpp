@@ -1,6 +1,6 @@
 // o11proto engine - Live mode, one sink's playback in the audio context:
 // the jitter buffer of 5.9, Opus decoding with the clamp of 5.7, and the
-// cubic resampler to the host rate whose speed follows the buffer's fill
+// cubic resampler to the host rate whose speed keeps the buffer's fill
 // (6.9, see engine/NOTES.md).
 #include "live_sink.h"
 
@@ -19,6 +19,8 @@ constexpr std::int64_t kRequestAgainNs = 10000000;   // 10 ms
 constexpr double kFillGain = 0.1;                     // speed change per second of fill error
 constexpr double kMaxSpeedChange = 0.005;
 constexpr double kFillSmoothing = 0.5;                // seconds
+constexpr double kFillSettle = 1.0;                   // seconds of playing before the level is taken
+constexpr double kFillDeadBand = 0.002;               // seconds around it
 
 int ceilDiv(double a, double b) { return static_cast<int>(std::ceil(a / b - 1e-9)); }
 
@@ -301,10 +303,23 @@ bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
     double step = 48000.0 / rate;
     if (phase_ == Playing) {                     // the speed follows the fill (6.9)
         const double fill = (heldBlocks() * block_ + (fifo_n_ - fifo_at_)) / 48000.0;
-        if (fill_ < 0) fill_ = latency_ms_ / 1000.0;
-        fill_ += (fill - fill_) * std::min(1.0, frames / (rate * kFillSmoothing));
-        const double change = std::max(-kMaxSpeedChange, std::min(kMaxSpeedChange, kFillGain * (fill_ - latency_ms_ / 1000.0)));
-        step *= 1.0 + change;
+        if (fill_ < 0) {                         // a new estimate: from this fill
+            fill_ = fill;
+            fill_ref_ = -1;
+            fill_age_ = 0;
+        } else {
+            fill_ += (fill - fill_) * std::min(1.0, frames / (rate * kFillSmoothing));
+        }
+        // The level it settles at after a second is the one to keep: the
+        // speed only makes up for the clocks' difference, so the stream
+        // plays at its own pitch and the delay stays what buffering gave.
+        fill_age_ += static_cast<double>(frames) / rate;
+        if (fill_ref_ < 0 && fill_age_ >= kFillSettle) fill_ref_ = fill_;
+        if (fill_ref_ >= 0) {                    // within the dead band the fill's own jitter changes nothing
+            const double e = fill_ - fill_ref_;
+            const double off = e > kFillDeadBand ? e - kFillDeadBand : (e < -kFillDeadBand ? e + kFillDeadBand : 0.0);
+            step *= 1.0 + std::max(-kMaxSpeedChange, std::min(kMaxSpeedChange, kFillGain * off));
+        }
     }
     for (int i = 0; i < frames; ++i) {
         while (t_ >= 1.0) {

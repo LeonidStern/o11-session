@@ -153,7 +153,7 @@ Example session:
 - `o11proto/live_transport.h`: `live::Transport`, the client's Live UDP: a
   socket connected to the relay, hellos and the cookie, the client's drop
   rules, and opaque payloads in (`on_data`) and out (`send()`), all on its own
-  network thread. The engine's Live layer (ENGINE.md section 15) runs on it.
+  network thread. The engine's Live layer (ENGINE.md section 16) runs on it.
 
 ## Client engine
 
@@ -163,14 +163,18 @@ or FLAC in `run()`, remote channels decoded and mixed with the interval queue,
 crossfade, pan law, meters, metronome and chat. `include/o11proto/engine/codec.h`
 has the encoders, decoders, the windowed-sinc resampler and the DSP helpers on
 their own. Call `process()` from the audio callback and `run()` from a control
-loop at least every 50 ms.
+loop at least every 50 ms. On a server with Live mode the engine also plays the
+room's Live players in real time (ENGINE.md section 16): `onLiveNotice` gets its
+chat lines, `liveCommand()` answers `/live` and `/live buffer N`, and
+`setLiveBufferMs()` / `setLiveHostState()` give it the jitter buffer setting and
+the host's transport.
 
 ## o11jam
 
     o11jam host:port --user NAME [--password P] [--tone HZ | --wav FILE] [--amp A]
           [--record out.wav] [--seconds N] [--srate N] [--block N] [--kbps N]
           [--no-flac] [--listen-only] [--toggle-transmit SECONDS] [--two]
-          [--say TEXT]... [--quiet]
+          [--say TEXT]... [--no-live] [--quiet]
 
 A command-line client on the engine with a simulated audio device running in
 real time. It plays the tone (default 997 Hz, amplitude 0.5) or the WAV file
@@ -178,7 +182,13 @@ into local channel 0, subscribes to everyone, records what it hears and prints
 `bpi=... interval_samples=... peak=... snr=...` measured over the last two
 intervals. `--two` runs a sender and a listener (`NAME_l`) in one process and
 reports the listener's figures; `--say "!codec flac"` switches the room to
-FLAC. On an anonymous server use `--user anonymous:NAME`.
+FLAC. On an anonymous server use `--user anonymous:NAME`. On a Live server the
+listener hears the sender live (ENGINE.md section 16) and the figures measure
+that; the engine's Live lines are printed as `[NAME] live: ...`, `--say "/live"`
+or `--say "/live buffer 40"` goes to the engine instead of the chat, and
+`--no-live` keeps both engines on intervals. A machine that stalls the audio
+thread for tens of milliseconds makes the listener fall back to intervals for a
+few seconds, which shows in the SNR as a phase jump.
 
 See `NOTES.md` for interpretation choices and what is not implemented,
 `engine/NOTES.md` for the engine and `portmap/NOTES.md` for the port mapper.

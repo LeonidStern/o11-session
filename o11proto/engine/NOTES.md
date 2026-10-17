@@ -222,6 +222,115 @@ specification leaves room, the choice is listed here.
 - `--wav` reads 16-bit PCM or 32-bit float WAV (mono, or the first channel)
   and resamples it linearly to `--srate`.
 
+## Live mode (section 16)
+
+Clean-room implementation of the Live mode specification, revision 2
+(2026-10-17), sections 5 and 6. The only inputs were that document,
+`PROTOCOL.md`, `ENGINE.md`, the o11proto sources and the public header of
+libopus; no AOO, NINJAM or Jamsa source was read, and no AOO code is in it.
+Live is o11proto's own ecosystem: nothing here exists only to talk to the
+reference build, but the wire formats are the specification's.
+
+**Files.** `engine/src/live_aoo.*` (the messages of Live 5.4-5.6),
+`engine/src/live_sink.*` (the queues between the contexts and one sink's
+buffer, decoder and resampler), `engine/src/live_layer.*` (the shared state,
+the slots and health, the network thread's source and sinks, the audio
+entry point), `engine/src/engine_live.cpp` (the `Engine` side: lifecycle,
+switching, mixing, `/live`). Hooks in `engine.cpp`: `run()` calls
+`liveControl()` after the client's poll; `process()` calls
+`liveAudioBlock()` before the pieces and `mixLive()` after `mixRemote()` in
+each piece; the boundary calls `liveBoundary()` before the new-interval step;
+`mixRemote()` mutes a channel 0 that is heard live.
+
+**Where o11proto differs from the Live spec, and why:**
+
+- **Clock drift by the buffer's fill, not a time DLL** (Live 6.9). Each sink
+  resamples 48 kHz to the host rate with a cubic. The fill is smoothed over
+  0.5 s, its level after 1 s of playing is kept, and while the smoothed fill
+  is more than 2 ms from that level the step is corrected by 0.1 per second
+  of the distance beyond the 2 ms, within ±0.5 %. It keeps a sink from slowly
+  filling up or running dry, which is what the DLL is for, without time
+  stamps on every 64-sample block. The kept level is the one buffering gave,
+  not *B*: regulating to *B* made the pitch wander by up to 0.1 % for tens of
+  seconds after each start (a 997 Hz tone came out at 998 Hz), and the dead
+  band keeps the fill's own jitter (whole blocks arriving at once) from
+  moving the pitch at all, so a steady tone keeps its phase (`o11jam --two`
+  on a Live server: SNR about 43 dB over two intervals at 48 kHz, 45 at
+  44.1). In return the source writes the nominal 48000.0 into every `/data`
+  instead of a measured rate, and a sink ignores the rate it receives (after
+  checking it is finite and positive). Nobody between o11proto clients reads
+  it.
+- **The source's resampler** (host rate to 48 kHz) is a plain cubic, with no
+  low-pass. That is right for 44.1 kHz (upsampling); at 88.2 or 96 kHz and up
+  content above 24 kHz can alias. Hosts at 48 kHz skip it.
+- **Buffering drops a burst.** When a sink starts playing it drops the oldest
+  blocks above the latency's number, so a burst that arrived while it waited
+  (a host that delivered several blocks at once) doesn't make it play later
+  than *B*. The buffer figure is then at most *B* + a frame + a host block,
+  as revision 2 asks.
+- **Giving up after 4 × *B*** (Live 5.9) counts one underrun and starts
+  waiting again; it doesn't start playing with fewer blocks than the latency.
+- **Limits.** A sink's ring holds 256 blocks and its capacity is capped at
+  250 (a 200 ms buffer with frame 120 and long host blocks could ask for
+  more). Host blocks over 16384 frames get no Live audio and play intervals:
+  the slots' output buffers are allocated for that size.
+- **Accepted payloads.** The OSC forms of `/data` and of the data request are
+  dropped (no Live client sends them); blocks split into frames are treated
+  as lost (Live 5.4 allows it); channel onsets other than 0 are dropped
+  (senders must send 0); `/start` block sizes other than 120, 240 and 480 are
+  refused (quirk 25).
+- **Threads.** One network thread (`live::Transport`'s) both receives and
+  sends, waking at least every 1 ms, in place of the reference's receiving
+  and sending threads (informative in Live 6.1).
+- **Texts** say "O11 Session" where the reference names its own product, in
+  `/live`, the offer and the slot-limit line.
+- **The quirks** (Live 10), where a new client may or should choose: stop
+  requests are answered at most once per 100 ms per peer (20); the source's
+  `/stop`s go out before the socket closes (21); the stream time of a later
+  `/start` counts 48 kHz samples at 48 kHz (22); a sink sends at most one
+  request message per 10 ms (24); answer limits run on the steady clock, which
+  keeps running while the stream is stopped (28); `/live buffer30` is read as
+  `buffer 30` (12); slots go to the first listed peers (27); `/live` shows the
+  latest server round trip (14) and keeps the reference's dropout count,
+  underruns + overruns + lost blocks, while health counts underruns, overruns
+  and xrun gaps (15).
+
+**Ambiguities in the Live spec and how they were read:**
+
+- *"After every underrun or overrun, the sink buffers … It gives up after 4 ×
+  its latency and counts an underrun"* (5.9): what it does after giving up
+  isn't said. Read as above: it counts the underrun and keeps waiting.
+- *"If that needs more room than is free, it is an overrun"* (5.9): the room
+  is counted from the next block to play to the new block, against the
+  capacity in blocks.
+- *"Its stream is active"* (6.4) is taken as the sink playing: not idle, not
+  buffering and not dry. *"Healthy since"* restarts whenever health is lost.
+- *"The report comes at the first block that doesn't arrive early"* (6.9):
+  the late block itself is only noted; the gap is reported at the next block
+  that isn't early, if the host is still behind by more than the threshold.
+  So a host that misses time and doesn't catch up reports it one block late;
+  one that catches up reports nothing.
+- *"The host's announced largest block"* (6.8, the capacity): an engine has
+  no announcement, so *H* (the longest block of the last 30 s) is used.
+- *"The queue … holds max(25 ms, 2 × the host's largest block / rate + 10
+  ms)"* (6.7): the capture queue is a fixed 1024 chunks of 64 frames (1.4 s
+  at 48 kHz), which covers every host block up to the 16384-frame limit;
+  chunks that don't fit are dropped.
+- *"Stop requests … The first underrun starts the 1 s"* (5.9): measured from
+  the last `/data` the sink took, which is the same moment.
+- *"Live off … at the next boundary"*: when the room's Live goes off the
+  mixer stops at once (6.5, "At once"), not at a boundary; a stall or packet
+  loss makes a listener fall back at the next boundary. The tests check both.
+- *"Health … about every 30 ms"* (6.4): worked out at every `run()` pass, which
+  ENGINE.md section 2 asks for at least every 50 ms; the reference's network
+  loop runs every 10 ms or so, and so does `o11jam`'s.
+
+**Tests.** `test_engine_live_units` and `test_engine_live` (ENGINE.md 16.11).
+The real-time test runs about 50 s. Machines that stall a thread for tens of
+milliseconds (virtual machines do) can make a listener fall back for real;
+the test notes every wake more than 10 ms late and makes the checks that
+need a steady stream only when there was none.
+
 ## Efficiency notes
 
 - The metronome keeps only its beat clock when muted or below 0.0001 (no

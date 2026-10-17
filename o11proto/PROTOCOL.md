@@ -491,7 +491,7 @@ A new client or server should pass these against the existing ones (the Jamsa re
 
 ## 15. Live mode (O11 Session extension)
 
-Live mode lets the players of a room hear each other in real time: each Live player sends small Opus packets over UDP to the server it is connected to, and the server copies them to the room's other Live players. Intervals keep flowing exactly as before, for everyone. This section is the wire reference for o11proto; it follows the Live mode specification revision 2 (2026-10-17, written from Jamsa's Live at `44a4904`), where every rule here is explained. The client's behaviour (audio, jitter buffer, switching, `/live`) is in `ENGINE.md` section 15, and what o11proto chose where that specification leaves room is in `NOTES.md` and `engine/NOTES.md`.
+Live mode lets the players of a room hear each other in real time: each Live player sends small Opus packets over UDP to the server it is connected to, and the server copies them to the room's other Live players. Intervals keep flowing exactly as before, for everyone. This section is the wire reference for o11proto; it follows the Live mode specification revision 2 (2026-10-17, written from Jamsa's Live at `44a4904`), where every rule here is explained. The payload is in 15.9, the client's behaviour (audio, jitter buffer, switching, `/live`) in `ENGINE.md` section 16, and what o11proto chose where that specification leaves room is in `NOTES.md` and `engine/NOTES.md`.
 
 ### 15.1 The caps bit and SERVER_LIVE (`0x07`)
 
@@ -602,3 +602,38 @@ A **known player** is a Live player with a key, with Live allowed and the UDP po
 ### 15.8 Port mapping
 
 With the UDP port open, the port mapper (`PORTMAP.md`, `PortMapper::start(port, true)`) maps UDP on the same number too, right after TCP and at every renewal: UPnP with the same ports, address, description and the TCP lease (0 with a permanent-only router); NAT-PMP asking for the public port TCP was granted and lifetime 3600, counted as working only when granted exactly that port. The lines say `TCP and UDP` instead of `TCP` while UDP works (`asking the router to forward TCP and UDP port <p> to this machine`, `removed the forward for TCP and UDP port <p>`, the section 7 lines); without a router, `Forward TCP port <p> on your router to this machine by hand, and UDP port <p> for Live, or turn on UPnP …`. A UDP failure never fails TCP and is logged once, until UDP works again, as `warning: Live: the router did not forward UDP port <p> (<why>), so players outside your network can't play Live with you; they still hear you through intervals`, with `<why>` one of `UPnP: the router forwards it to another machine`, `UPnP error <n>`, `NAT-PMP: the router did not answer`, `NAT-PMP error <n>`, `NAT-PMP: it gave public port <p>, not <q>`. UDP is removed first, quietly.
+
+### 15.9 The payload
+
+The relay never reads the payload. Between Live clients it is the subset of AOO 2.0 in Live spec section 5, written for o11proto from that description (no AOO code): every number big-endian, every source and sink AOO id 1, the UDP header's peer ids saying who is who. Messages for a sink come from a source and messages for a source from a sink. Each client has one source (its channel 0) and up to eight sinks (`ENGINE.md` 16.4).
+
+**Binary messages** (first byte has bit 7 set):
+
+| Message | Bytes | Layout |
+|---|---|---|
+| `/data`, an audio block (source → sinks) | 24 + packet | `81 00 01 01`, i32 stream id, i32 sequence, u8 channel 0, u8 flags `0x01`, u16 packet size, f64 rate 48000.0, the Opus packet |
+| `/data`, an xrun block | 16 | the same with flags `0x08`, size 0, no rate and no data |
+| data request (sink → source) | 12 + 8 × *n* | `80 00 01 01`, i32 stream id, i32 *n* (1-32), then *n* × (i32 sequence, i16 frame offset −1, u16 0) |
+
+- The audio blocks go once to destination 0 (broadcast mode: one stream id for every sink); everything else is unicast to one peer.
+- Reading `/data` follows Live 5.4: 16 fixed bytes, then the optional fields its flags announce (`0x02` frames: u32 total, u16 count, u16 index; `0x04` stream messages: u32 bytes; `0x01` f64 rate, finite and above 0; `0x10` u64 time), then the size's bytes; stream messages are skipped. o11proto never splits a block and treats a split one as lost; it drops a negative stream id or sequence, command bit `0x80`, and channel onsets other than 0.
+- Sequences run from 0 to `0x7ffffffe` and start again at 0; a block 2^30 or more below the last one played is a wrap. A data request's frame offset −1 asks for the whole block; o11proto also reads requests for frame 0, ignores other frames, drops a message whose count is negative or larger than it holds, and reads at most 32.
+
+**OSC messages** (single OSC 1.0 messages; no bundles), each with the sender's id 1 as first argument:
+
+| Address | Tags | Bytes | Arguments after the id |
+|---|---|---|---|
+| `/aoo/sink/1/start` | `,isiiiiiisbtiiNNi` | 116 | version `2.0-test4`, stream id, start sequence, format id, channels 2, rate 48000, block (frame size), codec `opus`, blob `00 00 08 03` (restricted low delay), stream time (the sender's monotonic clock), latency, codec delay 120, two nils, sample offset 0 |
+| `/aoo/sink/1/stop` | `,iiii` | 44 | stream id, next sequence, 0 |
+| `/aoo/sink/1/ping` | `,it` | 36 | t1 (wall clock) |
+| `/aoo/src/1/pong` | `,itttf` | 56 | t1, t2, t3, f32 loss since the previous pong |
+| `/aoo/src/1/ping` | `,it` | 32 | t1 |
+| `/aoo/sink/1/pong` | `,ittt` | 56 | t1, t2, t3 |
+| `/aoo/src/1/start` (start request) | `,is` | 40 | version |
+| `/aoo/src/1/stop` (stop request) | `,ii` | 28 | stream id |
+
+- A version is accepted when it reads as a decimal number 2, a period and a digit (`2.0-test4`, `2.1`; not `2`). A `/start` is accepted for codec `opus`, 1 or 2 channels, 48000 Hz and a block of 120, 240 or 480; its latency is clamped to 0..10 s and its codec delay and sample offset to 0..rate/10. The latency the source sends is trunc(max(0, *F* − 64*r*) + *L r*), *r* = 48000 / host rate, *L* = 0 at 48 kHz multiples and 2 otherwise (176 at 48 kHz and frame 240).
+- Round trips are (t4 − t1) − (t3 − t2) on the measuring side's clock. Time tags are NTP 32.32; the `/start`'s stream time is never compared with another clock.
+- o11proto doesn't send or accept the OSC forms of `/data` and of the data request (`/aoo/sink/1/data`, `/aoo/src/1/data`); it sends and accepts the binary forms only.
+
+**The codec**: Opus, 48 kHz, stereo (mono input as L = R), one packet of one frame per block, the frame size and bitrate of `0x07` (frame 120, 240 or 480, otherwise 240; 32-510 kbps), application restricted low delay. Decoded samples are clamped to −2..+2. Resends, budgets, stream life and the client's rules are `ENGINE.md` 16.5-16.6.

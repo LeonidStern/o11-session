@@ -272,7 +272,7 @@ the choice is listed here.
   `0x07` (quirk 13 kept), and one warning line is logged.
 - **Previous epoch** (quirk 6): skipped at epoch 0 instead of wrapping.
 - **Unverified hellos** are answered and counted as dropped (`unverified
-  hello`) in the traffic line, as the reference does (quirk 19).
+  address (answered)`) in the traffic line, as the reference does (quirk 19).
 - **Rate tokens** are charged before the room-off, may-send and destination
   checks (quirk 4), and the bucket starts full at a player's first datagram.
 - **Bound changes** are noticed per player and the messages compared per
@@ -316,6 +316,12 @@ the choice is listed here.
   datagrams before `on_data`: a test hook for the engine's loss tests.
 - A Live client whose TCP connection is IPv6 can't start (`serverAddress()`
   is empty): `no peer ID or server address`, as 4.1 says.
+
+### Engine
+
+The audio layer and the client's behaviour (Live spec sections 5 and 6) are
+in the engine: `ENGINE.md` section 16, with its choices in `engine/NOTES.md`
+("Live mode").
 
 ## Tools
 

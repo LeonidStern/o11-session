@@ -324,6 +324,34 @@ TEST(sink_stop_and_reset) {
     CHECK(!p.sink.hasStream());
 }
 
+TEST(sink_follows_clock_drift) {                // 6.9: a sender whose clock runs 200 ppm fast or slow
+    for (double drift : {200e-6, -200e-6}) {
+        LiveSink k;
+        k.configure(20, 256, 48000);
+        k.apply(item(SinkItem::Start, 0), 1);
+        std::vector<float> out(2 * 256);
+        std::int32_t sent = 0;
+        int lo = 1 << 30, hi = 0;
+        const int blocks = 48000 * 150 / 256;   // 150 s of host blocks
+        for (int b = 0; b < blocks; ++b) {
+            const double t = (b + 1) * 256.0 / 48000.0;
+            const std::int32_t due = static_cast<std::int32_t>(t * 48000.0 * (1.0 + drift) / 240.0);
+            while (sent < due) k.apply(item(SinkItem::Xrun, sent++), 1);
+            k.render(out.data(), 256, 48000, 1);
+            if (b * 256 > 48000 * 10) {          // after the first 10 s
+                lo = std::min(lo, k.heldBlocks());
+                hi = std::max(hi, k.heldBlocks());
+            }
+        }
+        std::printf("    drift %+.0f ppm: held %d..%d blocks, %u underruns, %u overruns\n", drift * 1e6, lo, hi,
+                    k.stats.underruns.load(), k.stats.overruns.load());
+        CHECK(k.playing());
+        CHECK_EQ(k.stats.underruns.load(), 0u);
+        CHECK_EQ(k.stats.overruns.load(), 0u);
+        CHECK(lo >= 2 && hi <= 6);               // without the correction 150 s would move it by 30 ms (6 blocks)
+    }
+}
+
 TEST(decoder_clamp) {                            // test 40
     int err = 0;
     OpusEncoder* enc = opus_encoder_create(48000, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);

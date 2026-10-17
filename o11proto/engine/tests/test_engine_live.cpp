@@ -408,6 +408,7 @@ TEST(sender_stall_falls_back_at_boundary) {
     // Live again later, from a boundary, after the settle time: the stall's
     // 0.5 s, 1 s of playing well and 3 s of settling at the least.
     REQUIRE(r.until([&] { return r.side[1].e.userLive(0); }, 20));
+    r.wait(0.1);                                 // the audio thread has recorded the switch
     const long on = r.switchFrom(1, b, false);
     REQUIRE(on > 0);
     std::printf("    bob hears alice live again %.1f s after the stall began\n", r.secondsOf(on - block));
@@ -444,6 +445,7 @@ TEST(packet_loss_falls_back_at_boundary) {
     const long healed = r.frames.load() / kBlock;
     r.side[1].e.setLiveTestLoss(0);
     REQUIRE(r.until([&] { return r.side[1].e.userLive(0); }, 20));
+    r.wait(0.1);                                 // the audio thread has recorded the switch
     const long on = r.switchFrom(1, healed, false);
     REQUIRE(on > 0);
     std::printf("    bob hears alice live again %.1f s after the loss ended\n", r.secondsOf(on - healed));
@@ -476,6 +478,10 @@ TEST(jitter_buffer_setting_takes_effect) {
     if (calm) {                                  // the buffer change is a gap, not a fall back (6.5)
         CHECK(r.side[1].e.userLive(0));
         CHECK(r.side[1].findNotice("is back on intervals", seen).empty());
+        if (!r.side[1].findNotice("is back on intervals", seen).empty()) {
+            std::lock_guard<std::mutex> lock(r.side[1].m);
+            for (std::size_t i = seen; i < r.side[1].notices.size(); ++i) std::printf("    [bob] %s\n", r.side[1].notices[i].c_str());
+        }
     }
     // /live shows the buffer in use and an estimate close to the measured delay.
     seen = r.side[1].noticeCount();

@@ -165,7 +165,9 @@ private:
     int fifo_n_ = 0, fifo_at_ = 0;
     float x_[4][2] = {};                        // the cubic resampler's window
     double t_ = 0;                              // its position between x_[1] and x_[2]
-    double fill_ = -1;                          // smoothed buffer fill, seconds
+    double fill_ = -1;                          // smoothed buffer fill, seconds; -1: a new estimate
+    double fill_ref_ = -1;                      // the fill it keeps, once settled
+    double fill_age_ = 0;                       // seconds of this estimate
     std::int64_t played48_ = 0;
     std::int64_t last_xrun48_ = -(1LL << 40);
 };
