@@ -265,23 +265,44 @@ void Client::handleChallenge(const std::vector<std::uint8_t>& p) {
         return;
     }
     if (on_challenge) on_challenge(ch);
-    if (ch.protocol_version < 0x00020000 || ch.protocol_version >= 0x0002ffff) {
-        fail("unsupported server protocol version");
+    if (ch.protocol_version < 0x00020000 || ch.protocol_version >= opt_.max_server_version) {
+        fail("server is incorrect protocol version");
         return;
     }
     keepalive_seconds_ = ch.keepaliveSeconds();
+    challenge_ = ch.challenge;
+    if (!ch.has_licence) {
+        sendLogin(false);
+        return;
+    }
+    licence_pending_ = true;
+    LicenceDecision d;
+    if (on_licence_decision) d = on_licence_decision(ch.licence);
+    else if (on_licence) d = on_licence(ch.licence) ? LicenceDecision::Agree : LicenceDecision::Refuse;
+    else d = opt_.agree_licence ? LicenceDecision::Agree : LicenceDecision::Refuse;
+    if (d == LicenceDecision::Defer) {
+        state_ = State::AwaitingLicence;       // keepalives continue at 45 s
+        return;
+    }
+    sendLogin(d == LicenceDecision::Agree);
+}
+
+void Client::answerLicence(bool agree) {
+    if (state_ != State::AwaitingLicence) return;
+    sendLogin(agree);
+}
+
+void Client::sendLogin(bool licence_agreed) {
     std::uint32_t caps = opt_.codec_caps & kCapCodecMask;
-    if (ch.has_licence) {
-        licence_pending_ = true;
-        bool agree = on_licence ? on_licence(ch.licence) : opt_.agree_licence;
-        if (!agree) {
+    if (licence_pending_) {
+        if (!licence_agreed && !opt_.login_when_licence_refused) {
             fail("licence not agreed");
             return;
         }
-        caps |= kCapLicenceAgreed;
+        if (licence_agreed) caps |= kCapLicenceAgreed;
     }
     AuthUser au;
-    au.passhash = passwordHash(opt_.username, opt_.password, ch.challenge);
+    au.passhash = passwordHash(opt_.username, opt_.password, challenge_);
     au.username = opt_.username;
     au.client_caps = caps;
     au.client_version = opt_.client_version;

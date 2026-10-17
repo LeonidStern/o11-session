@@ -25,6 +25,10 @@ sockets only.
 Builds with g++ on Linux at `-Wall -Wextra` without warnings. The loopback test
 takes about ten seconds because it waits for real keepalive and transfer timeouts.
 
+The client engine (`njproto_engine`, `njjam`, the `test_engine_*` tests) needs
+libopus, libogg and libFLAC, found with pkg-config. Pass
+`-DNJPROTO_BUILD_ENGINE=OFF` to build only the protocol library and its tools.
+
 ## njserver
 
     njserver <port> [--anon] [--anon-multi] [--user name:pass:privs]...
@@ -104,4 +108,30 @@ Example session:
 - `njproto/server.h`: `ServerConfig` and `Server` with `start()`, `poll()`,
   `stop()`. Drive `poll()` from your own loop or call `runFor()`.
 
-See `NOTES.md` for interpretation choices and what is not implemented.
+## Client engine
+
+`include/njproto/engine.h` (`njproto::engine::Engine`) implements `ENGINE.md`:
+the interval clock, local channels captured in `process()` and encoded to Opus
+or FLAC in `run()`, remote channels decoded and mixed with the interval queue,
+crossfade, pan law, meters, metronome and chat. `include/njproto/engine/codec.h`
+has the encoders, decoders, the windowed-sinc resampler and the DSP helpers on
+their own. Call `process()` from the audio callback and `run()` from a control
+loop at least every 50 ms.
+
+## njjam
+
+    njjam host:port --user NAME [--password P] [--tone HZ | --wav FILE] [--amp A]
+          [--record out.wav] [--seconds N] [--srate N] [--block N] [--kbps N]
+          [--no-flac] [--listen-only] [--toggle-transmit SECONDS] [--two]
+          [--say TEXT]... [--quiet]
+
+A command-line client on the engine with a simulated audio device running in
+real time. It plays the tone (default 997 Hz, amplitude 0.5) or the WAV file
+into local channel 0, subscribes to everyone, records what it hears and prints
+`bpi=... interval_samples=... peak=... snr=...` measured over the last two
+intervals. `--two` runs a sender and a listener (`NAME_l`) in one process and
+reports the listener's figures; `--say "!codec flac"` switches the room to
+FLAC. On an anonymous server use `--user anonymous:NAME`.
+
+See `NOTES.md` for interpretation choices and what is not implemented, and
+`engine/NOTES.md` for the engine.

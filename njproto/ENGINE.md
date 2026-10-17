@@ -1,6 +1,6 @@
 # NINJAM client engine specification
 
-Revision 1, 2026-10-16. Companion to `PROTOCOL.md` (revision 2a), which this
+Revision 1a, 2026-10-17. Companion to `PROTOCOL.md` (revision 2a), which this
 document builds on and never repeats: wire formats, message types, login,
 codec negotiation and chat are defined there, by section number.
 
@@ -196,8 +196,11 @@ running and at least one interval has started.
 block in pieces that never cross a boundary, so every piece belongs to one
 interval and one tempo. At a boundary it applies a pending tempo change, calls
 the **new-interval step** (sections 6.3 and 8.2), resets `intervalPos` to 0 and
-increments `loopCount`. A boundary falls exactly when `intervalPos ==
-intervalLength`; the first boundary is at the start of the first running block.
+increments `loopCount`. A boundary is processed when the first sample **after** the interval's
+last one is about to be produced: after a block that ends exactly on the
+boundary, `position()` still reports `pos == len` and `loopCount()` is
+unchanged until the next block. The first boundary is at the start of the
+first running block.
 
 ### 4.5 Ending an interval early or late
 
@@ -375,7 +378,10 @@ sample count, so the receiver can play intervals back to back.
 - Input at another rate is resampled to 48000 Hz with a windowed-sinc (or
   equally good) resampler whose state **persists across intervals** of the
   same encoder, so the stream of one interval begins exactly where the
-  previous ended. The Opus encoder state itself is reset at each new stream.
+  previous ended. The resampler keeps its position as an exact rational, so
+  an interval of N input frames yields exactly `N × 48000 / rate` output
+  frames (rounded the same way every time) and consecutive intervals never
+  slip by a sample against each other. The Opus encoder state itself is reset at each new stream.
 - **End of interval:** the real audio ends at `real` samples (after
   resampling). The stream is padded up to the next multiple of 960 of `real +
   pre_skip`, so the encoder's lookahead is flushed and the last frame is
@@ -399,7 +405,8 @@ sample count, so the receiver can play intervals back to back.
   sample rate allows it, else not. The stream is written as it is encoded, so
   STREAMINFO's total sample count stays 0.
 - Float to 16-bit: exact zero (and NaN) stays exactly 0, so digital silence
-  compresses to almost nothing; any other value is scaled by 32768, gets TPDF
+  compresses to almost nothing; a value that is already exactly on a 16-bit
+  step is converted exactly; any other value is scaled by 32768, gets TPDF
   dither of 1 LSB (two uniform random values in 0..1, added, minus 1), is
   rounded to nearest and clipped to -32768..32767.
 - End of interval: finish the stream, which writes the last, shorter frame.
@@ -561,7 +568,7 @@ For each remote channel that is present, with its current interval:
 - **needed** = the number of source frames this piece needs: `len` when the
   stream's rate equals the engine's, else `trunc(srcRate × len / dstRate +
   phase)` where `phase` is the resampler's fractional position carried from
-  the last piece;
+  the last piece (reset to 0 at each interval boundary);
 - decode until `available() > needed`, or the stream is exhausted;
 - if the channel has a **drop count** (section 8.2, below): skip that many
   frames first (as many as are available), reducing the count;
@@ -668,7 +675,9 @@ A conforming implementation passes:
    show no discontinuity (no sample-to-sample step larger than the tone's own
    maximum step × 1.5 around the join).
 3. FLAC round trip, stereo, 44100 Hz: a signal already quantised to 16 bits
-   decodes bit-exactly; digital silence of 2 s encodes to under 200 bytes;
+   decodes bit-exactly; digital silence of 2 s encodes to under 512 bytes
+   (libFLAC writes a VORBIS_COMMENT block and 4096-sample frames, about 400
+   bytes in all);
    decoding from data delivered in chunks of 700 bytes gives the same output
    as from the whole stream.
 4. Float conversion: 0.0 → 0, 1.0 → 32767, -1.0 → -32768; a constant 0.5
@@ -692,16 +701,20 @@ A conforming implementation passes:
 **Against servers (end to end, needs `njserver` from this repository and may
 also be run against the reference server)**
 10. Two engines in one process, 48000 Hz, 512-frame blocks, a 997 Hz tone of
-    0.5 amplitude on one, the other subscribed: after 12 s the listener's last
-    two intervals have SNR ≥ 35 dB with Opus at the room's 128 kbps and the
-    tone's peak within 0.45..0.55; the same room switched with `!codec flac`
-    gives SNR ≥ 60 dB.
+    0.5 amplitude on one, the other subscribed with the channel volume set to
+    1.0: after 12 s the listener's last two intervals have SNR ≥ 35 dB with
+    Opus at the room's 128 kbps and the tone's peak within 0.45..0.55; the
+    same room switched with `!codec flac` gives SNR ≥ 60 dB, measured once two
+    whole FLAC intervals have played (the interval in progress at the switch
+    stays Opus).
 11. The same at 44100 Hz on both sides, Opus: SNR ≥ 30 dB.
 12. Transmit off then on: the listener gets a zero-GUID BEGIN once, then
     whole intervals again; while off, the listener's output for that channel
     is exactly 0 after the current interval ends.
-13. A listener whose `process()` is not called for 20 s and then resumes plays
-    the newest intervals, not the stale ones (the queue depth of 2 holds).
+13. A listener whose `process()` is not called for 20 s and then resumes
+    plays, within two intervals, the newest interval and nothing older after
+    it (the queue depth of 2 holds: slot 0 keeps the first interval that
+    arrived during the stall, slot 1 the newest).
 14. Against the reference client (`ninjam/tests/njclient_e2e` sender or
     listener, run by a tester who may read both): engine listener with
     reference sender and the reverse both reach SNR ≥ 35 dB with Opus.
@@ -733,3 +746,7 @@ also be run against the reference server)**
 
 - **1** (2026-10-16): first version, from the behaviour of the reference client
   as the Jamsa plug-in uses it.
+- **1a** (2026-10-17): clarifications after the first implementation: exact
+  boundary semantics (4.4), exact resampler positions and undithered exact
+  values (6.4), playback phase reset (8.5), tests 13.3, 13.10 and 13.13
+  restated.

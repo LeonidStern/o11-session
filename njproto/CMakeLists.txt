@@ -31,3 +31,32 @@ foreach(t test_codec test_sha1 test_loopback)
   target_link_libraries(${t} njproto)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# ---------------------------------------------------------------- engine
+# The client engine (ENGINE.md) needs libopus, libogg and libFLAC.
+option(NJPROTO_BUILD_ENGINE "Build the njproto_engine library, njjam and its tests" ON)
+if(NJPROTO_BUILD_ENGINE)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(CODECS REQUIRED IMPORTED_TARGET opus ogg flac)
+
+  add_library(njproto_engine STATIC
+    engine/src/dsp.cpp
+    engine/src/opus_codec.cpp
+    engine/src/flac_codec.cpp
+    engine/src/engine.cpp
+  )
+  target_include_directories(njproto_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(njproto_engine PUBLIC njproto PkgConfig::CODECS)
+  find_package(Threads REQUIRED)
+  target_link_libraries(njproto_engine PUBLIC Threads::Threads)
+
+  add_executable(njjam tools/njjam.cpp)
+  target_link_libraries(njjam njproto_engine)
+
+  foreach(t test_engine_codecs test_engine_clock test_engine_e2e)
+    add_executable(${t} engine/tests/${t}.cpp)
+    target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(${t} njproto_engine)
+    add_test(NAME ${t} COMMAND ${t})
+  endforeach()
+endif()

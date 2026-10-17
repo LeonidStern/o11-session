@@ -25,17 +25,22 @@ public:
         Disconnected,       // nothing open
         Connecting,         // TCP connect in progress
         AwaitingChallenge,  // connected, waiting for AUTH_CHALLENGE
+        AwaitingLicence,    // licence shown, waiting for answerLicence()
         AwaitingReply,      // AUTH_USER sent, waiting for AUTH_REPLY
         LoggedIn,
         Failed,             // closed after a refused login or an error (see failReason())
     };
+
+    enum class LicenceDecision { Agree, Refuse, Defer };
 
     struct Options {
         std::string username;
         std::string password;
         std::uint32_t codec_caps = 0;                  // kCapOpus | kCapFlac
         std::uint32_t client_version = kProtocolVersion;
-        bool agree_licence = true;                     // default answer when on_licence is unset
+        std::uint32_t max_server_version = 0x0002ffff; // accepted: 0x00020000 <= v < this
+        bool agree_licence = true;                     // default answer when no licence callback is set
+        bool login_when_licence_refused = false;       // true: send AUTH_USER without bit 0 and let the server refuse
         bool send_keepalives = true;                   // false only for tests
         bool auto_subscribe = false;                   // subscribe to every user seen (mask ~0)
     };
@@ -55,6 +60,9 @@ public:
 
     // Callbacks. All optional. They are invoked from inside poll().
     std::function<bool(const std::string& licence)> on_licence;   // return true to agree
+    // Preferred over on_licence when set: may answer Defer, after which the
+    // client keeps sending keepalives until answerLicence() is called.
+    std::function<LicenceDecision(const std::string& licence)> on_licence_decision;
     std::function<void(const AuthChallenge&)> on_challenge;
     std::function<void(const AuthReply&)> on_auth_reply;
     std::function<void(const ConfigChange&)> on_config;
@@ -76,6 +84,8 @@ public:
     // resolved or no socket can be made.
     bool connect(const std::string& host, std::uint16_t port, const Options& options);
     void disconnect(const std::string& reason = "closed by caller");
+    // Completes a deferred licence decision (state AwaitingLicence).
+    void answerLicence(bool agree);
 
     // One iteration of the event loop: waits up to timeout_ms for socket
     // activity, then processes it and the timers.
@@ -130,6 +140,7 @@ private:
     void fail(const std::string& reason);
     void handleMessage(const RawMessage& m);
     void handleChallenge(const std::vector<std::uint8_t>& p);
+    void sendLogin(bool licence_agreed);
     void handleAuthReply(const std::vector<std::uint8_t>& p);
     void handleUserInfo(const std::vector<std::uint8_t>& p);
     void handleTimers(TimePoint now);
@@ -143,6 +154,7 @@ private:
     int maxchan_ = 0;
     int keepalive_seconds_ = kDefaultKeepaliveSeconds;
     bool licence_pending_ = false;
+    std::array<std::uint8_t, 8> challenge_{};
     std::uint16_t bpm_ = 0, bpi_ = 0;
     bool has_codec_mask_ = false;
     CodecMask codec_mask_;
