@@ -28,6 +28,30 @@ constexpr int kPaddingFullLevel = 128;
 // TPDF dither of 1 LSB, round to nearest, clip.
 std::int16_t floatToInt16(float v, std::mt19937& rng);
 
+// The dither generator the FLAC encoder uses: xorshift64* (Vigna), one draw
+// per sample giving both uniform values of the TPDF dither as two 24-bit
+// fractions. Statistically ample for dither and about ten times cheaper per
+// sample than two std::uniform_real_distribution draws from std::mt19937.
+class DitherRng {
+public:
+    explicit DitherRng(std::uint64_t seed = 0x9E3779B97F4A7C15ull) : s_(seed ? seed : 0x9E3779B97F4A7C15ull) {}
+    // u1 + u2 - 1 with u1, u2 uniform in [0, 1): triangular in (-1, 1).
+    float tpdf() {
+        s_ ^= s_ >> 12;
+        s_ ^= s_ << 25;
+        s_ ^= s_ >> 27;
+        std::uint64_t r = s_ * 0x2545F4914F6CDD1Dull;
+        constexpr float k = 1.0f / 16777216.0f;
+        return static_cast<float>(r >> 40) * k + static_cast<float>((r >> 16) & 0xFFFFFFu) * k - 1.0f;
+    }
+
+private:
+    std::uint64_t s_;
+};
+std::int16_t floatToInt16(float v, DitherRng& rng);
+// The same for a whole buffer, into 32-bit integers (libFLAC's input type).
+void floatToInt16(const float* in, std::int32_t* out, std::size_t n, DitherRng& rng);
+
 // Levinson-Durbin fit of `order` coefficients to `n` samples (with a mild lag
 // window and bandwidth expansion), then `count` extrapolated samples that
 // continue `history`. Silence extrapolates to silence.

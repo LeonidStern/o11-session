@@ -22,6 +22,10 @@ specification leaves room, the choice is listed here.
   in-process `Server` with a simulated audio clock, plus duplex rooms where
   both engines send and listen with offset interval clocks, FLAC and Opus).
 - `tools/o11jam.cpp`: the command-line client of section 14.
+- `tools/o11bench.cpp`: a CPU benchmark for profiling (not part of the
+  specification): a sender and a listener on an in-process server with a
+  simulated audio clock, printing the CPU time (getrusage) and SNR, e.g.
+  `valgrind --tool=callgrind o11bench --codec flac --seconds 20`.
 - CMake option `O11PROTO_BUILD_ENGINE` (default ON) finds opus and flac with
   pkg-config; OFF builds only the protocol library.
 
@@ -154,7 +158,11 @@ specification leaves room, the choice is listed here.
 - Float to 16-bit: 0 and NaN give 0; a value that already sits exactly on a
   16-bit step is kept as it is (no dither), so quantised audio round-trips
   bit-exactly (13.3); any other value gets 1 LSB TPDF dither, rounding to
-  nearest, clipping. The dither generator is a per-encoder `std::mt19937`.
+  nearest, clipping. The dither generator is a per-encoder xorshift64*
+  (`DitherRng`, seeded from `std::random_device`): one 64-bit draw gives
+  both uniform values as 24-bit fractions. It replaced `std::mt19937` with
+  two `uniform_real_distribution` draws, which cost more CPU than libFLAC's
+  level-5 encoding itself.
 - Decoder: the read callback returns ABORT when starved; the decoder is then
   `flush()`ed and the input rewound to the last `get_decode_position` (a tell
   callback is supplied), so a truncated frame is retried from its start once
@@ -234,6 +242,26 @@ specification leaves room, the choice is listed here.
   the same syscall counts (it sends about four times as many WRITEs at the
   2048-byte threshold of 6.1 and three times the bytes); the threshold is
   kept as specified.
+- The FLAC encoder's float to 16-bit conversion (6.4) used two
+  `std::uniform_real_distribution` draws from `std::mt19937` and `floor` /
+  `lround` per sample: 172 M instructions for 20 s of mono 48 kHz, more than
+  libFLAC's level-5 encoding (117 M). It now draws both dither values from one
+  xorshift64* step and rounds without libm calls, with the same rule (exact
+  steps undithered, round half away from zero, clip): 59 M.
+- The upload resampler (6.4, only when the device rate is not 48 kHz)
+  interpolated between its two phase tables once per tap *and* channel and
+  tested every tap's index; at 44.1 kHz mono it cost 1040 M instructions per
+  20 s, more than the Opus encoder. It now builds the interpolated kernel once
+  per output frame and sums in four partial sums without a per-tap test
+  (318 M); the output differs from before only by float rounding (test 13.2
+  and the resampler check report the same figures).
+- What is left of an Opus run at 48 kHz is libopus: in `o11bench --codec
+  opus` at 510 kbps, `opus_encode_float` is about 59 % of all instructions
+  and `opus_decode_float` 19 %; the engine's own mixing, meters, copies and
+  messaging are about 5 %. In a real-time `o11jam --two` run most of the
+  remaining process CPU is the two threads waking up (about 3800 sleeps and
+  wake-ups in 20 s), not instructions: an idle connected `--two` run with
+  nothing sent costs about as much CPU as the FLAC work.
 
 ## Not implemented
 

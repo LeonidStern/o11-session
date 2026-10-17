@@ -11,20 +11,45 @@ namespace engine {
 
 // -------------------------------------------------------- float -> int16
 
-std::int16_t floatToInt16(float v, std::mt19937& rng) {
+namespace {
+
+// The conversion of ENGINE.md 6.4 with the dither drawn by `tpdf()`. It
+// avoids libm calls (floor, lround) in the per-sample path: |x| beyond the
+// range where dither can still change the clipped result is clipped at once,
+// and inside it a float -> int truncation tests for an exact step and rounds
+// half away from zero exactly as std::lround does (x + 0.5 is exact for
+// |x| < 2^22).
+template <class Tpdf>
+inline std::int16_t convert(float v, Tpdf&& tpdf) {
     if (v == 0.0f || std::isnan(v)) return 0;    // digital silence stays exact
     float x = v * 32768.0f;
+    if (x >= 32769.0f) return 32767;             // any dither still clips
+    if (x <= -32770.0f) return -32768;
     // A value that already sits on a 16-bit step is kept as it is, so audio
     // that was quantised before stays bit-exact (ENGINE.md 13.3); anything
     // else gets TPDF dither of 1 LSB.
-    if (x != std::floor(x)) {
-        std::uniform_real_distribution<float> uni(0.0f, 1.0f);
-        x += uni(rng) + uni(rng) - 1.0f;
-    }
-    long r = std::lround(x);
+    if (static_cast<float>(static_cast<int>(x)) != x) x += tpdf();
+    int r = static_cast<int>(x >= 0.0f ? x + 0.5f : x - 0.5f);
     if (r > 32767) r = 32767;
     if (r < -32768) r = -32768;
     return static_cast<std::int16_t>(r);
+}
+
+}  // namespace
+
+std::int16_t floatToInt16(float v, std::mt19937& rng) {
+    return convert(v, [&rng] {
+        std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+        return uni(rng) + uni(rng) - 1.0f;
+    });
+}
+
+std::int16_t floatToInt16(float v, DitherRng& rng) {
+    return convert(v, [&rng] { return rng.tpdf(); });
+}
+
+void floatToInt16(const float* in, std::int32_t* out, std::size_t n, DitherRng& rng) {
+    for (std::size_t i = 0; i < n; ++i) out[i] = convert(in[i], [&rng] { return rng.tpdf(); });
 }
 
 // ------------------------------------------------------------------- LPC
@@ -135,8 +160,12 @@ void Resampler::process(const float* in, int frames, std::vector<float>& out) {
     }
     buf_.insert(buf_.end(), in, in + static_cast<std::size_t>(frames) * ch);
     const std::size_t have = buf_.size() / ch;
+    // About frames * out / in output frames follow; reserve them once.
+    out.reserve(out.size() + (static_cast<std::size_t>(frames) * static_cast<std::size_t>(out_rate_) /
+                              static_cast<std::size_t>(in_rate_) + 2) * ch);
     // Output frame j is at input position origin_ + j*in/out and needs input
     // frames floor(pos)-kTaps+1 .. floor(pos)+kTaps.
+    float kern[2 * kTaps];
     while (true) {
         long num = j_ * in_rate_;
         long fl = origin_ + num / out_rate_;
@@ -148,12 +177,43 @@ void Resampler::process(const float* in, int frames, std::vector<float>& out) {
         float pw = static_cast<float>(pf - p0);
         const float* t0 = &table_[static_cast<std::size_t>(p0) * 2 * kTaps];
         const float* t1 = &table_[static_cast<std::size_t>(p0 + 1) * 2 * kTaps];
+        // The interpolated kernel is the same for every channel: build it
+        // once per output frame instead of once per tap and channel.
+        for (int t = 0; t < 2 * kTaps; ++t) kern[t] = t0[t] + (t1[t] - t0[t]) * pw;
+        // base >= 1 always (the buffer starts with kTaps frames of history and
+        // the trimming below keeps kTaps), so no bounds test per tap; the
+        // guarded loop stays for safety.
         for (std::size_t c = 0; c < ch; ++c) {
-            float acc = 0;
-            for (int t = 0; t < 2 * kTaps; ++t) {
-                long idx = base + t;
-                float x = idx < 0 ? 0.0f : buf_[static_cast<std::size_t>(idx) * ch + c];
-                acc += x * (t0[t] + (t1[t] - t0[t]) * pw);
+            float acc;
+            if (base >= 0) {
+                const float* x = &buf_[static_cast<std::size_t>(base) * ch + c];
+                // Four partial sums so the compiler can keep them in one SIMD
+                // register; the order of additions differs from a single
+                // running sum only by float rounding.
+                float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                if (ch == 1) {
+                    for (int t = 0; t < 2 * kTaps; t += 4) {
+                        a0 += x[t] * kern[t];
+                        a1 += x[t + 1] * kern[t + 1];
+                        a2 += x[t + 2] * kern[t + 2];
+                        a3 += x[t + 3] * kern[t + 3];
+                    }
+                } else {
+                    for (int t = 0; t < 2 * kTaps; t += 4) {
+                        a0 += x[static_cast<std::size_t>(t) * ch] * kern[t];
+                        a1 += x[static_cast<std::size_t>(t + 1) * ch] * kern[t + 1];
+                        a2 += x[static_cast<std::size_t>(t + 2) * ch] * kern[t + 2];
+                        a3 += x[static_cast<std::size_t>(t + 3) * ch] * kern[t + 3];
+                    }
+                }
+                acc = (a0 + a1) + (a2 + a3);
+            } else {
+                acc = 0;
+                for (int t = 0; t < 2 * kTaps; ++t) {
+                    long idx = base + t;
+                    float x = idx < 0 ? 0.0f : buf_[static_cast<std::size_t>(idx) * ch + c];
+                    acc += x * kern[t];
+                }
             }
             out.push_back(acc);
         }
