@@ -22,7 +22,9 @@ specification leaves room, the choice is listed here.
   in-process `Server` with a simulated audio clock, plus duplex rooms where
   both engines send and listen with offset interval clocks, FLAC and Opus;
   13.15-13.16, one engine fed by a plain o11proto client that uploads FLAC
-  intervals on cue, for the level meter and the dropout count).
+  intervals on cue, for the level meter and the dropout count; 13.17, two
+  engines with offset clocks voting to another tempo, which counts no
+  dropouts).
 - `tools/o11jam.cpp`: the command-line client of section 14.
 - `tools/o11bench.cpp`: a CPU benchmark for profiling (not part of the
   specification): a sender and a listener on an in-process server with a
@@ -204,28 +206,57 @@ specification leaves room, the choice is listed here.
   take the mutex only to find the user, like the peaks. Per channel,
   `audio_expected` is set when an audio or undecodable interval becomes
   current and cleared by a silent one or `discardChannelIntervals`;
-  `dropped` limits the count to one per interval. A download with no decoder
-  (`makeDecoder` returns null: Vorbis, Ogg Opus) used to be left out of the
-  queue; it now takes its slot as an undecodable entry, which plays nothing
-  as before and counts once when it becomes current.
-- A stream that ran out counts unless it has `finished()` (all arrived and
-  decoded) and ends at most `kDropoutSlackFrames` (64) source frames before
-  the end of the interval, or the piece starts past the usual length. The
-  slack is for rounding between two sides' interval lengths: an Opus stream
-  from a 44.1 kHz sender is `floor(trunc(T x 44100) x 48000 / 44100)` frames
-  and can be one short of a 48 kHz listener's `trunc(T x 48000)` (110 BPM /
-  16 BPI, for example), from an 8000 Hz sender up to six. 8.5 then plays
-  nothing in that last piece of the interval; that behaviour is unchanged
-  here, only not counted. FLAC streams can't come up short this way (the
-  listener consumes `floor(len x src / dst)` frames, never more than the
-  sender's count).
+  `first_audio` marks an audio interval that became current while nothing
+  was expected; `dropped` limits the count to one per interval. A download
+  with no decoder (`makeDecoder` returns null: Vorbis, Ogg Opus) used to be
+  left out of the queue; it now takes its slot as an undecodable entry,
+  which plays nothing as before and counts once when it becomes current,
+  first interval and clock changes or not.
+- Late data counts only while the decoder has not `finished()`: a stream
+  that has all arrived never counts, however short (a joiner's partial first
+  interval, an interval recorded at the old tempo, a host that stopped). The
+  check is in the 8.5 underrun branch: what the rest of the interval needs
+  (`interval_len_ - interval_pos_`, mapped to source frames with the
+  resampler's phase) minus `available()`, more than `kDropoutSlackFrames`
+  (64). The slack is no longer about rounding (a finished stream is out
+  anyway); it keeps a stream that is still arriving its last few frames
+  before the boundary from counting. 8.5 still plays nothing in the last
+  piece of an interval whose stream is a few frames short (an Opus stream
+  from a 44.1 kHz sender at 110 BPM / 16 BPI, say); that is unchanged here
+  and not counted.
+- A missing interval counts at the boundary when slot 0 is empty, the
+  channel is subscribed, present and expecting audio, unless the outgoing
+  stream ran long: before it goes to `garbage_`, the boundary decodes it to
+  `drop_count + 65` frames past the read position (`decodeUntil`, cheap: the
+  data is there or it isn't) and, when more than `drop_count + 64` are
+  available, the sender's interval was longer than ours (its `setIntervalEnd`
+  moved the end, or it switched to a slower tempo first) and its next one is
+  due later.
+- Clock grace: `clockSteady()` is false while `clock_grace_` (samples, audio
+  context) is above 0, while `clock_moved_` is set (`setIntervalEnd` changed
+  the length of the interval in progress) and while the server's BPM or BPI
+  differ from the active ones (a CONFIG_CHANGE waiting for the boundary).
+  The boundary that changes BPM, BPI or the length, or ends a moved
+  interval, sets the grace to the old usual length plus the new one; each
+  piece takes its length off. Neither late data nor missing intervals count
+  while the clock is not steady. That covers both orders of switching: a
+  listener that goes to a slower tempo first gets the sender's shorter last
+  old-tempo interval (finished, not counted) and then the sender's first
+  new one late; one that goes to a faster tempo first ends an interval
+  before the sender sends anything for it, and the next plays silence (test
+  13.17 measures four seconds of it). Starting to run is not a change (no
+  grace at the first boundary), and a sample-rate change counts as one
+  because it changes the length.
 - Left out of the count on purpose: intervals replaced in slot 1 of a full
   queue (the listener's own audio stalled: every channel would count the
   same, and the count is meant to tell which player's audio is not coming
   through) and audio cut off by a boundary. Counted although nobody's network
-  is at fault: the first interval after a change to a slower tempo, and,
-  in a room whose mask fell to Vorbis, every interval (another engine sends
-  nothing, a legacy client sends Vorbis); both are gaps the listener hears.
+  is at fault: in a room whose mask fell to Vorbis, every interval (another
+  engine sends nothing, so they are missing; a legacy client sends Vorbis,
+  which is undecodable), because the listener hears nothing from them. A
+  listener whose own `process()` stalled can still count the missing
+  intervals right after it resumes; from inside the engine that looks the
+  same as a sender's.
 - The fade-out is the previous decoder's lapping frames followed by what it
   still has available, up to 128 frames; for FLAC that is empty when the
   stream was exactly the interval long. The fade-in is applied in place to

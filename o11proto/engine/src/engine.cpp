@@ -786,7 +786,9 @@ void Engine::position(int* pos, int* len) const {
 
 void Engine::setIntervalEnd(int samples) {
     if (!running_.load() || !interval_started_.load() || samples < 1) return;
-    interval_len_.store(interval_pos_.load() + samples);
+    int len = interval_pos_.load() + samples;
+    if (len != interval_len_.load()) clock_moved_.store(true);
+    interval_len_.store(len);
 }
 
 void Engine::outputPair(int outChannel, int offset, int numOut, int* idx, bool* mono) const {
@@ -814,6 +816,8 @@ void Engine::process(const float* const* in, int numIn, float* const* out, int n
         running_.store(true);
         interval_started_.store(false);          // first boundary at the start of this block
         loop_count_.store(0);
+        clock_grace_ = 0;
+        clock_moved_.store(false);
     }
 
     if (!running_.load()) {
@@ -836,13 +840,16 @@ void Engine::process(const float* const* in, int numIn, float* const* out, int n
         mixLocal(inp, numIn, outp, numOut, piece, sampleRate);
         mixMetronome(outp, numOut, piece, sampleRate);
         interval_pos_.store(interval_pos_.load() + piece);
+        if (clock_grace_ > 0) clock_grace_ = std::max(0, clock_grace_ - piece);
         pos += piece;
     }
     applyMaster(out, numOut, frames, sampleRate);
 }
 
 void Engine::boundary(int sampleRate) {
-    if (tempo_pending_.load() || !interval_started_.load()) {
+    bool started = interval_started_.load();
+    int old_bpm = active_bpm_.load(), old_bpi = active_bpi_.load(), old_len = usual_len_.load();
+    if (tempo_pending_.load() || !started) {
         if (server_bpm_.load() > 0 && server_bpi_.load() > 0) {
             active_bpm_.store(server_bpm_.load());
             active_bpi_.store(server_bpi_.load());
@@ -851,6 +858,12 @@ void Engine::boundary(int sampleRate) {
     }
     int len = intervalLengthFor(active_bpm_.load(), active_bpi_.load(), sampleRate);
     if (len < 1) len = 1;
+    // This clock changed (tempo, BPI, sample rate, or an interval end moved):
+    // until an interval of the old length and one of the new have played,
+    // intervals can come early or late by that alone, so no dropouts (8.7).
+    if (started && (clock_moved_.exchange(false) || len != old_len || active_bpm_.load() != old_bpm ||
+                    active_bpi_.load() != old_bpi))
+        clock_grace_ = old_len + len;
     usual_len_.store(len);
     interval_len_.store(len);
     interval_pos_.store(0);
@@ -905,12 +918,21 @@ void Engine::newIntervalStep() {
                 }
                 rc.fade_channels = ch;
             }
-            // 2. drop the current interval
-            if (rc.current) garbage_.push_back(std::move(rc.current));
+            // 2. drop the current interval. A stream with frames to spare ran
+            // longer than this interval: its sender's interval was longer
+            // (an interval end moved there, a slower tempo), so its next one
+            // comes that much later than usual (8.7).
+            bool ran_long = false;
+            if (rc.current) {
+                std::size_t spare = static_cast<std::size_t>(rc.drop_count) + static_cast<std::size_t>(kDropoutSlackFrames);
+                rc.current->decodeUntil(spare + 1);
+                ran_long = rc.current->available() > spare;
+                garbage_.push_back(std::move(rc.current));
+            }
             rc.has_current = false;
             // 3./4. advance the queue
             bool live = rc.subscribed && rc.present;
-            bool late = live && !rc.slots[0].used && rc.audio_expected;
+            bool late = live && !rc.slots[0].used && rc.audio_expected && !ran_long && clockSteady();
             bool failed = live && rc.slots[0].used && rc.slots[0].failed;
             if (rc.slots[0].used) {
                 if (live) {
@@ -924,10 +946,15 @@ void Engine::newIntervalStep() {
             rc.slots[1] = Slot();
             // 5. drop count, and the dropouts of 8.7: nothing arrived in time
             // after an audio interval, or the interval can't be decoded. A
-            // silent interval means none is due until audio comes again.
+            // silent interval means none is due until audio comes again, and
+            // the first audio after that is not held to time.
             rc.drop_count = 0;
             rc.dropped = false;
-            if (rc.has_current) rc.audio_expected = rc.current || failed;
+            rc.first_audio = false;
+            if (rc.has_current) {
+                rc.first_audio = rc.current && !rc.audio_expected;
+                rc.audio_expected = rc.current || failed;
+            }
             if (late || failed) countDropout(rc);
             rc.rs.reset();
             // 6. fade-in
@@ -954,6 +981,7 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
     float decay = static_cast<float>(std::pow(0.015625, static_cast<double>(len) / sampleRate));
     bool any_solo = any_solo_.load();
     int offset = remote_offset_.load();
+    bool steady = clockSteady();
     for (auto& u : users_) {
         for (auto& rc : u->ch) {
             if (!rc.present) continue;
@@ -976,7 +1004,7 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
                 dec.decodeUntil(static_cast<std::size_t>(needed) + 2);
             }
             if (dec.available() < static_cast<std::size_t>(needed)) {
-                if (!rc.dropped && isDropout(rc, dec, srcRate, sampleRate)) countDropout(rc);
+                if (!rc.dropped && !rc.first_audio && steady && isDropout(rc, dec, srcRate, sampleRate)) countDropout(rc);
                 rc.drop_count += needed - static_cast<long>(dec.available());
                 dec.skip(dec.available());
                 rc.rs.advance(srcRate, sampleRate, len, needed);
@@ -1042,19 +1070,25 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
     }
 }
 
-// 8.7: whether a piece the current stream can't fill is a dropout. Data that
-// is late, or a stream that can't be decoded, is one. A stream that has all
-// arrived and ran out is one unless it ends within kDropoutSlackFrames of the
-// interval's end (the sender's and the listener's interval lengths differ by
-// a few frames of rounding when their sample rates differ) or past the usual
-// length (an interval made longer with setIntervalEnd). remote_mutex_ held.
+// 8.7: whether a piece the current stream can't fill is late data: the
+// download is still arriving (or the stream went bad and decodes no further)
+// and it lacks more than kDropoutSlackFrames of what the rest of the interval
+// needs. A stream that has all arrived is never a dropout, however short: its
+// sender's interval was shorter (it started late, a tempo change, a stopped
+// host). remote_mutex_ held.
 bool Engine::isDropout(const RemoteChannel& rc, const Decoder& dec, int srcRate, int sampleRate) const {
-    int rem = std::min(interval_len_.load(), usual_len_.load()) - interval_pos_.load();
-    if (rem <= 0) return false;
-    if (!dec.finished()) return true;
+    if (dec.finished()) return false;
+    int rem = interval_len_.load() - interval_pos_.load();
     std::int64_t want = srcRate == sampleRate ? rem
         : (static_cast<std::int64_t>(srcRate) * rem + rc.rs.phase_num) / sampleRate;
     return want - static_cast<std::int64_t>(dec.available()) > kDropoutSlackFrames;
+}
+
+// 8.7: false while this engine's own clock changes (a new tempo or BPI on its
+// way or just applied, an interval end moved), audio context.
+bool Engine::clockSteady() const {
+    return clock_grace_ == 0 && !clock_moved_.load() && server_bpm_.load() == active_bpm_.load() &&
+           server_bpi_.load() == active_bpi_.load();
 }
 
 // 5.3 and 5.4, local_mutex_ held.

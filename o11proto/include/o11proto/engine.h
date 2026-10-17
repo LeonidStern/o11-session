@@ -31,7 +31,7 @@ constexpr int kPrebufferBytes = 8192;
 constexpr int kFirstWriteThreshold = 8192;
 constexpr int kLaterWriteThreshold = 2048;
 constexpr int kCrossfadeFrames = 128;
-constexpr int kDropoutSlackFrames = 64;          // a whole stream this close to the interval's end is no dropout (8.7)
+constexpr int kDropoutSlackFrames = 64;          // late data this close to the interval's end is no dropout (8.7)
 
 // Settings of a local channel (ENGINE.md 5.1).
 struct LocalChannel {
@@ -220,6 +220,7 @@ private:
         Slot slots[2];
         long drop_count = 0;                    // frames a late stream owes, skipped when they arrive (8.5)
         bool audio_expected = false;            // the last interval was audio, so another is due (8.7)
+        bool first_audio = false;               // the current interval is audio after none was due
         bool dropped = false;                   // a dropout was counted in this interval
         PlaybackResampler rs;
         std::vector<float> fade;                // interleaved fade-out
@@ -275,6 +276,7 @@ private:
     void applyMaster(float* const* out, int numOut, int len, int sampleRate);
     void outputPair(int outChannel, int offset, int numOut, int* idx, bool* mono) const;
     bool isDropout(const RemoteChannel& rc, const Decoder& dec, int srcRate, int sampleRate) const;
+    bool clockSteady() const;
     static void countDropout(RemoteChannel& rc);
     static void decayPeak(std::atomic<float>& p, float factor);
     static void raisePeak(std::atomic<float>& p, float v);
@@ -306,6 +308,8 @@ private:
     std::atomic<int> interval_pos_{0}, interval_len_{0}, usual_len_{0}, loop_count_{0}, sample_rate_{0};
     int beat_len_ = 0, next_beat_ = 0, beat_index_ = 0, click_pos_ = -1, click_len_ = 0;
     bool click_first_ = false;
+    int clock_grace_ = 0;                       // samples left in which dropouts aren't counted (8.7)
+    std::atomic<bool> clock_moved_{false};      // setIntervalEnd moved the end of this interval
 
     // master / metronome settings (atomics: set from control, read in audio)
     std::atomic<float> master_vol_{1.0f}, master_pan_{0.0f};
