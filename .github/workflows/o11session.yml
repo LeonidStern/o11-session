@@ -1,16 +1,26 @@
 name: o11session
 
-# Builds the O11 Session plug-in on JUCE over the clean-room o11proto engine (plugin/), on
-# Linux, Windows and macOS, runs its tests (and o11proto's), checks the VST3 with Tracktion's
-# pluginval (which also opens the editor) and uploads what users install.
+# Builds the O11 Session plug-in on JUCE over the clean-room o11proto engine (plugin/), runs
+# its tests (and o11proto's), checks the VST3 with Tracktion's pluginval (which also opens the
+# editor) and uploads what users install.
+#
+# Day to day (pushes to main, pull requests) only macOS builds and tests: that's where the
+# plug-in is tried by hand. Linux and Windows build too for a release candidate: a pushed tag
+# rc-<anything> (git tag rc-3 && git push origin rc-3), or a manual run with "all platforms".
 
 on:
   push:
     branches: [main]
+    tags: ['rc-*']
     paths: ['plugin/**', 'o11proto/**', '.github/workflows/o11session.yml']
   pull_request:
     paths: ['plugin/**', 'o11proto/**', '.github/workflows/o11session.yml']
   workflow_dispatch:
+    inputs:
+      all_platforms:
+        description: Build and test on Linux and Windows too, as for a release candidate
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,6 +39,7 @@ env:
 
 jobs:
   linux:
+    if: startsWith(github.ref, 'refs/tags/rc-') || inputs.all_platforms
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -83,6 +94,7 @@ jobs:
           if-no-files-found: ignore
 
   windows:
+    if: startsWith(github.ref, 'refs/tags/rc-') || inputs.all_platforms
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -329,10 +341,16 @@ jobs:
           path: pluginval-logs/
           if-no-files-found: ignore
 
-  # The downloads in the README: each push to main puts that build of all three in the
-  # release "o11session-latest" (the tag moves to the commit), replacing the files there.
+  # The downloads in the README: each push to main puts its macOS build in the release
+  # "o11session-latest" (the tag moves to the commit), replacing the files there; Linux and
+  # Windows are replaced only by a build of all three. A release candidate (tag rc-*) also gets
+  # its own pre-release with all three.
   release:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: >-
+      always() && needs.macos.result == 'success' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
+      (startsWith(github.ref, 'refs/tags/rc-') ||
+       (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')))
     needs: [linux, windows, macos]
     runs-on: ubuntu-24.04
     permissions:
@@ -340,13 +358,16 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: o11session-latest
+      ALL: ${{ needs.linux.result == 'success' && needs.windows.result == 'success' }}
     steps:
       - uses: actions/download-artifact@v4
+        if: needs.linux.result == 'success'
         with:
           name: O11Session-linux-x86_64
           path: linux
 
       - uses: actions/download-artifact@v4
+        if: needs.windows.result == 'success'
         with:
           name: O11Session-windows-x64
           path: windows
@@ -359,15 +380,22 @@ jobs:
       - name: Zip the downloads
         run: |
           mkdir release
-          (cd linux && zip -qr ../release/O11Session-linux-x86_64.zip O11Session.vst3)
-          (cd windows && zip -qr ../release/O11Session-windows-x64.zip O11Session.vst3)
+          if [ "$ALL" = true ]; then
+            (cd linux && zip -qr ../release/O11Session-linux-x86_64.zip O11Session.vst3)
+            (cd windows && zip -qr ../release/O11Session-windows-x64.zip O11Session.vst3)
+          fi
           # made on the Mac, with the bundle bit (see the macos job)
           cp macos/O11Session-macos.dmg macos/O11Session-macos.zip release/
           ls -l release
 
       - name: Publish to the o11session-latest release
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/rc-')
         run: |
-          NOTES="The newest build of O11 Session, from ${GITHUB_SHA::7} on main. See the README for how to install it."
+          if [ "$ALL" = true ]; then
+            NOTES="The newest build of O11 Session, from ${GITHUB_SHA::7}, on every platform. See the README for how to install it."
+          else
+            NOTES="The newest build of O11 Session. The Mac files are from ${GITHUB_SHA::7} on main; the Windows and Linux files are from the last release candidate. See the README for how to install it."
+          fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" -f sha="$GITHUB_SHA" -F force=true >/dev/null
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "O11 Session (latest build)" --notes "$NOTES"
@@ -375,3 +403,15 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "O11 Session (latest build)" --notes "$NOTES" --latest
           fi
           gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish the release candidate
+        if: startsWith(github.ref, 'refs/tags/rc-')
+        run: |
+          RC="$GITHUB_REF_NAME"
+          NOTES="Release candidate $RC of O11 Session, from ${GITHUB_SHA::7}, for testing by hand. See the README for how to install it."
+          if gh release view "$RC" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RC" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          else
+            gh release create "$RC" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --title "O11 Session $RC" --notes "$NOTES"
+          fi
+          gh release upload "$RC" release/* --repo "$GITHUB_REPOSITORY" --clobber

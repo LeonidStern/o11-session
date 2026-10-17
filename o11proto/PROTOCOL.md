@@ -1,6 +1,6 @@
 # NINJAM protocol specification
 
-Revision 2b, 2026-10-17 (revision 1 plus the exact server texts and defaults found by running a clean-room implementation against the reference; see section 14). Written from the behaviour of the NINJAM server and client in the Jamsa repository (`LeonidStern/Jamsa`, commit `e040ae1`), including the Jamsa extensions (codec negotiation and the room bitrate). It describes what goes over the wire and how each side must behave; it contains no code. It is meant to be enough to write a new client or server from scratch that works with existing NINJAM clients (ReaNINJAM, JamTaba, JamWide, the original NINJAM clients) and with the Jamsa server and plug-in.
+Revision 2c, 2026-10-17 (revision 1 plus the exact server texts and defaults found by running a clean-room implementation against the reference; see section 14). Written from the behaviour of the NINJAM server and client in the Jamsa repository (`LeonidStern/Jamsa`, commit `e040ae1`), including the Jamsa extensions (codec negotiation and the room bitrate). It describes what goes over the wire and how each side must behave; it contains no code. It is meant to be enough to write a new client or server from scratch that works with existing NINJAM clients (ReaNINJAM, JamTaba, JamWide, the original NINJAM clients) and with the Jamsa server and plug-in.
 
 Where this spec says "Jamsa extension", original NINJAM software doesn't know the feature and ignores it. Everything else is the protocol as Cockos defined it in 2005.
 
@@ -384,7 +384,7 @@ The payload is **up to five strings**, each ending in `0x00`, including the last
 
 | Fields | Meaning |
 |---|---|
-| `MSG`, text | say *text* to the room. Needs the chat privilege. Text starting with `!` is a command (9.4) and isn't broadcast |
+| `MSG`, text | say *text* to the room. Needs the chat privilege. Text starting with `!` is a command (9.4) and isn't broadcast, except a `!vote` that counts, which the room sees (9.4) |
 | `PRIVMSG`, user, text | private message to *user*. Needs the chat privilege. *user* may also be a prefix of a name, when the name continues with `@` right after the prefix or the prefix itself contains `@` (anonymous names), so `bob` reaches `bob@1.2.3.x`; an ambiguous prefix is refused |
 | `ADMIN`, command | a `/command` (9.5), sent without the slash |
 | `SESSION`, guid, index, "offset length" | ReaNINJAM session chunk tag (9.3) |
@@ -393,7 +393,7 @@ The payload is **up to five strings**, each ending in `0x00`, including the last
 
 | Fields | Meaning |
 |---|---|
-| `MSG`, user, text | *user* said *text*. An empty user means the server itself (vote results, errors, kicks). The sender receives their own MSG back |
+| `MSG`, user, text | *user* said *text*. An empty user means the server itself (vote results, errors, kicks). The sender receives their own MSG back. A `!` command is not passed on, except a `!vote` that counts: everyone, the voter included, gets it as the voter's MSG (9.4) |
 | `PRIVMSG`, user, text | a private message from *user*; user `*` is the server (message of the day, stats) |
 | `TOPIC`, user, text | the topic; user is empty when the server sends it on login or in answer to `!topic`, and the changer's name when someone sets it |
 | `JOIN`, user | *user* logged in (sent to everyone else) |
@@ -412,7 +412,7 @@ From the client: `SESSION`, GUID as 32 hex digits, channel index as decimal, the
 | Command | Effect |
 |---|---|
 | `!topic` | the server sends the current TOPIC to the sender |
-| `!vote bpm N`, `!vote bpi N` | cast a vote (needs the vote privilege; N within 40-400 or 2-64). Each user's latest vote per setting counts for `VotingTimeout` seconds (default 120). When the leading value has at least `threshold % × visible users` votes (rounded), the server applies it, broadcasts `[voting system] setting BPM to N` (or `BPI`) and a CONFIG_CHANGE, and clears the votes; otherwise it broadcasts `[voting system] leading candidate: a/b votes for N BPM [each vote expires in Ts]` to everyone. Voting is off when the threshold is over 100: `[voting system] Voting not enabled`; without the privilege: `[voting system] No vote permission`; bad arguments: `[voting system] !vote requires <bpm|bpi> <value> parameters`. These three go to the sender only. All vote lines are `MSG` with an empty user |
+| `!vote bpm N`, `!vote bpi N` | cast a vote (needs the vote privilege; N within 40-400 or 2-64). A vote that counts is first shown to everyone, the voter included, as the voter's own chat line: `MSG`, the voter's name, the command as typed with leading and trailing white space removed (`MSG\0Anna\0!vote bpm 100\0\0\0`); the `[voting system]` line it produces follows it. Each user's latest vote per setting counts for `VotingTimeout` seconds (default 120). When the leading value has at least `threshold % × visible users` votes (rounded), the server applies it, broadcasts `[voting system] setting BPM to N` (or `BPI`) and a CONFIG_CHANGE, and clears the votes; otherwise it broadcasts `[voting system] leading candidate: a/b votes for N BPM [each vote expires in Ts]` to everyone. Voting is off when the threshold is over 100: `[voting system] Voting not enabled`; without the privilege: `[voting system] No vote permission`; bad arguments: `[voting system] !vote requires <bpm|bpi> <value> parameters`. These three go to the sender only, and a refused vote is not shown to the room. All `[voting system]` lines are `MSG` with an empty user. (Showing the vote is new in revision 2c: the reference server only sends the `[voting system]` lines; to any client the voter's line is ordinary chat.) |
 | `!codec [opus|flac|vorbis]`, `!bitrate [N]` | section 8.4 |
 | `!live [on|off]` | section 15.3 |
 | other `!word` | `PRIVMSG * Unknown !command. Commands available: !vote, !topic, !codec, !bitrate, !live` to the sender (also on a server without Live) |
@@ -476,7 +476,7 @@ A new client or server should pass these against the existing ones (the Jamsa re
 5. A WRITE for a GUID that another connection began is dropped.
 6. Channel index 32 or beyond `maxchan` is ignored.
 7. Chat MSG is broadcast with the sender's name; a chat whose last byte isn't `0x00` is ignored (Jamsa server).
-8. `!vote bpm 100` from enough users changes the tempo and sends CONFIG_CHANGE to all.
+8. `!vote bpm 100` from enough users changes the tempo and sends CONFIG_CHANGE to all. Every vote that counts reaches everyone as the voter's `MSG` before the `[voting system]` line it causes; a refused vote (voting off, no privilege, bad arguments) answers the sender and nobody else sees it.
 9. Codec mask: a client with `0x100` gets `0x06` with Opus; when a client without codec bits joins, everyone gets mask 0 and `[server] room audio is now Vorbis ...`; it comes back when they leave. An Opus interval reaches only clients with `0x100`; others get a zero-GUID BEGIN.
 10. `!bitrate 128` → the mask carries 128 for everyone with codec bits; out-of-range values only answer the sender.
 11. A client that stops sending keepalives is dropped after about 9 s; one that sends them stays.
@@ -484,6 +484,7 @@ A new client or server should pass these against the existing ones (the Jamsa re
 
 ## 14. Revision history
 
+- **Revision 2c (2026-10-17):** a `!vote` that counts is shown to the whole room as the voter's own `MSG`, before the `[voting system]` line (9.1, 9.2, 9.4, test 8); refused votes stay private to the sender. Other `!` commands are unchanged.
 - **Revision 2b (2026-10-17):** fourcc `OPUr`, raw Opus packets with length prefixes (7.8); servers map it to the `0x100` capability like `OPUS`.
 - **Revision 2a (2026-10-16):** two more findings from the same comparison: chat messages always carry five strings (9), and CODEC_MASK is only resent when it changes (8.1).
 - **Revision 2 (2026-10-16):** a clean-room implementation written from revision 1 was run against the reference server and client. Audio, login, channels, subscriptions and forwarding matched at once; the differences were all in things revision 1 left open, now fixed in the text: the exact `[server]` and `[voting system]` chat texts and the fact that they are `MSG` lines with an empty user (8.5, 9.4, 9.5); the default Opus bitrate of 128 kbps; anonymous users don't get multiple logins unless configured; the same-name replacement runs before the capacity check; `!codec` may switch between allowed codecs under RequireCodec.

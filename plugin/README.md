@@ -32,8 +32,10 @@ configure with `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
 -DCMAKE_POLICY_DEFAULT_CMP0091=NEW` for a plug-in that needs no Visual C++
 runtime; on macOS add `"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"` for a
 universal build. `-DO11_TESTS=OFF` leaves the tests out.
-`.github/workflows/o11session.yml` does all of this on the three platforms and
-checks the plug-in with pluginval.
+`.github/workflows/o11session.yml` does all of this and checks the plug-in with
+pluginval: on macOS for every change, and on all three platforms for a release
+candidate (a pushed tag `rc-*`, or a manual run with "all platforms"), which
+also gets its own pre-release with the downloads.
 
 ### Targets
 
@@ -130,15 +132,17 @@ Everything the old plug-in did on its own, in the same way:
     beat cells, and the beat of the interval;
   - the mixer: your row (TX, IN, what you send: "sending", "not sending",
     "paused: Live stopped", with the host's name), the input fader and meter,
-    then a row per player's channel: name, a short status ("joined 4 s ago"
-    for half a minute, "silent" when nothing was heard for two intervals, or
-    ten seconds if longer), volume, pan, mute, solo, and a meter (green, amber
-    from -12 dB, red from -3 dB, a peak hold, and a clip lamp a click clears;
-    scaled from -60 dB);
+    then a row per player's channel: name, a short status ("3 dropouts" for a
+    minute after a gap in their audio, "joined 4 s ago" for half a minute,
+    "silent" when nothing was heard for two intervals, or ten seconds if
+    longer), volume, pan, mute, solo, and a meter of what they play, muted or
+    not (green, amber from -12 dB, red from -3 dB, a peak hold, and a clip
+    lamp a click clears; scaled from -60 dB);
   - the room panel: the players, BPM, interval ("16 beats"), codec and
-    bitrate, a chip for each change coming at the next interval ("BPM 100 from
-    next interval"), and Recent: joins, leaves, votes and settings changes, the
-    server's notes and the host's warnings, newest first, with their age;
+    bitrate, a chip for each change coming at the next interval, with who
+    voted for it ("BPM 100 from next interval · Anna"), and Recent: joins,
+    leaves, votes and settings changes ("Anna set BPM to 100"), the server's
+    notes and the host's warnings, newest first, with their age;
   - the host bar: Host, the players ("8 in room · full"), the address to copy,
     and the port's state ("Only your network can join" behind carrier-grade
     NAT).
@@ -146,10 +150,9 @@ Everything the old plug-in did on its own, in the same way:
   The transport bar names the host shortly: "Live", "Bitwig", "Cubase",
   "REAPER", or "DAW" when the host doesn't say or the name doesn't fit. Text is
   in Inter, embedded in the plug-in. The chat commands (`chat`, `chatlog`)
-  still work for tests and automation. Not shown, because nothing tells the
-  plug-in: who voted for a change (the server doesn't pass the vote on),
-  dropouts (o11proto's engine doesn't count them), and the level of a muted
-  player (the engine's peak is after the mute).
+  still work for tests and automation; `users` also says each channel's level
+  and dropouts. Who voted comes from the server passing each accepted vote on
+  to the room (o11proto's server does).
 
 - A player's channel you hear for the first time starts at 0 dB, as in the old
   plug-in (o11proto's engine starts them at -12 dB on its own).

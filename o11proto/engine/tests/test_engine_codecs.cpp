@@ -309,6 +309,44 @@ TEST(float_to_int16) {                           // 13.4
     CHECK(lo > 0 && hi > 0);
 }
 
+TEST(float_to_int16_fast_dither) {               // 13.4 with the encoder's generator
+    DitherRng rng(1);
+    CHECK_EQ(floatToInt16(0.0f, rng), 0);
+    CHECK_EQ(floatToInt16(1.0f, rng), 32767);
+    CHECK_EQ(floatToInt16(-1.0f, rng), -32768);
+    CHECK_EQ(floatToInt16(std::nanf(""), rng), 0);
+    CHECK_EQ(floatToInt16(1e30f, rng), 32767);
+    CHECK_EQ(floatToInt16(-1e30f, rng), -32768);
+    CHECK_EQ(floatToInt16(-12345.0f / 32768.0f, rng), -12345);
+    int counts[3] = {0, 0, 0};
+    for (int i = 0; i < 100000; ++i) {
+        int v = floatToInt16(0.5f, rng);
+        CHECK(v >= 16383 && v <= 16385);
+        if (v >= 16383 && v <= 16385) ++counts[v - 16383];
+    }
+    CHECK(counts[1] == 100000);                   // 0.5 is an exact step: no dither
+    // An in-between value: the mean stays on the value (dither is unbiased)
+    // and the triangular dither reaches both neighbours.
+    double sum = 0;
+    int lo = 0, hi = 0;
+    const float x = 0.5f + 0.25f / 32768.0f;      // 16384.25
+    for (int i = 0; i < 100000; ++i) {
+        int v = floatToInt16(x, rng);
+        sum += v;
+        if (v < 16384) ++lo;
+        if (v > 16384) ++hi;
+        CHECK(v >= 16383 && v <= 16386);
+    }
+    double mean = sum / 100000.0;
+    CHECK(mean > 16384.24 && mean < 16384.26);
+    CHECK(lo > 0 && hi > 0);
+    // The buffer form gives the same values as the single-sample one.
+    float in[4] = {0.0f, 1.0f, -1.0f, 0.25f};
+    std::int32_t out[4];
+    floatToInt16(in, out, 4, rng);
+    CHECK(out[0] == 0 && out[1] == 32767 && out[2] == -32768 && out[3] == 8192);
+}
+
 TEST(resampler_and_lpc) {
     // 44100 -> 48000 keeps a tone's level and frequency.
     Resampler rs;

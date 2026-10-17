@@ -190,7 +190,8 @@ private:
     void handleChat(Conn& c, const std::vector<std::uint8_t>& p);
     void handleBangCommand(Conn& c, const std::string& text);
     void handleAdminCommand(Conn& c, const std::string& text);
-    void handleVote(Conn& c, const std::string& setting, const std::string& value);
+    // `text` is the whole command as typed, echoed to the room when the vote counts.
+    void handleVote(Conn& c, const std::string& setting, const std::string& value, const std::string& text);
 
     void refuseLogin(Conn& c, const std::string& reason);
     void finishLogin(Conn& c, const std::string& name, std::uint32_t privs, std::uint32_t caps);

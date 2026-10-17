@@ -20,8 +20,16 @@ specification leaves room, the choice is listed here.
   check and the `OPUr` byte-at-a-time / truncated-stream checks of 8.1), `engine/tests/test_engine_clock.cpp` (13.5-13.9),
   `engine/tests/test_engine_e2e.cpp` (13.10-13.13, two engines against the
   in-process `Server` with a simulated audio clock, plus duplex rooms where
-  both engines send and listen with offset interval clocks, FLAC and Opus).
+  both engines send and listen with offset interval clocks, FLAC and Opus;
+  13.15-13.16, one engine fed by a plain o11proto client that uploads FLAC
+  intervals on cue, for the level meter and the dropout count; 13.17, two
+  engines with offset clocks voting to another tempo, which counts no
+  dropouts).
 - `tools/o11jam.cpp`: the command-line client of section 14.
+- `tools/o11bench.cpp`: a CPU benchmark for profiling (not part of the
+  specification): a sender and a listener on an in-process server with a
+  simulated audio clock, printing the CPU time (getrusage) and SNR, e.g.
+  `valgrind --tool=callgrind o11bench --codec flac --seconds 20`.
 - CMake option `O11PROTO_BUILD_ENGINE` (default ON) finds opus and flac with
   pkg-config; OFF builds only the protocol library.
 
@@ -154,7 +162,11 @@ specification leaves room, the choice is listed here.
 - Float to 16-bit: 0 and NaN give 0; a value that already sits exactly on a
   16-bit step is kept as it is (no dither), so quantised audio round-trips
   bit-exactly (13.3); any other value gets 1 LSB TPDF dither, rounding to
-  nearest, clipping. The dither generator is a per-encoder `std::mt19937`.
+  nearest, clipping. The dither generator is a per-encoder xorshift64*
+  (`DitherRng`, seeded from `std::random_device`): one 64-bit draw gives
+  both uniform values as 24-bit fractions. It replaced `std::mt19937` with
+  two `uniform_real_distribution` draws, which cost more CPU than libFLAC's
+  level-5 encoding itself.
 - Decoder: the read callback returns ABORT when starved; the decoder is then
   `flush()`ed and the input rewound to the last `get_decode_position` (a tell
   callback is supplied), so a truncated frame is retried from its start once
@@ -180,7 +192,71 @@ specification leaves room, the choice is listed here.
   The phase is reset at each boundary (the new stream starts at its frame 0).
 - A late or short stream: skip what is available, add the shortfall to the
   drop count, output nothing for the piece; the drop count is reset at the
-  boundary.
+  boundary. `RemoteChannel::drop_count` is that shortfall in source frames
+  (what the stream owes and skips once the data is there, to stay in time),
+  not a count of dropouts.
+- Level meter (8.6, `channelLevel`): `RemoteChannel::level[2]`, atomics next
+  to `peak[2]`, decayed together. The mixing loop runs for every channel with
+  a decoder and volume >= 1e-7, muted or not; it always raises the level and
+  only writes the output and raises the peak when the channel is heard, so
+  while it is heard the two hold identical values.
+- Dropouts (8.7, `channelDropouts`): `RemoteChannel::dropouts` is an atomic
+  `long`, written in the audio context (and reset to 0 by the control
+  context when the channel appears), both under `remote_mutex_`; queries
+  take the mutex only to find the user, like the peaks. Per channel,
+  `audio_expected` is set when an audio or undecodable interval becomes
+  current and cleared by a silent one or `discardChannelIntervals`;
+  `first_audio` marks an audio interval that became current while nothing
+  was expected; `dropped` limits the count to one per interval. A download
+  with no decoder (`makeDecoder` returns null: Vorbis, Ogg Opus) used to be
+  left out of the queue; it now takes its slot as an undecodable entry,
+  which plays nothing as before and counts once when it becomes current,
+  first interval and clock changes or not.
+- Late data counts only while the decoder has not `finished()`: a stream
+  that has all arrived never counts, however short (a joiner's partial first
+  interval, an interval recorded at the old tempo, a host that stopped). The
+  check is in the 8.5 underrun branch: what the rest of the interval needs
+  (`interval_len_ - interval_pos_`, mapped to source frames with the
+  resampler's phase) minus `available()`, more than `kDropoutSlackFrames`
+  (64). The slack is no longer about rounding (a finished stream is out
+  anyway); it keeps a stream that is still arriving its last few frames
+  before the boundary from counting. 8.5 still plays nothing in the last
+  piece of an interval whose stream is a few frames short (an Opus stream
+  from a 44.1 kHz sender at 110 BPM / 16 BPI, say); that is unchanged here
+  and not counted.
+- A missing interval counts at the boundary when slot 0 is empty, the
+  channel is subscribed, present and expecting audio, unless the outgoing
+  stream ran long: before it goes to `garbage_`, the boundary decodes it to
+  `drop_count + 65` frames past the read position (`decodeUntil`, cheap: the
+  data is there or it isn't) and, when more than `drop_count + 64` are
+  available, the sender's interval was longer than ours (its `setIntervalEnd`
+  moved the end, or it switched to a slower tempo first) and its next one is
+  due later.
+- Clock grace: `clockSteady()` is false while `clock_grace_` (samples, audio
+  context) is above 0, while `clock_moved_` is set (`setIntervalEnd` changed
+  the length of the interval in progress) and while the server's BPM or BPI
+  differ from the active ones (a CONFIG_CHANGE waiting for the boundary).
+  The boundary that changes BPM, BPI or the length, or ends a moved
+  interval, sets the grace to the old usual length plus the new one; each
+  piece takes its length off. Neither late data nor missing intervals count
+  while the clock is not steady. That covers both orders of switching: a
+  listener that goes to a slower tempo first gets the sender's shorter last
+  old-tempo interval (finished, not counted) and then the sender's first
+  new one late; one that goes to a faster tempo first ends an interval
+  before the sender sends anything for it, and the next plays silence (test
+  13.17 measures four seconds of it). Starting to run is not a change (no
+  grace at the first boundary), and a sample-rate change counts as one
+  because it changes the length.
+- Left out of the count on purpose: intervals replaced in slot 1 of a full
+  queue (the listener's own audio stalled: every channel would count the
+  same, and the count is meant to tell which player's audio is not coming
+  through) and audio cut off by a boundary. Counted although nobody's network
+  is at fault: in a room whose mask fell to Vorbis, every interval (another
+  engine sends nothing, so they are missing; a legacy client sends Vorbis,
+  which is undecodable), because the listener hears nothing from them. A
+  listener whose own `process()` stalled can still count the missing
+  intervals right after it resumes; from inside the engine that looks the
+  same as a sender's.
 - The fade-out is the previous decoder's lapping frames followed by what it
   still has available, up to 128 frames; for FLAC that is empty when the
   stream was exactly the interval long. The fade-in is applied in place to
@@ -337,12 +413,35 @@ need a steady stream only when there was none.
   per-sample loop); the master stage leaves the samples alone at unity gain
   and only meters them; decoders write straight into their output buffer
   (`reserveOutput`), the Opus decoder in runs rather than frame by frame.
+- A muted (or soloed-away) remote channel still goes through the resampling
+  and gain loop, without writing the output, so that its level meter stays
+  live (8.6); before, a muted channel only had its frames skipped.
 - Of what remains, libopus (complexity 10, as 6.4 says) is about 85 % of a
   `o11jam --two` Opus run; the engine's own mixing, meters and buffer clearing
   are a few percent. A FLAC run shows more system time than an Opus run with
   the same syscall counts (it sends about four times as many WRITEs at the
   2048-byte threshold of 6.1 and three times the bytes); the threshold is
   kept as specified.
+- The FLAC encoder's float to 16-bit conversion (6.4) used two
+  `std::uniform_real_distribution` draws from `std::mt19937` and `floor` /
+  `lround` per sample: 172 M instructions for 20 s of mono 48 kHz, more than
+  libFLAC's level-5 encoding (117 M). It now draws both dither values from one
+  xorshift64* step and rounds without libm calls, with the same rule (exact
+  steps undithered, round half away from zero, clip): 59 M.
+- The upload resampler (6.4, only when the device rate is not 48 kHz)
+  interpolated between its two phase tables once per tap *and* channel and
+  tested every tap's index; at 44.1 kHz mono it cost 1040 M instructions per
+  20 s, more than the Opus encoder. It now builds the interpolated kernel once
+  per output frame and sums in four partial sums without a per-tap test
+  (318 M); the output differs from before only by float rounding (test 13.2
+  and the resampler check report the same figures).
+- What is left of an Opus run at 48 kHz is libopus: in `o11bench --codec
+  opus` at 510 kbps, `opus_encode_float` is about 59 % of all instructions
+  and `opus_decode_float` 19 %; the engine's own mixing, meters, copies and
+  messaging are about 5 %. In a real-time `o11jam --two` run most of the
+  remaining process CPU is the two threads waking up (about 3800 sleeps and
+  wake-ups in 20 s), not instructions: an idle connected `--two` run with
+  nothing sent costs about as much CPU as the FLAC work.
 
 ## Not implemented
 

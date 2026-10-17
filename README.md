@@ -96,15 +96,26 @@ what the listener hears; higher is better):
 | O11 Session | **47.8 dB** | 87.3 dB |
 
 **Client CPU** for a sender and a listener together: about 1.7 % of one core
-at Opus 510 kbps, a little above the classic client's 1.4 %. Tuning is still
-to come.
+at Opus 510 kbps, a little above the classic client's 1.4 %. Profiling shows
+why: about 78 % of it is the Opus library at its highest quality setting,
+which is also what gives the better sound above. O11 Session's own code is 5
+to 8 %. Two parts of it cost more than they should have, and were tuned on
+2026-10-17:
+
+| | Before | After |
+|---|---|---|
+| Opus at 44.1 kHz, CPU of one core | 2.5 % | **2.2 %** |
+| FLAC's 16-bit conversion, instructions per 20 s | 172 M | **59 M** |
+| 44.1 kHz resampler, instructions per 20 s | 1041 M | **318 M** |
+
+The sound is the same to 0.1 dB.
 
 **Compatibility:** the classic server's own protocol test suite passes 28 of
 28 cases against the O11 Session server.
 
-Every change is built and tested automatically on macOS, Windows and Linux,
-including Tracktion's pluginval at its strictest level and a full two-player
-session through a hosted room.
+Every change is built and tested automatically on macOS, and each release
+candidate on macOS, Windows and Linux, including Tracktion's pluginval at its
+strictest level and a full two-player session through a hosted room.
 
 ## Coming next
 

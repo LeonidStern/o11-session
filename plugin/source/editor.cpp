@@ -907,19 +907,20 @@ void O11Editor::updateRoom(const Snapshot &s, double)
     m_kbps->setCurrentIndex(index);
   }
 
-  // what the room changes to at the next interval (the server doesn't say who asked for it)
+  // what the room changes to at the next interval, and who voted for it (when the server says)
   int shown = 0;
-  auto chip = [&](bool on, const std::string &text, const std::string &tip) {
+  auto chip = [&](bool on, const std::string &text, const std::string &tip, const Vote &vote, int value) {
     if (!on) return;
     Chip *c = m_chips[shown++];
-    c->set(text, "");
-    setTooltip(c, tip);
+    const std::string who = vote.value == value ? vote.who : std::string();
+    c->set(text, who);
+    setTooltip(c, tip + (who.empty() ? "" : who == "You" ? ": you voted for it" : ": " + who + " voted for it"));
   };
   const int roomBpm = (int)lround(s.bpm);
   chip(playing && roomBpm > 0 && roomBpm != (int)lround(s.intervalBpm), "BPM " + std::to_string(roomBpm) + " from next interval",
-       "The room's tempo changes to " + std::to_string(roomBpm) + " BPM when the next interval starts");
+       "The room's tempo changes to " + std::to_string(roomBpm) + " BPM when the next interval starts", m_lastVote[0], roomBpm);
   chip(playing && s.bpi > 0 && s.bpi != s.intervalBeats, uitext::beatsText(s.bpi) + " from next interval",
-       "The intervals last " + uitext::beatsText(s.bpi) + " from the next one on");
+       "The intervals last " + uitext::beatsText(s.bpi) + " from the next one on", m_lastVote[1], s.bpi);
   for (int i = 0; i < 2; i ++) showView(m_chips[i], i < shown);
   if (shown != m_chipsShown)
   {
@@ -938,6 +939,7 @@ static uitext::LineKind lineKind(const ChatLine &l)
     case ChatLine::Host: return uitext::LineKind::HostLog;
     case ChatLine::Join: return uitext::LineKind::Join;
     case ChatLine::Leave: return uitext::LineKind::Leave;
+    case ChatLine::Message: return uitext::LineKind::Chat;
     case ChatLine::Private: return l.who == "*" ? uitext::LineKind::Server : uitext::LineKind::Other; // the server's message of the day
     default: return uitext::LineKind::Other;
   }
@@ -960,12 +962,45 @@ void O11Editor::updateEvents(const Snapshot &s, double now)
   std::vector<ChatLine> lines;
   m_chatRevision = engine().getChat(lines, 400);
   m_eventsSince = s.roomSince;
-  std::vector<EventList::Event> events;
-  for (auto it = lines.rbegin(); it != lines.rend() && events.size() < 100; ++it)
+
+  // who cast the votes the server passed on: the voting system line a vote brought about says
+  // who, instead of the vote's own line
+  std::vector<std::string> voterOf(lines.size());
+  std::vector<bool> merged(lines.size(), false);
+  m_lastVote[0] = m_lastVote[1] = Vote();
+  size_t vote = lines.size();
+  bool voteBpm = false;
+  int voteValue = 0;
+  for (size_t i = 0; i < lines.size(); i ++)
   {
+    const ChatLine &l = lines[i];
+    if (l.time < s.roomSince) continue;
+    bool bpm = false;
+    int value = 0;
+    if (l.kind == ChatLine::Message && uitext::parseVote(l.text, &bpm, &value))
+    {
+      vote = i;
+      voteBpm = bpm;
+      voteValue = value;
+      m_lastVote[bpm ? 0 : 1] = Vote { l.who == s.userName ? std::string("You") : l.who, value };
+    }
+    else if (l.kind == ChatLine::Server && vote < lines.size() && uitext::voteMatches(voteBpm, voteValue, l.text))
+    {
+      voterOf[i] = m_lastVote[voteBpm ? 0 : 1].who;
+      merged[vote] = true;
+      vote = lines.size();
+    }
+  }
+
+  std::vector<EventList::Event> events;
+  for (size_t i = lines.size(); i-- > 0 && events.size() < 100;)
+  {
+    const auto it = lines.begin() + (long)i;
     if (it->time < s.roomSince) break;
+    if (merged[i]) continue;
     if ((it->kind == ChatLine::Join || it->kind == ChatLine::Leave) && it->who == s.userName) continue;
-    const uitext::RoomEvent e = uitext::roomEvent(lineKind(*it), it->who, it->text, s.hosting);
+    const std::string who = it->kind == ChatLine::Message && it->who == s.userName ? std::string("You") : it->who;
+    const uitext::RoomEvent e = uitext::roomEvent(lineKind(*it), who, it->text, s.hosting, voterOf[i]);
     if (!e.shown) continue;
     EventList::Event v;
     v.text = e.text;
@@ -1005,7 +1040,7 @@ static std::string rowKey(const std::string &user, int channel)
 void O11Editor::rebuildRows(const Snapshot &s)
 {
   m_rows.clear();
-  std::map<std::string, double> heard;
+  std::map<std::string, RowTrack> tracks;
   size_t index = 0;
   for (const RemoteUserView &u : s.users)
     for (const RemoteChannelView &c : u.channels)
@@ -1013,8 +1048,8 @@ void O11Editor::rebuildRows(const Snapshot &s)
       Row row;
       row.user = u.name;
       row.channel = c.index;
-      const auto was = m_heardAt.find(rowKey(u.name, c.index));
-      if (was != m_heardAt.end()) heard.insert(*was);
+      const auto was = m_tracks.find(rowKey(u.name, c.index));
+      if (was != m_tracks.end()) tracks.insert(*was);
       row.container.reset(new Pane(juce::Colours::transparentBlack));
       row.led = new Led;
       row.container->addAndMakeVisible(row.led);
@@ -1047,7 +1082,7 @@ void O11Editor::rebuildRows(const Snapshot &s)
       m_rows.push_back(std::move(row));
       index++;
     }
-  m_heardAt.swap(heard); // forget the channels that are gone
+  m_tracks.swap(tracks); // forget the channels that are gone
   layout();
 }
 
@@ -1072,22 +1107,31 @@ void O11Editor::updateRows(const Snapshot &s, double now)
       setControlValue(row.pan, (c.pan + 1.0f) * 0.5f);
       row.mute->setValue(c.mute);
       row.solo->setValue(c.solo);
-      const float peak = std::max(c.peak[0], c.peak[1]);
-      row.meter->setLevel(peak, now);
+      // what they play, muted or not
+      const float level = std::max(c.level[0], c.level[1]);
+      row.meter->setLevel(level, now);
       // muted: the meter dims; another player soloed: the whole row
       row.meter->setAlpha(c.mute ? 0.3f : 1.0f);
       row.container->setAlpha(anySolo && !c.solo ? 0.4f : 1.0f);
 
-      // the status: joined a moment ago, or silent for a while (only while the audio runs: the
-      // intervals, and their sound, come with it)
-      double &heard = m_heardAt.emplace(rowKey(u.name, c.index), now).first->second;
-      if (peak > 0.0001f || !s.audioRunning || c.mute) heard = now; // muted, its level isn't known
+      // the status: dropouts a moment ago, joined a moment ago, or silent for a while (only
+      // while the audio runs: the intervals, and their sound, come with it)
+      RowTrack &track = m_tracks.emplace(rowKey(u.name, c.index), RowTrack { now, -1, -1 }).first->second;
+      if (level > 0.0001f || !s.audioRunning) track.heard = now;
+      if (track.dropouts >= 0 && c.dropouts > track.dropouts) track.droppedAt = now;
+      track.dropouts = c.dropouts;
       const double joined = u.joinedAt > 0 ? now - u.joinedAt : -1;
       std::string status;
       juce::Colour color = Colors::green(), led = Colors::green();
-      bool silent = false;
-      if (joined >= 0 && joined < uitext::JOINED_SECONDS) status = uitext::joinedText(joined);
-      else if (now - heard > silentAfter)
+      bool silent = false, dropping = false;
+      if (track.droppedAt >= 0 && now - track.droppedAt < uitext::DROPOUT_SECONDS && c.dropouts > 0)
+      {
+        status = uitext::dropoutsText(c.dropouts);
+        color = led = Colors::amber();
+        dropping = true;
+      }
+      else if (joined >= 0 && joined < uitext::JOINED_SECONDS) status = uitext::joinedText(joined);
+      else if (now - track.heard > silentAfter)
       {
         status = "silent";
         color = Colors::label();
@@ -1101,6 +1145,12 @@ void O11Editor::updateRows(const Snapshot &s, double now)
                              : "plays on the main output only (the " + std::to_string(Engine::NUM_PLAYER_OUTS) +
                                  " player outputs are taken)";
       if (silent) tip += ". No sound from them for a while: their TX may be off, or their DAW stopped";
+      if (dropping)
+      {
+        const double ago = now - track.droppedAt;
+        tip += ". Gaps in their audio: " + uitext::dropoutsText(c.dropouts) + " since they came in, the last one " +
+               (ago < 5 ? std::string("just now") : uitext::ageText(ago) + " ago") + " (their connection, or yours, may be too slow)";
+      }
       setTooltip(row.name, tip);
       setTooltip(row.led, tip);
     }

@@ -862,6 +862,8 @@ static void test_uitext()
   CHECK_EQ(playersText(4), std::string("4 players"));
   CHECK_EQ(joinedText(0.5), std::string("just joined"));
   CHECK_EQ(joinedText(12.7), std::string("joined 12 s ago"));
+  CHECK_EQ(dropoutsText(1), std::string("1 dropout"));
+  CHECK_EQ(dropoutsText(3), std::string("3 dropouts"));
   CHECK_EQ(ageText(0), std::string("now"));
   CHECK_EQ(ageText(4.9), std::string("now"));
   CHECK_EQ(ageText(12.2), std::string("12 s"));
@@ -895,7 +897,7 @@ static void test_room_events()
   CHECK_EQ(e.text, "anna joined");
   CHECK_EQ(ev(LineKind::Leave, "", false, "anna").text, "anna left");
 
-  // votes: the server names nobody
+  // votes: the voting system's lines, and who voted when the server passes the vote on
   e = ev(LineKind::Server, "[voting system] setting BPM to 100");
   CHECK(e.shown && e.tone == RoomEvent::Change);
   CHECK_EQ(e.text, "BPM set to 100");
@@ -904,6 +906,31 @@ static void test_room_events()
            "Vote for BPM 100: 1 of 2");
   CHECK_EQ(ev(LineKind::Server, "[voting system] leading candidate: 2/3 votes for 8 BPI [each vote expires in 60s]").text,
            "Vote for 8 beats: 2 of 3");
+  CHECK_EQ(uitext::roomEvent(LineKind::Server, "", "[voting system] setting BPM to 100", false, "Anna").text, "Anna set BPM to 100");
+  CHECK_EQ(uitext::roomEvent(LineKind::Server, "", "[voting system] setting BPI to 16", false, "You").text,
+           "You set the interval to 16 beats");
+  CHECK_EQ(uitext::roomEvent(LineKind::Server, "", "[voting system] leading candidate: 1/2 votes for 100 BPM [each vote expires in 60s]",
+                             false, "Anna").text,
+           "Anna voted for BPM 100: 1 of 2");
+  e = ev(LineKind::Chat, "!vote bpm 90", false, "Anna");
+  CHECK(e.shown && e.tone == RoomEvent::Change);
+  CHECK_EQ(e.text, "Anna voted for BPM 90");
+  CHECK_EQ(ev(LineKind::Chat, " !VOTE BPI 32", false, "Sam").text, "Sam voted for 32 beats");
+  CHECK(!ev(LineKind::Chat, "hello", false, "Sam").shown);
+  CHECK(!ev(LineKind::Chat, "!vote bpm", false, "Sam").shown);
+  CHECK(!ev(LineKind::Chat, "!vote tempo 100", false, "Sam").shown);
+  bool bpm = false;
+  int value = 0;
+  CHECK(uitext::parseVote("!vote bpm 100", &bpm, &value) && bpm && value == 100);
+  CHECK(uitext::parseVote("!vote  bpi 16 ", &bpm, &value) && !bpm && value == 16);
+  CHECK(!uitext::parseVote("!voted bpm 100", &bpm, &value));
+  CHECK(!uitext::parseVote("!vote bpm -5", &bpm, &value));
+  CHECK(uitext::voteMatches(true, 100, "[voting system] setting BPM to 100"));
+  CHECK(!uitext::voteMatches(true, 100, "[voting system] setting BPI to 100"));
+  CHECK(!uitext::voteMatches(true, 90, "[voting system] setting BPM to 100"));
+  CHECK(uitext::voteMatches(false, 8, "[voting system] leading candidate: 2/3 votes for 8 BPI [each vote expires in 60s]"));
+  CHECK(!uitext::voteMatches(false, 16, "[voting system] leading candidate: 2/3 votes for 8 BPI [each vote expires in 60s]"));
+  CHECK(!uitext::voteMatches(true, 100, "[voting system] No vote permission"));
   e = ev(LineKind::Server, "[voting system] No vote permission");
   CHECK(e.shown && e.tone == RoomEvent::Warn);
   CHECK_EQ(e.text, "No vote permission");
@@ -1122,6 +1149,11 @@ static void test_public_address_lookup()
 static void test_host_bar()
 {
   using uitext::HostBar;
+  // addresses as people type them: the usual port left out
+  CHECK_EQ(uitext::roomAddress("203.0.113.7:2049"), "203.0.113.7");
+  CHECK_EQ(uitext::roomAddress("203.0.113.7:2050"), "203.0.113.7:2050");
+  CHECK_EQ(uitext::roomAddress("203.0.113.7:12049"), "203.0.113.7:12049");
+  CHECK_EQ(uitext::roomAddress(""), "");
   uitext::HostInfo h;
   h.port = 2049;
 
@@ -1141,7 +1173,7 @@ static void test_host_bar()
   h.lookupPending = true;
   b = uitext::hostBar(h);
   CHECK_EQ(b.addressKey, "LAN");
-  CHECK_EQ(b.address, "192.168.1.20:2049");
+  CHECK_EQ(b.address, "192.168.1.20");
   CHECK(b.port == HostBar::Asking);
   CHECK_EQ(b.portText, "Asking the router\xe2\x80\xa6");
   CHECK(b.addressTip.find("being looked up") != std::string::npos);
@@ -1156,15 +1188,15 @@ static void test_host_bar()
   h.portmapPending = false;
   b = uitext::hostBar(h);
   CHECK_EQ(b.addressKey, "WAN");
-  CHECK_EQ(b.address, "203.0.113.7:2049");
+  CHECK_EQ(b.address, "203.0.113.7");
   CHECK(b.port == HostBar::Open);
   CHECK_EQ(b.portText, "Port open");
-  CHECK(b.portTip.find("join at 203.0.113.7:2049") != std::string::npos);
-  CHECK(b.addressTip.find("192.168.1.20:2049") != std::string::npos);
+  CHECK(b.portTip.find("join at 203.0.113.7") != std::string::npos);
+  CHECK(b.addressTip.find("join at 192.168.1.20") != std::string::npos);
   // the router's address wins over the service's
   h.lookedUpAddress = "198.51.100.4:2049";
   h.lookupPending = false;
-  CHECK_EQ(uitext::hostBar(h).address, "203.0.113.7:2049");
+  CHECK_EQ(uitext::hostBar(h).address, "203.0.113.7");
 
   // the mapper's private-address line from behind the provider's NAT (100.64.0.0/10): nobody
   // outside can join, so the LAN address
@@ -1172,7 +1204,7 @@ static void test_host_bar()
   h.portmapNote = "NAT-PMP: router forwards TCP port 2049 to this machine, but the router's own internet address is 100.64.0.9, which is not public.";
   b = uitext::hostBar(h);
   CHECK_EQ(b.addressKey, "LAN");
-  CHECK_EQ(b.address, "192.168.1.20:2049");
+  CHECK_EQ(b.address, "192.168.1.20");
   CHECK(b.port == HostBar::Blocked);
   CHECK_EQ(b.portText, "Only your network can join");
   CHECK(b.portTip.find("internet address (100.64.0.9) isn't public") != std::string::npos);
@@ -1182,25 +1214,25 @@ static void test_host_bar()
   h.portmapNote = "NAT-PMP: router forwards TCP port 2049 to this machine, but the router's own internet address is 192.168.0.9, which is not public.";
   b = uitext::hostBar(h);
   CHECK_EQ(b.addressKey, "WAN"); // the service's address: the port may be forwarded by hand
-  CHECK_EQ(b.address, "198.51.100.4:2049");
+  CHECK_EQ(b.address, "198.51.100.4");
   CHECK(b.port == HostBar::Forward);
   CHECK_EQ(b.portText, "Forward port 2049");
   CHECK(b.portTip.find("(TCP) to this computer (192.168.1.20)") != std::string::npos);
-  CHECK(b.portTip.find("join at 198.51.100.4:2049") != std::string::npos);
+  CHECK(b.portTip.find("join at 198.51.100.4") != std::string::npos);
   CHECK(b.portTip.find("(The router said: NAT-PMP: router forwards") != std::string::npos);
   CHECK(b.addressTip.find("once port 2049 is forwarded") != std::string::npos);
 
   // the lookup's result alone (no router, or O11_PORTMAP=off)
   h.portmapNote.clear();
   b = uitext::hostBar(h);
-  CHECK_EQ(b.address, "198.51.100.4:2049");
+  CHECK_EQ(b.address, "198.51.100.4");
   CHECK(b.port == HostBar::Forward);
   CHECK(b.portTip.find("The router said") == std::string::npos);
 
   // the mapper lost the forward: asking again, the service's address stays
   h.portmapPending = true;
   b = uitext::hostBar(h);
-  CHECK_EQ(b.address, "198.51.100.4:2049");
+  CHECK_EQ(b.address, "198.51.100.4");
   CHECK(b.port == HostBar::Asking);
   h.portmapPending = false;
 
@@ -1208,7 +1240,7 @@ static void test_host_bar()
   h.lookedUpAddress.clear();
   b = uitext::hostBar(h);
   CHECK_EQ(b.addressKey, "LAN");
-  CHECK_EQ(b.address, "192.168.1.20:2049");
+  CHECK_EQ(b.address, "192.168.1.20");
   CHECK_EQ(b.placeholder, "not known");
   CHECK(b.port == HostBar::Forward);
   CHECK(b.portTip.find("join at") == std::string::npos);
@@ -1220,7 +1252,7 @@ static void test_host_bar()
   CHECK(b.portTip.find("A player joined from the internet, so port 2049 is open") == 0);
   h.lookedUpAddress = "198.51.100.4:2049";
   b = uitext::hostBar(h);
-  CHECK(b.portTip.find("players join at 198.51.100.4:2049") != std::string::npos);
+  CHECK(b.portTip.find("players join at 198.51.100.4") != std::string::npos);
   CHECK(b.addressTip.find("once port") == std::string::npos);
 }
 

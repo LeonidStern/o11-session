@@ -105,6 +105,11 @@ std::string joinedText(double seconds)
   return "joined " + std::to_string((long)seconds) + " s ago";
 }
 
+std::string dropoutsText(long n)
+{
+  return std::to_string(n) + (n == 1 ? " dropout" : " dropouts");
+}
+
 std::string ageText(double seconds)
 {
   if (!(seconds >= 5)) return "now";
@@ -152,7 +157,34 @@ static int numberAfter(const std::string &s, const char *prefix)
   return atoi(s.c_str() + at + strlen(prefix));
 }
 
-RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &text, bool hosting)
+bool parseVote(const std::string &text, bool *bpm, int *value)
+{
+  std::string t = text;
+  for (auto &c : t) c = (char)tolower((unsigned char)c);
+  size_t i = t.find_first_not_of(" \t");
+  if (i == std::string::npos || t.compare(i, 6, "!vote ") != 0) return false;
+  i = t.find_first_not_of(" \t", i + 6);
+  if (i == std::string::npos) return false;
+  const bool isBpm = t.compare(i, 4, "bpm ") == 0;
+  if (!isBpm && t.compare(i, 4, "bpi ") != 0) return false;
+  const int n = atoi(t.c_str() + i + 4);
+  if (n <= 0) return false;
+  if (bpm) *bpm = isBpm;
+  if (value) *value = n;
+  return true;
+}
+
+bool voteMatches(bool bpm, int value, const std::string &serverText)
+{
+  static const char *prefix = "[voting system] ";
+  if (!startsWith(serverText, prefix)) return false;
+  const std::string t = serverText.substr(strlen(prefix)), unit = bpm ? " BPM" : " BPI";
+  if (startsWith(t, "setting ")) return t.find(unit) != std::string::npos && numberAfter(t, " to ") == value;
+  if (startsWith(t, "leading candidate: ")) return t.find(unit) != std::string::npos && numberAfter(t, "votes for ") == value;
+  return false;
+}
+
+RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &text, bool hosting, const std::string &voter)
 {
   RoomEvent e;
   auto show = [&e](RoomEvent::Tone tone, const std::string &t) {
@@ -172,6 +204,14 @@ RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &te
     case LineKind::HostLog:
       if (startsWith(text, "[portmap]")) return e; // the host bar says what the router did
       return show(RoomEvent::Warn, capitalized(text));
+    case LineKind::Chat:
+    {
+      // a vote the server passed on (when it brought about a voting system line, that line says it)
+      bool bpm = false;
+      int n = 0;
+      if (!parseVote(text, &bpm, &n)) return e;
+      return show(RoomEvent::Change, who + " voted for " + (bpm ? "BPM " + std::to_string(n) : beatsText(n)));
+    }
     case LineKind::Server: break;
     default: return e;
   }
@@ -185,13 +225,15 @@ RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &te
     if (startsWith(t, "setting ") && (bpm || bpi))
     {
       const int n = numberAfter(t, " to ");
+      if (!voter.empty())
+        return show(RoomEvent::Change, voter + (bpm ? " set BPM to " + std::to_string(n) : " set the interval to " + beatsText(n)));
       return show(RoomEvent::Change, bpm ? "BPM set to " + std::to_string(n) : "Interval set to " + beatsText(n));
     }
     if (startsWith(t, "leading candidate: ") && (bpm || bpi))
     {
       const int have = atoi(t.c_str() + strlen("leading candidate: ")), need = numberAfter(t, "/"), n = numberAfter(t, "votes for ");
-      return show(RoomEvent::Change, (bpm ? "Vote for BPM " + std::to_string(n) : "Vote for " + beatsText(n)) + ": " +
-                                       std::to_string(have) + " of " + std::to_string(need));
+      const std::string what = (bpm ? "BPM " + std::to_string(n) : beatsText(n)) + ": " + std::to_string(have) + " of " + std::to_string(need);
+      return show(RoomEvent::Change, voter.empty() ? "Vote for " + what : voter + " voted for " + what);
     }
     return show(RoomEvent::Warn, capitalized(t));
   }
@@ -231,9 +273,18 @@ static std::string sharedRouterAddress(const std::string &note)
   return a == 100 && b >= 64 && b <= 127 ? addr : "";
 }
 
+std::string roomAddress(const std::string &address)
+{
+  static const char *port = ":2049";
+  const size_t n = strlen(port);
+  if (address.size() > n && address.compare(address.size() - n, n, port) == 0) return address.substr(0, address.size() - n);
+  return address;
+}
+
 HostBar hostBar(const HostInfo &h)
 {
   HostBar b;
+  const std::string lan = roomAddress(h.localAddress);
   const std::string portNo = std::to_string(h.port);
   const std::string here = h.localAddress.empty() ? std::string("this computer")
                                                   : "this computer (" + h.localAddress.substr(0, h.localAddress.rfind(':')) + ")";
@@ -246,7 +297,7 @@ HostBar hostBar(const HostInfo &h)
   if (!shared.empty())
   {
     b.addressKey = "LAN";
-    b.address = h.localAddress;
+    b.address = lan;
     b.placeholder = "not known";
     b.addressTip = "Where players in your local network join";
     b.port = HostBar::Blocked;
@@ -259,16 +310,16 @@ HostBar hostBar(const HostInfo &h)
   if (!wan.empty())
   {
     b.addressKey = "WAN";
-    b.address = wan;
+    b.address = roomAddress(wan);
     b.placeholder = "not known";
     b.addressTip = "Where players on the internet join" +
                    (forwarded || h.joinedFromInternet ? std::string() : ", once port " + portNo + " is forwarded to " + here) +
-                   (h.localAddress.empty() ? std::string() : "; players in your local network join at " + h.localAddress);
+                   (lan.empty() ? std::string() : "; players in your local network join at " + lan);
   }
   else
   {
     b.addressKey = "LAN";
-    b.address = h.localAddress;
+    b.address = lan;
     b.placeholder = asking ? "looking it up\xe2\x80\xa6" : "not known";
     b.addressTip = "Where players in your local network join; players on the internet join at your public address" +
                    std::string(asking ? ", which is being looked up" : ", which is not known") + ", once port " + portNo +
@@ -279,9 +330,9 @@ HostBar hostBar(const HostInfo &h)
   {
     b.port = HostBar::Open;
     b.portText = "Port open";
-    b.portTip = forwarded ? "Your router forwards port " + portNo + ": players on the internet join at " + wan
+    b.portTip = forwarded ? "Your router forwards port " + portNo + ": players on the internet join at " + roomAddress(wan)
                           : "A player joined from the internet, so port " + portNo + " is open" +
-                              (wan.empty() ? std::string() : ": players join at " + wan);
+                              (wan.empty() ? std::string() : ": players join at " + roomAddress(wan));
   }
   else if (h.portmapPending)
   {
@@ -295,7 +346,7 @@ HostBar hostBar(const HostInfo &h)
     b.port = HostBar::Forward;
     b.portText = "Forward port " + portNo;
     b.portTip = "Your router didn't open port " + portNo + " for O11 Session. Forward port " + portNo + " (TCP) to " + here +
-                " in your router's settings" + (wan.empty() ? std::string() : ", and players on the internet join at " + wan) +
+                " in your router's settings" + (wan.empty() ? std::string() : ", and players on the internet join at " + roomAddress(wan)) +
                 ". If it's forwarded already, they can join now.";
     if (!h.portmapNote.empty()) b.portTip += " (The router said: " + h.portmapNote + ")";
   }

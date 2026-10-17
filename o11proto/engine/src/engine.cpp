@@ -51,6 +51,10 @@ Engine::~Engine() {
 }
 
 void Engine::decayPeak(std::atomic<float>& p, float factor) { p.store(p.load() * factor); }
+void Engine::countDropout(RemoteChannel& rc) {
+    rc.dropouts.store(rc.dropouts.load() + 1);   // written under remote_mutex_ only; read from anywhere
+    rc.dropped = true;
+}
 void Engine::raisePeak(std::atomic<float>& p, float v) {
     if (v > p.load()) p.store(v);
 }
@@ -454,6 +458,8 @@ void Engine::discardChannelIntervals(RemoteChannel& rc) {
     }
     rc.fade.clear();
     rc.drop_count = 0;
+    rc.audio_expected = false;
+    rc.dropped = false;
 }
 
 void Engine::sendUserMask(RemoteUser& u) { client_.subscribe(u.name, u.submask); }
@@ -478,6 +484,7 @@ void Engine::handleUserInfo(const UserInfoRecord& rec) {
             rc.present = true;
             rc.name = rec.channel;
             rc.flags = rec.flags;
+            if (!was_present) rc.dropouts.store(0);       // counted from the channel's appearance (8.7)
             if (was_present && ((old_flags ^ rec.flags) & (kChanVoice | kChanSession))) discardChannelIntervals(rc);
             if (auto_subscribe_.load()) {
                 u->submask |= 1u << rec.index;
@@ -628,6 +635,20 @@ float Engine::channelPeak(int user, int ch, int side) const {
     return u->ch[static_cast<std::size_t>(ch)].peak[side & 1].load();
 }
 
+float Engine::channelLevel(int user, int ch, int side) const {
+    std::lock_guard<std::mutex> lock(remote_mutex_);
+    RemoteUser* u = userAt(user);
+    if (!u || ch < 0 || ch >= kMaxChannels) return 0.0f;
+    return u->ch[static_cast<std::size_t>(ch)].level[side & 1].load();
+}
+
+long Engine::channelDropouts(int user, int ch) const {
+    std::lock_guard<std::mutex> lock(remote_mutex_);
+    RemoteUser* u = userAt(user);
+    if (!u || ch < 0 || ch >= kMaxChannels) return 0;
+    return u->ch[static_cast<std::size_t>(ch)].dropouts.load();
+}
+
 #define NJ_CHAN_SET(name, field, type)                                     \
     void Engine::name(int user, int ch, type v) {                          \
         std::lock_guard<std::mutex> lock(remote_mutex_);                   \
@@ -718,8 +739,7 @@ void Engine::makePlayable(const Guid&, Download& dl) {
     // Create and prime the decoder before taking remote_mutex_, so the audio
     // context never waits on codec work.
     std::unique_ptr<Decoder> dec = makeDecoder(dl.fourcc, dl.stream);
-    if (!dec) return;
-    dec->decodeUntil(1);
+    if (dec) dec->decodeUntil(1);
     std::lock_guard<std::mutex> lock(remote_mutex_);
     RemoteUser* u = findUser(dl.user);
     if (!u) return;
@@ -727,6 +747,7 @@ void Engine::makePlayable(const Guid&, Download& dl) {
     if (rc.ignoresIntervals()) return;
     Slot s;
     s.dec = std::move(dec);
+    s.failed = !s.dec;                            // a codec this engine can't play: it plays nothing, as a dropout (8.7)
     queueInterval(rc, std::move(s));
 }
 
@@ -775,7 +796,9 @@ void Engine::position(int* pos, int* len) const {
 
 void Engine::setIntervalEnd(int samples) {
     if (!running_.load() || !interval_started_.load() || samples < 1) return;
-    interval_len_.store(interval_pos_.load() + samples);
+    int len = interval_pos_.load() + samples;
+    if (len != interval_len_.load()) clock_moved_.store(true);
+    interval_len_.store(len);
 }
 
 void Engine::outputPair(int outChannel, int offset, int numOut, int* idx, bool* mono) const {
@@ -803,6 +826,8 @@ void Engine::process(const float* const* in, int numIn, float* const* out, int n
         running_.store(true);
         interval_started_.store(false);          // first boundary at the start of this block
         loop_count_.store(0);
+        clock_grace_ = 0;
+        clock_moved_.store(false);
     }
     liveAudioBlock(in, numIn, frames, sampleRate);
 
@@ -827,13 +852,16 @@ void Engine::process(const float* const* in, int numIn, float* const* out, int n
         mixLocal(inp, numIn, outp, numOut, piece, sampleRate);
         mixMetronome(outp, numOut, piece, sampleRate);
         interval_pos_.store(interval_pos_.load() + piece);
+        if (clock_grace_ > 0) clock_grace_ = std::max(0, clock_grace_ - piece);
         pos += piece;
     }
     applyMaster(out, numOut, frames, sampleRate);
 }
 
 void Engine::boundary(int sampleRate) {
-    if (tempo_pending_.load() || !interval_started_.load()) {
+    bool started = interval_started_.load();
+    int old_bpm = active_bpm_.load(), old_bpi = active_bpi_.load(), old_len = usual_len_.load();
+    if (tempo_pending_.load() || !started) {
         if (server_bpm_.load() > 0 && server_bpi_.load() > 0) {
             active_bpm_.store(server_bpm_.load());
             active_bpi_.store(server_bpi_.load());
@@ -842,6 +870,12 @@ void Engine::boundary(int sampleRate) {
     }
     int len = intervalLengthFor(active_bpm_.load(), active_bpi_.load(), sampleRate);
     if (len < 1) len = 1;
+    // This clock changed (tempo, BPI, sample rate, or an interval end moved):
+    // until an interval of the old length and one of the new have played,
+    // intervals can come early or late by that alone, so no dropouts (8.7).
+    if (started && (clock_moved_.exchange(false) || len != old_len || active_bpm_.load() != old_bpm ||
+                    active_bpi_.load() != old_bpi))
+        clock_grace_ = old_len + len;
     usual_len_.store(len);
     interval_len_.store(len);
     interval_pos_.store(0);
@@ -897,12 +931,24 @@ void Engine::newIntervalStep() {
                 }
                 rc.fade_channels = ch;
             }
-            // 2. drop the current interval
-            if (rc.current) garbage_.push_back(std::move(rc.current));
+            // 2. drop the current interval. A stream with frames to spare ran
+            // longer than this interval: its sender's interval was longer
+            // (an interval end moved there, a slower tempo), so its next one
+            // comes that much later than usual (8.7).
+            bool ran_long = false;
+            if (rc.current) {
+                std::size_t spare = static_cast<std::size_t>(rc.drop_count) + static_cast<std::size_t>(kDropoutSlackFrames);
+                rc.current->decodeUntil(spare + 1);
+                ran_long = rc.current->available() > spare;
+                garbage_.push_back(std::move(rc.current));
+            }
             rc.has_current = false;
             // 3./4. advance the queue
+            bool live = rc.subscribed && rc.present;
+            bool late = live && !rc.slots[0].used && rc.audio_expected && !ran_long && clockSteady();
+            bool failed = live && rc.slots[0].used && rc.slots[0].failed;
             if (rc.slots[0].used) {
-                if (rc.subscribed && rc.present) {
+                if (live) {
                     rc.has_current = true;
                     rc.current = std::move(rc.slots[0].dec);
                 } else if (rc.slots[0].dec) {
@@ -911,8 +957,18 @@ void Engine::newIntervalStep() {
             }
             rc.slots[0] = std::move(rc.slots[1]);
             rc.slots[1] = Slot();
-            // 5. drop count
+            // 5. drop count, and the dropouts of 8.7: nothing arrived in time
+            // after an audio interval, or the interval can't be decoded. A
+            // silent interval means none is due until audio comes again, and
+            // the first audio after that is not held to time.
             rc.drop_count = 0;
+            rc.dropped = false;
+            rc.first_audio = false;
+            if (rc.has_current) {
+                rc.first_audio = rc.current && !rc.audio_expected;
+                rc.audio_expected = rc.current || failed;
+            }
+            if (late || failed) countDropout(rc);
             rc.rs.reset();
             // 6. fade-in
             if (rc.current && !rc.fade.empty() && rc.fade_channels == rc.current->channels()) {
@@ -942,11 +998,14 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
     float decay = static_cast<float>(std::pow(0.015625, static_cast<double>(len) / sampleRate));
     bool any_solo = any_solo_.load();
     int offset = remote_offset_.load();
+    bool steady = clockSteady();
     for (auto& u : users_) {
         for (auto& rc : u->ch) {
             if (!rc.present) continue;
             decayPeak(rc.peak[0], decay);
             decayPeak(rc.peak[1], decay);
+            decayPeak(rc.level[0], decay);
+            decayPeak(rc.level[1], decay);
             if (rc.ignoresIntervals() || !rc.current) continue;
             float vol = std::min(4.0f, std::max(0.0f, u->volume * rc.volume));
             float pan = std::min(1.0f, std::max(-1.0f, u->pan + rc.pan));
@@ -963,19 +1022,23 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
                 dec.decodeUntil(static_cast<std::size_t>(needed) + 2);
             }
             if (dec.available() < static_cast<std::size_t>(needed)) {
+                if (!rc.dropped && !rc.first_audio && steady && isDropout(rc, dec, srcRate, sampleRate)) countDropout(rc);
                 rc.drop_count += needed - static_cast<long>(dec.available());
                 dec.skip(dec.available());
                 rc.rs.advance(srcRate, sampleRate, len, needed);
                 continue;
             }
-            if (!muted && vol >= 1e-7f && numOut > 0) {
+            // The level meter is measured whether or not the channel is heard;
+            // the peak meter and the output only when it is.
+            bool audible = !muted && numOut > 0;
+            if (vol >= 1e-7f) {
                 int ch = dec.channels();
                 float* src = const_cast<float*>(dec.data());
                 std::size_t avail = dec.available();
                 for (std::size_t i = 0; i < static_cast<std::size_t>(needed) * static_cast<std::size_t>(ch); ++i) src[i] = clip1(src[i]);
                 int idx;
                 bool mono;
-                outputPair(rc.outChannel, offset, numOut, &idx, &mono);
+                outputPair(rc.outChannel, offset, numOut, &idx, &mono);   // with no outputs: mono, idx 0, unused
                 float gl, gr;
                 panGains(pan, &gl, &gr);
                 float pk0 = 0, pk1 = 0;
@@ -1000,23 +1063,50 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
                     }
                     if (mono) {
                         float v = clip1((s1 + s2) * 0.5f * vol);
-                        out[idx][i] += v;
+                        if (audible) out[idx][i] += v;
                         pk0 = std::max(pk0, std::fabs(v));
                     } else {
                         float l = clip1(s1 * vol * gl), r = clip1(s2 * vol * gr);
-                        out[idx][i] += l;
-                        out[idx + 1][i] += r;
+                        if (audible) {
+                            out[idx][i] += l;
+                            out[idx + 1][i] += r;
+                        }
                         pk0 = std::max(pk0, std::fabs(l));
                         pk1 = std::max(pk1, std::fabs(r));
                     }
                 }
-                raisePeak(rc.peak[0], pk0);
-                raisePeak(rc.peak[1], mono ? pk0 : pk1);
+                raisePeak(rc.level[0], pk0);
+                raisePeak(rc.level[1], mono ? pk0 : pk1);
+                if (audible) {
+                    raisePeak(rc.peak[0], pk0);
+                    raisePeak(rc.peak[1], mono ? pk0 : pk1);
+                }
             }
             dec.skip(static_cast<std::size_t>(needed));
             rc.rs.advance(srcRate, sampleRate, len, needed);
         }
     }
+}
+
+// 8.7: whether a piece the current stream can't fill is late data: the
+// download is still arriving (or the stream went bad and decodes no further)
+// and it lacks more than kDropoutSlackFrames of what the rest of the interval
+// needs. A stream that has all arrived is never a dropout, however short: its
+// sender's interval was shorter (it started late, a tempo change, a stopped
+// host). remote_mutex_ held.
+bool Engine::isDropout(const RemoteChannel& rc, const Decoder& dec, int srcRate, int sampleRate) const {
+    if (dec.finished()) return false;
+    int rem = interval_len_.load() - interval_pos_.load();
+    std::int64_t want = srcRate == sampleRate ? rem
+        : (static_cast<std::int64_t>(srcRate) * rem + rc.rs.phase_num) / sampleRate;
+    return want - static_cast<std::int64_t>(dec.available()) > kDropoutSlackFrames;
+}
+
+// 8.7: false while this engine's own clock changes (a new tempo or BPI on its
+// way or just applied, an interval end moved), audio context.
+bool Engine::clockSteady() const {
+    return clock_grace_ == 0 && !clock_moved_.load() && server_bpm_.load() == active_bpm_.load() &&
+           server_bpi_.load() == active_bpi_.load();
 }
 
 // 5.3 and 5.4, local_mutex_ held.
