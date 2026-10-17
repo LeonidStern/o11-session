@@ -601,20 +601,48 @@ struct Drums {
     }
 };
 
+// Steady tones instead (O11PROTO_LISTENING=tones), where whatever a switch
+// or a gap does to the sound is easy to see: alice plays 440 Hz and a quiet
+// 3520 Hz (-20 dB, so that a glitch in the treble shows), bob 660 Hz, each
+// at about -12 dBFS, from a 50 ms fade-in at frame 0 on, and never stop.
+struct Tones {
+    int rate = 48000;
+    float player(int which, long n) const {
+        if (n < 0) return 0.0f;
+        const double t = static_cast<double>(n) / rate, in = rate / 20.0;
+        const double fade = n < in ? 0.5 - 0.5 * std::cos(M_PI * n / in) : 1.0;
+        const double v = which == 0 ? 0.22 * std::sin(2 * M_PI * 440 * t) + 0.022 * std::sin(2 * M_PI * 3520 * t)
+                                    : 0.24 * std::sin(2 * M_PI * 660 * t);
+        return static_cast<float>(fade * v);
+    }
+};
+
 }  // namespace
 
 TEST(listening_file) {
     Options o;
     o.sides = 3;
+    const char* which = std::getenv("O11PROTO_LISTENING");
+    const bool tones = which && std::string(which) == "tones";
     // The engines' interval clocks start after the first host block, so the
     // pattern starts there: each bar is an interval, and its first kick
-    // falls on the boundary.
+    // falls on the boundary. (With the tones the drums only place the gaps.)
     const Drums drums(o.rate, o.bpm, kBlock);
+    const Tones tone{o.rate};
     Room r(o, {"alice", "bob", "carl"});
-    std::printf("    the drums peak at %.1f dBFS\n", 20 * std::log10(drums.peak));
-    CHECK(drums.peak < 0.5f);                    // under -6 dBFS
-    r[0].signal = [&drums](long n, int) { return drums.player(0, n); };
-    r[1].signal = [&drums](long n, int) { return drums.player(1, n); };
+    if (tones) {
+        float peak = 0;
+        for (long n = 0; n < o.rate; ++n) peak = std::max(peak, std::fabs(tone.player(0, n) + tone.player(1, n)));
+        std::printf("    the tones peak at %.1f and %.1f dBFS, together at %.1f dBFS\n", 20 * std::log10(0.242),
+                    20 * std::log10(0.24), 20 * std::log10(peak));
+        r[0].signal = [&tone](long n, int) { return tone.player(0, n); };
+        r[1].signal = [&tone](long n, int) { return tone.player(1, n); };
+    } else {
+        std::printf("    the drums peak at %.1f dBFS\n", 20 * std::log10(drums.peak));
+        CHECK(drums.peak < 0.5f);                // under -6 dBFS
+        r[0].signal = [&drums](long n, int) { return drums.player(0, n); };
+        r[1].signal = [&drums](long n, int) { return drums.player(1, n); };
+    }
     LocalChannel lc;                             // carl listens: he sends nothing
     lc.name = "listen";
     lc.mute = true;
@@ -639,14 +667,14 @@ TEST(listening_file) {
     const int gaps[5] = {20, 50, 80, 120, 250};
     auto waitUntil = [&](long frame) { r.until([&] { return r.frames.load() >= frame; }, 30); };
     // Each gap starts a 16th after a beat, where alice plays no hit and her
-    // kick is decaying. (One that starts right after an attack makes
-    // libopus's concealment repeat the attack once a pitch period, a buzz of
-    // the codec's own that isn't measured here.)
+    // kick (and, on the beats with one, her snare) is decaying.
     const long beat = 4 * drums.step, mid = drums.step;
+    long gap_at[5] = {};
     for (int k = 0; k < 5; ++k) {
         const long t = live_at + static_cast<long>((1.5 + 2.0 * k) * o.rate);
         waitUntil(t + ((mid - t) % beat + beat) % beat);
         const long f = r.frames.load();
+        gap_at[k] = f;
         r[0].e.setLiveTestSendGap(gaps[k]);
         ev.push_back({f, "a " + std::to_string(gaps[k]) + " ms gap in alice's packets (sent now, heard about " + late +
                              " ms later)"});
@@ -678,25 +706,132 @@ TEST(listening_file) {
     }
     CHECK(first >= b || !r.calm(live_at, first * kBlock));   // unless the machine had a hiccup by then
 
-    const std::string wav = "live-transitions.wav", txt = "live-transitions.txt";
+    const std::string name = tones ? "live-transitions-tones" : "live-transitions";
+    const std::string wav = name + ".wav", txt = name + ".txt";
     CHECK(writeWav(wav, r[2].heard.get() + start, end - start, o.rate));
     float heard_peak = 0;
     for (long n = start; n < end; ++n) heard_peak = std::max(heard_peak, std::fabs(r[2].heard[n]));
     std::printf("    what carl hears peaks at %.1f dBFS\n", 20 * std::log10(heard_peak));
-    CHECK(heard_peak < 0.5f);
+    if (!tones) CHECK(heard_peak < 0.5f);
     std::FILE* f = std::fopen(txt.c_str(), "w");
     REQUIRE(f);
-    std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is 909-style drums, synthesized,\n"
-                    "at %d bpm, one bar per interval: alice plays the kick and the snare, bob the closed and open\n"
-                    "hi-hats and the clap; carl sends nothing. A slot without audio is concealed for %.0f x B =\n"
-                    "%.0f ms, then fades out over %.0f ms; every switch crossfades over %.0f ms. The first sample is\n"
-                    "frame %ld of the players' clock. Times in seconds from the start.\n\n",
-                 wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
-                 kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
+    if (tones)
+        std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is steady tones: alice plays\n"
+                        "440 Hz and a quiet 3520 Hz (-20 dB), bob 660 Hz, each at about -12 dBFS, from a 50 ms\n"
+                        "fade-in at the players' frame 0 on, without a break; carl sends nothing. The room is at\n"
+                        "%d bpm, the timeline is the drum file's (live-transitions.wav). A slot without audio is\n"
+                        "concealed for %.0f x B = %.0f ms, then fades out over %.0f ms; every switch crossfades over\n"
+                        "%.0f ms. The first sample is frame %ld of the players' clock. Times in seconds from the start.\n\n",
+                     wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
+                     kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
+    else
+        std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is 909-style drums, synthesized,\n"
+                        "at %d bpm, one bar per interval: alice plays the kick and the snare, bob the closed and open\n"
+                        "hi-hats and the clap; carl sends nothing. A slot without audio is concealed for %.0f x B =\n"
+                        "%.0f ms, then fades out over %.0f ms; every switch crossfades over %.0f ms. The first sample is\n"
+                        "frame %ld of the players' clock. Times in seconds from the start.\n\n",
+                     wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
+                     kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
     for (const Event& e : ev) std::fprintf(f, "%7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
     std::fclose(f);
     std::printf("    wrote %s (%.1f s) and %s:\n", wav.c_str(), double(end - start) / o.rate, txt.c_str());
     for (const Event& e : ev) std::printf("      %7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
+
+    // Where carl hears each gap (16.6): the packets lost are the ones sent
+    // in it, and a block goes a few ms after it was played, so alice's
+    // concealment begins about `d` - 8 ms after the gap was set (give or
+    // take a block), and her audio comes back the gap's length later, on
+    // the delay it had. Each check takes in 10 ms either side of that.
+    const float* x = r[2].heard.get();
+    const long L = intervalLengthFor(o.bpm, o.bpi, o.rate), ms = o.rate / 1000;
+    const double hold_ms = kLiveConcealBuffers * r[2].e.liveBufferInUseMs();
+    auto concealedAt = [&](int k, long d) { return gap_at[k] + d - 8 * ms; };
+
+    if (tones) {
+        // A steady tone goes on through a gap: through one of up to 4 x B
+        // alice's 440 Hz stays within 1 dB of its level and the rest (all
+        // but the three tones) under -40 dB, from before the concealment
+        // to 120 ms after her audio is back; through a longer one it holds
+        // for 4 x B, fades, and comes back with nothing over -40 dB. The
+        // level is taken over 10 ms, a tone with an envelope that changes
+        // in a straight line (over 5 ms the 660 Hz is too close to tell
+        // from it), and the rest over every 5 ms, with envelopes that may
+        // curve (for the codec's own changes of level from frame to frame).
+        const std::vector<double> hz = {440, 3520, 660};
+        const int B5 = 5 * static_cast<int>(ms);
+        const long d = (now_live.empty() ? 28 : std::atoi(late.c_str())) * ms;
+        auto level = [&](long f) {
+            double a[3], rest;
+            toneFit(x, f, 2 * B5, hz, o.rate, a, &rest, 1);
+            return a[0];
+        };
+        auto restOf = [&](long f) {
+            double a[3], rest;
+            toneFit(x, f, B5, hz, o.rate, a, &rest);
+            return rest;
+        };
+        std::vector<double> lv;
+        for (long f = live_at + 300 * ms; f + 2 * B5 <= live_at + 1300 * ms; f += B5) lv.push_back(level(f));
+        std::nth_element(lv.begin(), lv.begin() + static_cast<std::ptrdiff_t>(lv.size() / 2), lv.end());
+        const double a440 = lv[lv.size() / 2], rms440 = a440 / std::sqrt(2.0);
+        double floor_lo = 100, floor_hi = -100, floor_rest = -200;   // while nothing happens, for comparison
+        for (long f = live_at + 300 * ms; f + 2 * B5 <= live_at + 1300 * ms; f += B5) {
+            const double db = 20 * std::log10(level(f) / a440);
+            floor_lo = std::min(floor_lo, db), floor_hi = std::max(floor_hi, db);
+            floor_rest = std::max(floor_rest, 20 * std::log10(restOf(f) / rms440 + 1e-12));
+        }
+        std::printf("    alice's 440 Hz plays at %.1f dBFS live; while nothing happens, from %+.2f to %+.2f dB of that, "
+                    "and the rest at most %.1f dB against it\n",
+                    20 * std::log10(a440), floor_lo, floor_hi, floor_rest);
+        for (int k = 0; k < 5; ++k) {
+            const long c = concealedAt(k, d), back = c + gaps[k] * ms;
+            if (!r.calm(c - 200 * ms, back + 300 * ms)) {
+                std::printf("    the %d ms gap isn't checked: the machine had a hiccup\n", gaps[k]);
+                continue;
+            }
+            const bool short_gap = gaps[k] <= hold_ms;
+            const long held_to = short_gap ? back + 120 * ms : c + static_cast<long>(hold_ms) * ms - 15 * ms;
+            double lo = 100, hi = -100, worst = -200, worst_at = 0;
+            for (long f = c - 10 * ms; f + B5 <= back + 120 * ms; f += B5) {
+                if (f + 2 * B5 <= held_to) {
+                    const double db = 20 * std::log10(level(f) / a440 + 1e-12);
+                    lo = std::min(lo, db), hi = std::max(hi, db);
+                }
+                const double rdb = 20 * std::log10(restOf(f) / rms440 + 1e-12);
+                if (rdb > worst) worst = rdb, worst_at = r.ms(f - c);
+            }
+            std::printf("    the %3d ms gap: alice's 440 Hz from %+.2f to %+.2f dB of its level %s, the rest at most "
+                        "%.1f dB (%+.0f ms from the concealment)\n",
+                        gaps[k], lo, hi, short_gap ? "through it" : "while it holds", worst, worst_at);
+            CHECK(lo >= -1.0 && hi <= 1.0);
+            CHECK(worst <= -40.0);
+        }
+        // After a gap each player plays on the delay it had before it
+        // (16.6), so the two stay in time: each one's delay, from the phase
+        // of its tone over 800 ms before the gap and 800 ms from half a
+        // second after it, moves by at most 0.1 ms. (Within 1 ms is what
+        // matters, but the phase tells a delay only within the tone's
+        // period, 2.3 ms at 440 Hz: a block of 5 ms more or less reads as
+        // 0.45 ms. A delay that holds moves by none.)
+        const double sine[2] = {440, 660};
+        for (int k = 0; k < 5; ++k) {
+            const long g = gap_at[k], g1 = g + gaps[k] * ms;
+            double moved[2];
+            for (int p = 0; p < 2; ++p) {
+                const double before = sineDelay(x, g - 900 * ms, g - 100 * ms, sine[p], o.rate);
+                const double after = sineDelay(x, g1 + 500 * ms, g1 + 1300 * ms, sine[p], o.rate);
+                moved[p] = std::remainder(after - before, o.rate / sine[p]) * 1000.0 / o.rate;
+            }
+            std::printf("    the %3d ms gap: alice's delay moved by %+.3f ms, bob's by %+.3f ms\n", gaps[k], moved[0],
+                        moved[1]);
+            if (!r.calm(g - 1000 * ms, g1 + 1400 * ms)) {
+                std::printf("      (not checked: the machine had a hiccup)\n");
+                continue;
+            }
+            for (int p = 0; p < 2; ++p) CHECK(std::fabs(moved[p]) <= 0.1);
+        }
+        return;
+    }
 
     // Clicks: no 5 ms block may bend the sound more than 3 times as much as
     // its surroundings do (the median within 200 ms) and as the same drums
@@ -705,16 +840,13 @@ TEST(listening_file) {
     // the block, since the codecs spread an attack by a few ms (before it
     // too, as pre-echo), and a block where a hit starts is exempt: how a
     // codec renders an attack depends on how it falls on its frames.
-    const float* x = r[2].heard.get();
-    const long L = intervalLengthFor(o.bpm, o.bpi, o.rate), ms = o.rate / 1000;
     auto material = [&](long n) { return drums.mix(n); };
     const long d_live = bestLag(x, material, live_at + 300 * ms, live_at + 1300 * ms, 0, 100 * ms);
     const long d_int = bestLag(x, material, start + 100 * ms, live_at - 100 * ms, L - 50 * ms, L + 50 * ms);
     std::printf("    carl hears the players %.1f ms late live, %.1f ms through intervals\n", r.ms(d_live), r.ms(d_int));
-    // carl hears each player through a sink of its own, whose delay moves by
-    // a host block or so when the player's audio comes back after a gap and
-    // the buffer fills again. So each player's live delay is measured again
-    // for every 100 ms that plays live, within 10 ms of the first.
+    // carl hears each player through a sink of its own, so each player's
+    // live delay is measured again for every 100 ms that plays live, within
+    // 10 ms of the first.
     const long W = 100 * ms;
     const std::size_t windows = static_cast<std::size_t>((end - start) / W + 1);
     std::vector<long> live_lag[2] = {std::vector<long>(windows, d_live), std::vector<long>(windows, d_live)};
@@ -736,6 +868,26 @@ TEST(listening_file) {
     auto liveLag = [&](int p, long f) {
         return live_lag[p][std::min(static_cast<std::size_t>((f - start) / W), windows - 1)];
     };
+
+    // After a gap each player plays on the delay it had before it (16.6),
+    // so alice's kick and snare stay in time with bob's hats: measured over
+    // 800 ms before each gap and 800 ms from half a second after it.
+    for (int k = 0; k < 5; ++k) {
+        const long g = gap_at[k], g1 = g + gaps[k] * ms;
+        long before[2], after[2];
+        for (int p = 0; p < 2; ++p) {
+            auto played = [&drums, p](long n) { return drums.player(p, n); };
+            before[p] = bestLag(x, played, g - 900 * ms, g - 100 * ms, d_live - 10 * ms, d_live + 10 * ms);
+            after[p] = bestLag(x, played, g1 + 500 * ms, g1 + 1300 * ms, d_live - 10 * ms, d_live + 10 * ms);
+        }
+        std::printf("    the %3d ms gap: alice %.1f ms late before it, %.1f after; bob %.1f and %.1f\n", gaps[k],
+                    r.ms(before[0]), r.ms(after[0]), r.ms(before[1]), r.ms(after[1]));
+        const bool calm = r.calm(g - 1000 * ms, g1 + 1400 * ms);
+        for (int p = 0; p < 2; ++p)
+            if (calm) CHECK(std::labs(after[p] - before[p]) <= ms);
+        if (!calm) std::printf("      (not checked: the machine had a hiccup)\n");
+    }
+
     const long B = o.rate / 200;
     auto own = [&](long f, long da, long db) {   // the drums played straight, within 5 ms of the block
         double v = 0, x1 = 0, x2 = 0;

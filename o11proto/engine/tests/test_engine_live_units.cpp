@@ -312,6 +312,58 @@ TEST(sink_underrun_and_buffer_figure) {         // 5.9, 6.10 (test 43's bound at
     CHECK(p.sink.heldBlocks() <= p.sink.sizes().latency_blocks);
 }
 
+TEST(sink_keeps_its_delay_after_a_gap) {        // 16.6: back in time with the other players
+    // A sender in real time, 256-frame host blocks against 240-frame
+    // blocks, and a gap in its packets: lost (the sink hears nothing more
+    // until they go on), or held back (they all come at its end). The
+    // blocks held, over whole cycles of the two block sizes (15 host
+    // blocks), are the delay; it is the same after the gap as before it,
+    // wherever in the cycle the gap begins.
+    int worst = 0;
+    for (int held_back = 0; held_back < 2; ++held_back) {
+        for (int gap_ms : {20, 50, 80, 120, 250}) {
+            for (int phase = 0; phase < 15; ++phase) {
+                LiveSink k;
+                k.configure(20, 256, 48000);
+                k.apply(item(SinkItem::Start, 0), 1);
+                std::vector<float> out(2 * 256);
+                const long g0 = 48000 * 3 / 2 + phase * 256 + 37, g1 = g0 + gap_ms * 48;
+                std::int32_t sent = 0, given = 0;
+                long before = 0, after = 0;
+                const int cycles = 6 * 15;       // 480 ms
+                const int b_before = 48000 * 3 / 2 / 256 - cycles, b_after = static_cast<int>(g1 / 256) + 100;
+                for (int b = 0; b < b_after + cycles; ++b) {
+                    const long t = (b + 1) * 256L;
+                    while ((sent + 1) * 240L <= t) {
+                        const long at = sent * 240L;
+                        if (at >= g0 && at < g1 && !held_back) given = ++sent;   // lost
+                        else if (at >= g0 && at < g1) ++sent;                    // waits for the gap's end
+                        else {
+                            for (; given <= sent; ++given) k.apply(item(SinkItem::Xrun, given), 1);
+                            ++sent;
+                        }
+                    }
+                    k.render(out.data(), 256, 48000, 1);
+                    if (b >= b_before && b < b_before + cycles) before += k.heldBlocks();
+                    if (b >= b_after) after += k.heldBlocks();
+                }
+                const int moved = static_cast<int>(after - before);   // in 1/90 blocks
+                worst = std::max(worst, std::abs(moved));
+                if (moved != 0)
+                    std::printf("    %s gap of %d ms at phase %d: the delay moved %+.2f ms\n", held_back ? "held-back" : "lost",
+                                gap_ms, phase, moved * 5.0 / cycles);
+                CHECK(k.playing());
+                CHECK_EQ(moved, 0);
+                CHECK(k.stats.underruns.load() <= 1u);
+                CHECK_EQ(k.stats.overruns.load(), 0u);
+                if (gap_ms >= 50) CHECK_EQ(k.stats.underruns.load(), 1u);   // one dropout, not lost blocks
+                if (gap_ms >= 50 && !held_back) CHECK_EQ(k.stats.lost.load(), 0u);
+            }
+        }
+    }
+    std::printf("    after gaps of 20 to 250 ms, lost or held back: the delay moved at most %.2f ms\n", worst * 5.0 / 90);
+}
+
 TEST(sink_stop_and_reset) {
     Playing p(10);
     p.sink.apply(item(SinkItem::Stop, 0), p.now);

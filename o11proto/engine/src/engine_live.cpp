@@ -746,8 +746,11 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                 }
             }
             m.w = (m.w + n) & R;
-            if (m.pos[0] <= 0) m.delay[0] = 0;   // silent paths can move without a sound
-            if (m.pos[1] <= 0) m.delay[1] = 0;
+            // Silent paths can move without a sound, but not the live one
+            // while the room is Live: a slot that fades out in a gap comes
+            // back on the delay it had (16.6), lined up as it was.
+            if (m.pos[0] <= 0) m.delay[0] = 0;
+            if (m.pos[1] <= 0 && !m.path_live) m.delay[1] = 0;
             if (m.pos[0] <= 0 || m.pos[1] <= 0) m.rho = 0;
             done += n;
         }
