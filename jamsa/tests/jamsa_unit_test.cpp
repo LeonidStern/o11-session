@@ -935,7 +935,10 @@ struct FakeWhatsMyIp
   int port = 0;
   std::thread thread;
 
-  FakeWhatsMyIp(const std::string &reply, int answers)
+  // listening=false holds the port without listening: a connection to it is refused at once,
+  // and nothing else can take the port meanwhile (Windows hands out ports in order, so a
+  // "port + 1" guess could be the very socket that connects to it)
+  FakeWhatsMyIp(const std::string &reply, int answers, bool listening = true)
   {
 #ifdef _WIN32
     WSADATA wsa;
@@ -948,7 +951,7 @@ struct FakeWhatsMyIp
     a.sin_addr.s_addr = htonl(0x7f000001u);
     a.sin_port = 0;
     socklen_t len = sizeof(a);
-    if (bind(listener, (sockaddr *)&a, sizeof(a)) == 0 && listen(listener, 4) == 0 && getsockname(listener, (sockaddr *)&a, &len) == 0)
+    if (bind(listener, (sockaddr *)&a, sizeof(a)) == 0 && (!listening || listen(listener, 4) == 0) && getsockname(listener, (sockaddr *)&a, &len) == 0)
       port = ntohs(a.sin_port);
     thread = std::thread([this, reply, answers]() {
       for (int i = 0; i < answers; i ++)
@@ -998,10 +1001,10 @@ static void test_public_address_lookup()
   // "off" asks nobody, and a service nothing listens on gives nothing (at once: the connection is refused)
   CHECK_EQ(HostServer::whatsMyIp("off", &stop), "");
   {
-    FakeWhatsMyIp closed("", 0);
-    const int port = closed.port;
+    FakeWhatsMyIp closed("", 0, false);
+    CHECK(closed.port > 0);
     const auto t0 = std::chrono::steady_clock::now();
-    CHECK_EQ(HostServer::whatsMyIp("127.0.0.1:" + std::to_string(port + 1) + "/", &stop), "");
+    CHECK_EQ(HostServer::whatsMyIp(closed.spec(), &stop), "");
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(4));
   }
   // stopped before it starts
