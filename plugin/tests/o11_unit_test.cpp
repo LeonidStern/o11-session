@@ -1378,9 +1378,9 @@ static void test_calibrator()
   }
   CHECK_EQ(moved, 0);
   // never more than MAX_MS from the guess
-  Calibrator far;
-  calibrate(far, 1, [](double offset) { return 95.0 - offset; });
-  CHECK(far.offsetMs() <= Calibrator::MAX_MS);
+  Calibrator distant;
+  calibrate(distant, 1, [](double offset) { return 95.0 - offset; });
+  CHECK(distant.offsetMs() <= Calibrator::MAX_MS);
 }
 
 static void test_tempo_keeper()
