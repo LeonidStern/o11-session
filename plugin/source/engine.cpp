@@ -38,6 +38,9 @@ static const char *LOCAL_CHANNEL_NAME = "main";
 static const double LICENSE_WAIT_SECONDS = 60.0;
 static const double PUBLISH_INTERVAL = 0.03;
 static const double SYNC_NOTE_DELAY = 3.0; // the host's tempo differs this long before the note shows
+static const double LINK_POLL = 0.05;
+static const double LINK_DISCOVERY = 2.0;  // Link finds the other apps on the network within this, once on
+static const double LINK_HINT_DELAY = 3.0; // in a room, with no other Link app for this long: "Turn on Link in Live"
 static const int MIX_OUTS = 2 + 2 * Engine::NUM_PLAYER_OUTS;
 
 static double now_seconds()
@@ -295,6 +298,7 @@ std::string Engine::remoteKey(const std::string &user, int channel)
 Engine::Engine()
 {
   m_settings.userName = defaultUserName();
+  m_link.reset(new LinkSync);
   m_client.reset(new o11proto::engine::Engine);
   m_client->onLicence = [this](const std::string &text) {
     // from run() on the network thread: the UI answers (answerLicense), or the wait runs out
@@ -354,6 +358,8 @@ void Engine::stop()
   m_running = false;
 
   // what the network thread would have done on its way out
+  m_link->release();
+  m_link->use(false);
   m_client->disconnect();
   m_licenseWaiting = false;
   if (m_hosting) HostServer::instance().stop(this);
@@ -376,6 +382,8 @@ void Engine::setupProcessing(double sampleRate, int maxBlockSize)
   m_mix.assign((size_t)MIX_OUTS, std::vector<float>((size_t)m_maxBlock, 0.0f));
   m_barSync.reset();
   m_click.setSampleRate(m_sampleRate);
+  m_sampleTime = 0;
+  m_link->resetTiming();
 }
 
 void Engine::process(float **in, int numIn, float **out, int numOut, int frames, const HostTiming *timing,
@@ -388,6 +396,34 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
   float *inL = numIn > 0 && in ? in[0] : nullptr;
   float *inR = numIn > 1 && in ? in[1] : inL;
   m_hostTempo.store(timing && timing->position.tempo > 0 ? timing->position.tempo : 0.0, std::memory_order_relaxed);
+  const int64_t sampleTime = m_sampleTime;
+  m_sampleTime += frames;
+
+  // Ableton Link, in the instance that leads it: the room's tempo, and the intervals' beat
+  bool linkLeads = false;
+  if (!(timing && timing->offline))
+  {
+    LinkSync::Block block;
+    block.sampleTime = sampleTime;
+    block.frames = frames;
+    block.sampleRate = srate;
+    LinkSync::Interval iv;
+    int length = 0;
+    iv.running = m_client->isIntervalRunning();
+    m_client->position(&iv.pos, &length);
+    iv.len = m_client->usualIntervalLength();
+    iv.bpi = m_client->bpi();
+    iv.bpm = m_client->bpm();
+    LinkSync::Host host;
+    if (timing)
+    {
+      host.playing = timing->position.playing;
+      host.hasPosition = timing->position.hasPosition;
+      host.ppq = timing->position.ppq;
+      host.tempo = timing->position.tempo;
+    }
+    linkLeads = m_link->process(block, iv, host);
+  }
 
   // a stopped host: we send silence (and the network thread stops sending at the next interval)
   const bool stopped = timing && timing->transport && !timing->offline && !timing->position.playing;
@@ -395,9 +431,9 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
   const bool monitor = m_monitor.load(std::memory_order_relaxed) && !m_client->anySolo();
 
   // the host's bars: the interval playing now may end a little early or late, so the next
-  // ones start on them
+  // ones start on them. Not while Link leads the host: its bars follow the intervals then.
   if (m_barReset.exchange(false, std::memory_order_acquire)) m_barSync.reset();
-  if (!m_follow.load(std::memory_order_relaxed) || !timing) m_barSync.reset();
+  if (!m_follow.load(std::memory_order_relaxed) || !timing || linkLeads) m_barSync.reset();
   else if (!timing->offline)
   {
     BarSync::Interval iv;
@@ -411,9 +447,12 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
     const int end = m_barSync.process(timing->position, frames, srate, iv);
     if (end > 0) m_client->setIntervalEnd(end);
   }
-  // where the next interval starts in the host, while they are (or get) in line
+  // where the next interval starts in the host, while they are (or get) in line: through BarSync,
+  // or through Link while the host plays at the room's tempo
   double nextPpq = -1;
-  if (timing && (m_barSync.state() == BarSync::Aligned || m_barSync.state() == BarSync::Lining) && srate > 0)
+  const bool linkInLine = linkLeads && timing && timing->position.playing && timing->position.hasPosition &&
+                          fabs(timing->position.tempo - m_client->bpm()) <= BarSync::SAME_TEMPO;
+  if (timing && (m_barSync.state() == BarSync::Aligned || m_barSync.state() == BarSync::Lining || linkInLine) && srate > 0)
   {
     const HostPosition &p = timing->position;
     int pos = 0, length = 0;
@@ -737,8 +776,10 @@ void Engine::setFollowHostTempo(bool on)
   m_follow = on;
   m_barReset = true;
   post([this, on]() {
-    // a vote for the host's tempo, if the room's differs
-    if (on) m_tempoFollower.arm();
+    // a vote for the host's tempo, if the room's differs, unless Live follows the room through Link
+    if (on) m_armPending = true;
+    m_lastLinkPoll = 0; // Link on or off now
+    updateLink();
   });
 }
 
@@ -818,6 +859,7 @@ void Engine::threadProc()
     updateConnection();
     applySendKbps(); // the room's bitrate may have changed
     applyBroadcast(); // the host may have started or stopped
+    updateLink();
     followHostTempo();
 
     const double t = now_seconds();
@@ -933,8 +975,8 @@ void Engine::updateConnection()
       m_connectedTime = now_seconds();
       m_statusText = "Connected to " + m_server + " as " + displayName(m_client->username());
       addChat(ChatLine::System, "", m_statusText);
-      // the room gets the host's tempo, if they differ
-      m_tempoFollower.arm();
+      // the room gets the host's tempo, if they differ, unless Live follows the room through Link
+      m_armPending = true;
     }
     return;
   }
@@ -979,9 +1021,11 @@ void Engine::followHostTempo()
   const double t = now_seconds();
   // the host's tempo, while it runs the audio
   const double tempo = t - m_lastAudio < 1.0 ? m_hostTempo.load(std::memory_order_relaxed) : 0.0;
-  const int room = m_state == ConnState::Connected ? m_client->serverBpm() : 0;
+  // no vote while it waits to see if Live follows the room through Link (updateLink)
+  const int room = m_state == ConnState::Connected && !m_armPending ? m_client->serverBpm() : 0;
   const int bpm = m_tempoFollower.update(t, tempo, room);
   if (bpm <= 0) return;
+  m_linkKeeper.voted(t, bpm);
   char buf[256];
   snprintf(buf, sizeof(buf), "!vote bpm %d", bpm);
   m_client->say(buf);
@@ -992,6 +1036,106 @@ void Engine::followHostTempo()
   }
   snprintf(buf, sizeof(buf), "%s is at %s BPM, so you vote the room to %d (!vote bpm %d).", host.c_str(), bpmText(tempo).c_str(), bpm, bpm);
   addChat(ChatLine::System, "", buf);
+}
+
+void Engine::releaseLink()
+{
+  if (m_link->driving()) m_link->release();
+}
+
+// Ableton Link: in it while Sync is on in a room, and leading it unless another instance in this
+// program does. Not in Link out of a room: Live, turning its Link on, would take Link's tempo then.
+// process() does the tempo and the beat; this decides whether joining a room votes for the host's
+// tempo, and puts the room's tempo back on Link when it should (LinkTempoKeeper).
+void Engine::updateLink()
+{
+  const double t = now_seconds();
+  if (t - m_lastLinkPoll < LINK_POLL) return;
+  m_lastLinkPoll = t;
+
+  const bool sync = getSettings().followHostTempo;
+  const bool inRoom = m_state == ConnState::Connected;
+  if (!sync || !inRoom) releaseLink();
+  m_link->use(sync && inRoom);
+  if (!sync || !inRoom)
+  {
+    m_linkState = sync ? LinkState::Waiting : LinkState::Off;
+    m_linkPeers = 0;
+    m_linkTempo = 0;
+    return;
+  }
+  if (!m_link->driving() && m_link->drive())
+  {
+    m_linkKeeper.reset();
+    m_toldContested = m_toldLinkLeads = false;
+  }
+  const bool driving = m_link->driving();
+  m_linkPeers = m_link->numPeers();
+  m_linkTempo = m_link->sessionTempo();
+  if (!LinkSync::enabledInProgram()) m_linkState = LinkSync::unavailable() ? LinkState::Unavailable : LinkState::Off;
+  else if (driving) m_linkState = m_link->contested() ? LinkState::Contested : LinkState::Leading;
+  else m_linkState = LinkState::OtherInstance;
+  const bool leads = driving && m_linkPeers > 0 && !m_link->contested();
+
+  std::string host;
+  {
+    std::lock_guard<std::mutex> lock(m_settingsMutex);
+    host = m_hostName;
+  }
+  const std::string live = shortHostName(host);
+
+  // Joined a room, or Sync went on: today's vote for the host's tempo, unless Live takes the room's
+  // through Link. Link finds the other apps soon after it goes on, so it waits for that.
+  if (m_armPending && (!driving || m_linkPeers > 0 || LinkSync::enabledFor() >= LINK_DISCOVERY))
+  {
+    m_armPending = false;
+    if (leads) m_tempoFollower.disarm();
+    else m_tempoFollower.arm();
+  }
+
+  // the room's tempo back on Link, when the room didn't take Live's or another app set its own
+  if (leads && t - m_lastAudio < 1.0 && m_client->isIntervalRunning() && !m_link->restorePending())
+  {
+    const double hostTempo = m_hostTempo.load(std::memory_order_relaxed);
+    const int room = m_client->serverBpm();
+    const LinkTempoKeeper::Action a = m_linkKeeper.update(t, m_linkTempo, m_client->bpm(), room, hostTempo,
+                                                          m_tempoFollower.changedAt(), m_linkPeers);
+    if (a.kind == LinkTempoKeeper::Action::Restore)
+    {
+      m_link->restoreTempo();
+      char buf[512];
+      buf[0] = 0;
+      if (a.why == LinkTempoKeeper::Action::NotTaken)
+        snprintf(buf, sizeof(buf), "The room stays at %d BPM, so %s goes back to it.", room, live.c_str());
+      else if (a.why == LinkTempoKeeper::Action::OutOfRange)
+        snprintf(buf, sizeof(buf), "A NINJAM room can't have %s BPM (only %d to %d), so %s goes back to the room's %d.",
+                 bpmText(m_linkTempo).c_str(), TempoFollower::MIN_BPM, TempoFollower::MAX_BPM, live.c_str(), room);
+      if (buf[0]) addChat(ChatLine::System, "", buf);
+    }
+    if (m_linkKeeper.contested()) m_link->setContested();
+  }
+  if (leads && !m_toldLinkLeads && m_client->isIntervalRunning())
+  {
+    m_toldLinkLeads = true;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "Link: %s takes the room's tempo (%d BPM), and its bars start with the intervals.", live.c_str(),
+             m_client->serverBpm());
+    addChat(ChatLine::System, "", buf);
+  }
+  if (driving && m_link->contested() && !m_toldContested)
+  {
+    m_toldContested = true;
+    addChat(ChatLine::Error, "", "Another app on the network keeps changing Link's tempo or beat (another O11 Session?), so this "
+                                 "one stopped leading Link. Turn Sync off and on to lead it again.");
+  }
+
+  // no other Link app: Live's Link is off
+  if (driving && m_linkPeers == 0 && !m_toldLinkHint && LinkSync::enabledFor() >= LINK_HINT_DELAY &&
+      t - m_connectedTime >= LINK_HINT_DELAY)
+  {
+    m_toldLinkHint = true;
+    addChat(ChatLine::System, "", linkHint(host));
+  }
 }
 
 void Engine::doSetHosting(bool on)
@@ -1204,14 +1348,31 @@ void Engine::publish()
   snap.barFixes = m_barFixes.load(std::memory_order_relaxed);
   snap.tempoVotes = m_tempoFollower.votes();
 
+  // Link
+  snap.linkState = m_linkState;
+  snap.linkPeers = (int)m_linkPeers;
+  snap.linkTempo = m_linkTempo;
+  const bool leading = m_linkState == LinkState::Leading;
+  snap.linkLeads = leading && m_linkPeers > 0;
+  snap.linkAligned = leading && m_link->aligned();
+  snap.linkErrorMs = leading ? m_link->lastErrorMs() : 0.0;
+  snap.linkLatencyMs = m_link->latencyMs();
+  snap.linkJumps = m_link->jumps();
+  snap.linkSteps = m_link->steps();
+  snap.linkRestores = m_linkKeeper.restores();
+
   const int roomBpm = m_state == ConnState::Connected ? m_client->serverBpm() : 0;
-  // not while the room's tempo changes to the host's (at the next interval)
+  // not while the room's tempo changes to the host's (at the next interval), nor while Link's
+  // tempo isn't the room's yet (the room votes on it, or Link gets the room's back)
+  const bool linkSettles = snap.linkLeads && fabs(m_linkTempo - m_client->bpm()) > LinkTempoKeeper::SAME;
   const bool differs = snap.hostTempo > 0 && roomBpm > 0 && fabs(snap.hostTempo - roomBpm) > BarSync::SAME_TEMPO &&
-                       fabs(snap.hostTempo - m_client->bpm()) > BarSync::SAME_TEMPO;
+                       fabs(snap.hostTempo - m_client->bpm()) > BarSync::SAME_TEMPO && !linkSettles;
   if (!differs) m_noteSince = -1;
   else if (m_noteSince < 0) m_noteSince = t;
+  // where Link would lead the host, the note says to turn it on there
+  const bool suggestLink = m_linkState == LinkState::Leading;
   if (differs && t - m_noteSince >= SYNC_NOTE_DELAY)
-    snap.syncNote = hostTempoNote(hostName, snap.hostTempo, roomBpm, snap.followTempo);
+    snap.syncNote = hostTempoNote(hostName, snap.hostTempo, roomBpm, snap.followTempo, suggestLink);
 
   pollHosting(snap);
 
@@ -1271,6 +1432,19 @@ static const char *state_name(ConnState s)
     case ConnState::Connected: return "connected";
     case ConnState::Failed: return "failed";
     default: return "disconnected";
+  }
+}
+
+static const char *link_state_name(LinkState s)
+{
+  switch (s)
+  {
+    case LinkState::Waiting: return "waiting";
+    case LinkState::Leading: return "leading";
+    case LinkState::OtherInstance: return "other";
+    case LinkState::Contested: return "contested";
+    case LinkState::Unavailable: return "unavailable";
+    default: return "off";
   }
 }
 
@@ -1348,7 +1522,7 @@ std::string Engine::command(const std::string &lineIn)
   {
     Snapshot s;
     getSnapshot(s);
-    return syncTooltip(s.hostLabel);
+    return syncTooltip(s.hostLabel, s.linkState, s.linkPeers);
   }
   if (verb == "metronome")
   {
@@ -1368,9 +1542,14 @@ std::string Engine::command(const std::string &lineIn)
                      s.hostPublicAddress.empty() ? (s.hostPortmapPending ? "?" : "-") : s.hostPublicAddress.c_str(),
                      s.hostLocalAddress.empty() ? "-" : s.hostLocalAddress.c_str(), s.licensePending ? 1 : 0, s.audioRunning ? 1 : 0);
     if (n > 0 && n < (int)sizeof(buf))
-      snprintf(buf + n, sizeof(buf) - (size_t)n, " follow=%d hosttempo=%.3f bars=%s barerr=%.3f barfixes=%d tempovotes=%d ownkbps=%d roomkbps=%d",
-               s.followTempo ? 1 : 0, s.hostTempo, bar_state_name(s.barState), s.barErrorMs, s.barFixes, s.tempoVotes,
-               s.opusKbps, s.roomOpusKbps);
+      n += snprintf(buf + n, sizeof(buf) - (size_t)n, " follow=%d hosttempo=%.3f bars=%s barerr=%.3f barfixes=%d tempovotes=%d ownkbps=%d roomkbps=%d",
+                    s.followTempo ? 1 : 0, s.hostTempo, bar_state_name(s.barState), s.barErrorMs, s.barFixes, s.tempoVotes,
+                    s.opusKbps, s.roomOpusKbps);
+    if (n > 0 && n < (int)sizeof(buf))
+      snprintf(buf + n, sizeof(buf) - (size_t)n, " link=%s peers=%d linktempo=%.3f leads=%d linkaligned=%d linkerr=%.3f latency=%.3f "
+               "jumps=%d steps=%d restores=%d",
+               link_state_name(s.linkState), s.linkPeers, s.linkTempo, s.linkLeads ? 1 : 0, s.linkAligned ? 1 : 0, s.linkErrorMs,
+               s.linkLatencyMs, s.linkJumps, s.linkSteps, s.linkRestores);
     // the public address from the "what's my IP" service ("?" while it is asked), and whether a
     // player joined from the internet (so the port is open, whatever the router said)
     std::string out = buf;

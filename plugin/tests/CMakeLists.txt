@@ -5,20 +5,24 @@
 #                    its bars, voting for its tempo, the editor's notes), the metronome's click,
 #                    the editor's texts and BPM dragging, the text commands, the built-in
 #                    server's addresses (the port mapper's lines, the public address lookup
-#                    against a server on localhost, the host bar)
+#                    against a server on localhost, the host bar); Ableton Link: the beat,
+#                    phase and tempo logic, one instance leading Link in real time
 #   o11_e2e_test   two engine wrappers in one process: one hosts a room, the other joins,
 #                    a 997 Hz tone goes through process() with a simulated clock, in Opus and
-#                    then in FLAC
+#                    then in FLAC; one of them leads Link, and a Link peer (as Live with its
+#                    Link on) takes the room's tempo
 
 add_executable(o11_unit_test o11_unit_test.cpp)
 target_link_libraries(o11_unit_test PRIVATE o11_core)
 o11_warnings(o11_unit_test)
 add_test(NAME o11_unit_test COMMAND o11_unit_test)
+# Link apps on one machine see each other: the tests that use Link run one at a time
+set_tests_properties(o11_unit_test PROPERTIES RESOURCE_LOCK ableton_link)
 
 add_executable(o11_e2e_test o11_e2e_test.cpp)
-target_link_libraries(o11_e2e_test PRIVATE o11_core)
+target_link_libraries(o11_e2e_test PRIVATE o11_core Ableton::Link) # a Link peer, as Live with its Link on
 o11_warnings(o11_e2e_test)
 add_test(NAME o11_e2e_test COMMAND o11_e2e_test)
 # The room is on this computer, on any free port (another test or program may hold 2049): the
 # router isn't asked to forward it, nor a service on the internet for the public address.
-set_tests_properties(o11_e2e_test PROPERTIES TIMEOUT 300 ENVIRONMENT "O11_HOST_PORT=0;O11_PORTMAP=off;O11_WHATSMYIP=off")
+set_tests_properties(o11_e2e_test PROPERTIES TIMEOUT 300 RESOURCE_LOCK ableton_link ENVIRONMENT "O11_HOST_PORT=0;O11_PORTMAP=off;O11_WHATSMYIP=off")

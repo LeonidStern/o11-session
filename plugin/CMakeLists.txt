@@ -7,13 +7,15 @@
 #
 # Everything it needs is downloaded at configure time and linked statically: JUCE 8.0.9
 # (AGPLv3 or commercial: see README.md), Opus and FLAC (BSD), miniupnpc and libnatpmp (BSD,
-# for the built-in server's port mapping). To use local copies pass
-# -DFETCHCONTENT_SOURCE_DIR_<NAME>=/path for JUCE, OPUS, FLAC, MINIUPNP or LIBNATPMP.
+# for the built-in server's port mapping) and Ableton Link (GPL v2 or later, header-only, with
+# its asio-standalone; so the plug-in built with it is GPL). To use local copies pass
+# -DFETCHCONTENT_SOURCE_DIR_<NAME>=/path for JUCE, OPUS, FLAC, MINIUPNP, LIBNATPMP or LINK
+# (with its modules/asio-standalone).
 #
 # On Windows build with the static runtime (-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
 # -DCMAKE_POLICY_DEFAULT_CMP0091=NEW) so O11Session.vst3 needs no Visual C++ runtime.
 #
-# Targets: o11_core (the engine wrapper, the built-in server, host sync, click and the editor's texts: a static
+# Targets: o11_core (the engine wrapper, the built-in server, host sync and Link, click and the editor's texts: a static
 # library on juce_core and juce_audio_basics only, which the tests link without a host),
 # O11 Session (the plug-in: processor and editor) and the tests under tests/ (O11_TESTS=ON).
 
@@ -158,6 +160,29 @@ FetchContent_Declare(juce
 FetchContent_MakeAvailable(juce)
 
 # ---------------------------------------------------------------------------
+# Ableton Link (header-only): while Sync is on, Ableton Live (with its Link on) follows the
+# room's tempo, and its bars start with the intervals (source/linksync.cpp)
+# ---------------------------------------------------------------------------
+FetchContent_Declare(link
+    GIT_REPOSITORY https://github.com/Ableton/link.git
+    GIT_TAG Link-4.1
+    GIT_SHALLOW TRUE
+    GIT_SUBMODULES modules/asio-standalone
+    SOURCE_SUBDIR include # only lists Link's headers: without Link's examples and tests
+)
+FetchContent_MakeAvailable(link)
+# AbletonLinkConfig.cmake defines the Ableton::Link target (include paths, platform and asio
+# definitions). It also sets CMAKE_CXX_STANDARD, which a function keeps to itself.
+function(o11_link_target)
+    include(${link_SOURCE_DIR}/AbletonLinkConfig.cmake)
+endfunction()
+o11_link_target()
+if(WIN32)
+    # Link's network code (its #pragma comment(lib) covers MSVC only)
+    set_property(TARGET Ableton::Link APPEND PROPERTY INTERFACE_LINK_LIBRARIES ws2_32 iphlpapi)
+endif()
+
+# ---------------------------------------------------------------------------
 # The o11proto protocol library, client engine and port mapper, with the libraries above
 # ---------------------------------------------------------------------------
 set(O11PROTO_BUILD_ENGINE ON CACHE BOOL "" FORCE)
@@ -189,6 +214,8 @@ add_library(o11_core STATIC
     source/hostserver.h
     source/hostsync.cpp
     source/hostsync.h
+    source/linksync.cpp
+    source/linksync.h
     source/click.cpp
     source/click.h
     source/uitext.cpp
@@ -207,10 +234,15 @@ target_compile_definitions(o11_core
 # shared code; a static library's copy is only used where the plug-in's isn't, so the two
 # don't clash. The headers and definitions are passed on for the tests.
 target_link_libraries(o11_core
-    PRIVATE juce::juce_audio_basics juce::juce_core
+    PRIVATE juce::juce_audio_basics juce::juce_core Ableton::Link
     PUBLIC o11proto_engine o11proto o11proto_portmap juce::juce_recommended_config_flags
 )
 o11_warnings(o11_core)
+# asio makes some of its symbols visible to other modules unless told not to: this, and hidden
+# symbols for the library, keep Link's and asio's code inside the plug-in, apart from the host's
+# Link (Live's) and other plug-ins'
+target_compile_definitions(o11_core PRIVATE ASIO_DISABLE_VISIBILITY=1)
+set_target_properties(o11_core PROPERTIES CXX_VISIBILITY_PRESET hidden C_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN TRUE)
 target_include_directories(o11_core PUBLIC $<TARGET_PROPERTY:juce::juce_audio_basics,INTERFACE_INCLUDE_DIRECTORIES>)
 target_compile_definitions(o11_core PUBLIC $<TARGET_PROPERTY:juce::juce_audio_basics,INTERFACE_COMPILE_DEFINITIONS>)
 if(WIN32)

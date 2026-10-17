@@ -15,8 +15,10 @@ Nothing in here derives from the GPL code of NINJAM in that repository (`ninjam/
 ## Building
 
 Needs CMake 3.25 or later, Ninja (or another generator) and a C++17 compiler.
-JUCE, Opus, FLAC, miniupnpc and libnatpmp are fetched by CMake (all built in
-and linked statically, as in `ninjam/vst3`; there is no Ogg or Vorbis). On Linux
+JUCE, Opus, FLAC, miniupnpc, libnatpmp and Ableton Link (tag `Link-4.1`,
+header-only, with its `modules/asio-standalone`) are fetched by CMake (all
+built in and linked statically, as in `ninjam/vst3`; there is no Ogg or
+Vorbis). On Windows Link needs `ws2_32` and `iphlpapi`, which the build adds. On Linux
 the JUCE GUI needs the X11, freetype and fontconfig development packages
 (`libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev
 libfreetype-dev libfontconfig-dev`).
@@ -37,10 +39,12 @@ checks the plug-in with pluginval.
 
 - `o11_core`: a static library with the engine wrapper (`engine.cpp`), the
   built-in server (`hostserver.cpp`), following the host (`hostsync.cpp`),
-  the metronome's click (`click.cpp`) and the texts of the controls
-  (`uitext.cpp`). It needs only `juce_core`, `juce_audio_basics` and o11proto
-  (the engine and the port mapper), so the tests link it without a plug-in
-  host.
+  Ableton Link (`linksync.cpp`), the metronome's click (`click.cpp`) and the
+  texts of the controls (`uitext.cpp`). It needs only `juce_core`,
+  `juce_audio_basics`, Link and o11proto (the engine and the port mapper), so
+  the tests link it without a plug-in host. It is built with hidden symbols
+  and `ASIO_DISABLE_VISIBILITY`, so Link's and asio's code stays inside the
+  plug-in, apart from the host's own Link.
 - `O11 Session`: the VST3, from `o11_core` plus `processor.cpp` (the
   `juce::AudioProcessor`), `editor.cpp` and `views.cpp` (the editor).
 - `o11_unit_test` and `o11_e2e_test` (see Tests). o11proto's own tests are
@@ -80,6 +84,29 @@ Everything the old plug-in did on its own, in the same way:
   shortened or lengthened once, and the room is voted to the host's tempo when
   that changes. The host's position comes from
   `juce::AudioPlayHead::PositionInfo`.
+- Ableton Link, while Sync is on in a room (`linksync.cpp`): the room leads
+  Live through Link. One instance in the program leads Link (the first in a
+  room with Sync on; another takes over when it leaves); the others leave it
+  alone. The leader puts the room's tempo on Link when the intervals change
+  to it, and the intervals' beat (Link's quantum is BPI), moving Link's
+  timeline at once when it starts, when the BPM or BPI changes or the
+  timeline jumped, and by steps of at most 2 ms as the audio clock drifts.
+  While Link has peers, the intervals aren't moved to the host's bars
+  (BarSync), so the two don't chase each other. A block is taken to be heard
+  one block after `process()` is called (by the earliest calls of the last
+  two seconds), plus what the calibration measures from the host's beat while
+  it plays at the room's tempo. A tempo change in Live still votes the room;
+  the room's tempo goes back on Link when the room doesn't take the vote, or
+  another app set its own (the tempo keeper), and an app that keeps moving
+  Link's beat or tempo makes the plug-in stop leading (contested) until Sync
+  goes off and on. Out of a room, or with Sync off, the plug-in isn't in
+  Link. The chat says when Live follows the room, and once that Link sees no
+  other app ("Turn on Link in Live ..."); the Sync chip shows "Link", and the
+  Sync button's tooltip, the footer and the tempo note say what Link does.
+  `status` reports `link`, `peers`, `linktempo`, `leads`, `linkaligned`,
+  `linkerr`, `latency`, `jumps`, `steps` and `restores`, as before. The
+  host's position for it comes from `juce::AudioPlayHead::PositionInfo`
+  (playing, ppq and tempo) instead of VST3's `ProcessContext`.
 - The state: the same text format (`O11-SESSION-STATE 1`), so a state saved
   by the old plug-in loads here.
 - The editor, in JUCE: the same 720 x 330 layout, resizable with the same
@@ -97,9 +124,13 @@ Everything the old plug-in did on its own, in the same way:
 
 - A player's channel you hear for the first time starts at 0 dB, as in the old
   plug-in (o11proto's engine starts them at -12 dB on its own).
-- `status` no longer reports the Link fields (`link*`); see below. The port
-  mapping and lookup fields (`public`, `lookedup`, `joinedfrominternet`) are
-  there.
+- `status` has the port mapping and lookup fields (`public`, `lookedup`,
+  `joinedfrominternet`) besides the Link fields.
+- Link: the old plug-in held off `process()` with its audio mutex to stop
+  leading Link; this engine has no such mutex, so `LinkSync::release()` waits
+  for a `process()` running at that moment to return (a flag each side sets,
+  sequentially consistent) and the audio thread still takes no lock. The
+  texts that named the old plug-in ("Another Jamsa ...") name O11 Session.
 - The host bar has one address box (the old plug-in showed the WAN address
   only): it shows the LAN address until a public address is known, and
   switches to WAN then. The plug-in joins its own room at `127.0.0.1`, not
@@ -123,21 +154,29 @@ Everything the old plug-in did on its own, in the same way:
   address lookup against a "what's my IP" service on localhost, and what the
   host bar shows for each case (the router's address, a private one, pending,
   the lookup's result, nothing). The port mapper itself is tested in o11proto,
-  against a fake router.
+  against a fake router. And Ableton Link, as in the old plug-in: the beat and
+  phase math (with ten minutes of a drifting audio clock), when blocks start
+  on Link's clock, the calibration, the tempo keeper, the texts about Link,
+  and one instance leading Link in real time while another can't.
+  The tests that use Link run one at a time (`RESOURCE_LOCK ableton_link`):
+  Link apps on one machine see each other.
 - `o11_e2e_test`: two engine wrappers in one process, one hosting a room
   (on a free port, without the router or the lookup), the other connecting to
   it; a 997 Hz tone through `process()` with a
   simulated clock, checked for an SNR of at least 35 dB on Opus and 60 dB
   after `codec flac`; the bitrate command reaching the room, transmit off
-  giving silence, disconnecting and closing the room.
+  giving silence, disconnecting and closing the room. With Sync on in both,
+  the host leads Link and the guest doesn't; a Link peer in the process (as
+  Live with its Link on) takes the room's 120 BPM, and 100 after a vote; with
+  Sync off in the host, the guest leads Link. The peer's part is skipped when
+  Link doesn't see it (no multicast). The old plug-in's Python end-to-end
+  checks of a host that follows Link (the measured latency, the restores, the
+  hint once its Link is off) are not ported; the unit tests cover that logic.
 
 ## Deferred
 
 Not in this version; `ninjam/vst3` has them on its own stack:
 
-- Ableton Link (leading or following Link from the room's tempo and beats).
-  The `follow` setting and the bar sync with the host are here; Link needs
-  the Link SDK and the calibration of when the blocks are heard.
 - Live mode and CLAP.
 
 ## Licence
@@ -146,5 +185,8 @@ The plug-in's own sources (`plugin/`) are by the O11 Session contributors. JUCE 
 available under the AGPLv3 or a commercial licence from JUCE; the plug-in is
 built without `JUCE_DISPLAY_SPLASH_SCREEN=0`, as the free licence requires.
 Opus, FLAC, miniupnpc and libnatpmp are BSD licensed; o11proto is this
-repository's. Under which
-licence O11 Session itself is released is decided at release, by Leo.
+repository's. Ableton Link is under the GPL, version 2 or later, and is in
+every build, so the plug-in as built is GPL (with JUCE under its AGPLv3, the
+combination is under the GPLv3 and AGPLv3 terms) unless Link and JUCE are
+licensed commercially. Under which licence the plug-in's own sources are
+released is decided at release, by Leo.

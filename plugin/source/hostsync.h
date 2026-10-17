@@ -37,7 +37,10 @@
   BarSync runs on the audio thread (no locks, no allocations), the
   TempoFollower on the network thread.
 
-  Ableton Link (the room leading Live's tempo and bars) is not in this port yet.
+  With Ableton Link (linksync.h), the room leads the other way: Live, with
+  its Link on, takes the room's tempo, and its bars start with the
+  intervals, so BarSync leaves the intervals alone; a tempo change in Live
+  still votes the room (the TempoFollower).
 
 */
 
@@ -135,7 +138,7 @@ public:
   // not in a room. Returns the BPM to vote for (!vote bpm N), or 0.
   int update(double now, double hostTempo, int roomBpm);
   void arm(); // once more, when the host's tempo is known and still: on joining a room, on following again
-  void disarm(); // no vote for the tempo the host has now
+  void disarm(); // no vote for the tempo the host has now (Live takes the room's through Link)
   bool waiting() const { return m_armed; } // a vote may come when the host's tempo is still
   double changedAt() const { return m_since; } // when the host's tempo last changed (seconds)
   int votes() const { return m_votes; }
@@ -161,11 +164,23 @@ std::string shortHostName(const std::string &hostName);
 std::string hostChipName(const std::string &hostName);
 
 // The line the editor shows when the host's tempo isn't the room's, such as
-// "Live is at 120 BPM, the room at 95: set Live to 95", or "" when they agree.
-std::string hostTempoNote(const std::string &hostName, double hostTempo, int roomBpm, bool following);
+// "Live is at 120 BPM, the room at 95: set Live to 95", or "" when they agree. suggestLink:
+// Link would lead the host if it were on there ("turn on Link in Live, or set it to 95").
+std::string hostTempoNote(const std::string &hostName, double hostTempo, int roomBpm, bool following, bool suggestLink = false);
 
-// the Sync button's tooltip
-std::string syncTooltip(const std::string &hostName);
+// Ableton Link, while Sync is on (linksync.h). Off: Sync is off, so the plug-in isn't in Link.
+// Waiting: Sync is on, out of a room: in Link once in one. Leading: this instance leads Link.
+// OtherInstance: in a room, while another instance in this program leads Link. Contested:
+// another app on the network keeps leading Link, so this instance stopped. Unavailable: Link
+// couldn't start.
+enum class LinkState { Off, Waiting, Leading, OtherInstance, Contested, Unavailable };
+
+// "Turn on Link in Live: ...", when Link sees no other app (the chat says it once, the Sync
+// button's tooltip while it lasts)
+std::string linkHint(const std::string &hostName);
+
+// the Sync button's tooltip; peers: the other Link apps
+std::string syncTooltip(const std::string &hostName, LinkState link, int peers);
 
 // Where the next interval starts in the host, at quarter note ppq of a time signature num/den
 // (4/4 when not known): "Next interval at Live bar 9", or "... bar 9, beat 3" when it doesn't

@@ -25,6 +25,8 @@ silicon, signed and notarized on macOS):
   Opus intervals use a raw packet framing with no Ogg container.
 - Follow the DAW: the room's intervals start on the host's bars while it
   plays at the room's tempo, and a tempo change in the DAW becomes a vote.
+- Ableton Link: with Sync on in a room, Live (with its Link on) takes the
+  room's tempo and its bars start with the intervals.
 - Host a room from the plug-in: a built-in server on the first free port from
   2049, with the router asked to forward it (UPnP-IGD, then NAT-PMP), a
   public-address lookup for ports forwarded by hand, and the address to send
@@ -155,7 +157,6 @@ The repository's history is the history of these folders in
 
 ## Roadmap
 
-- Ableton Link in the plug-in.
 - Live mode: a low-latency path for players close to each other.
 - CLAP, and a signed Windows build.
 - The O11 Session box: a two-input networked audio interface on this stack.
@@ -163,4 +164,6 @@ The repository's history is the history of these folders in
 ## Licence
 
 To be decided by Leonid Stern. JUCE is used under its licence terms (AGPLv3
-or commercial); Opus, FLAC, miniupnpc and libnatpmp are BSD licensed.
+or commercial); Opus, FLAC, miniupnpc and libnatpmp are BSD licensed. The
+plug-in includes Ableton Link, which is GPLv2 or later, so builds of the
+plug-in are GPL.

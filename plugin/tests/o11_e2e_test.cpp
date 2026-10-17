@@ -15,7 +15,24 @@
   switched to FLAC with "codec flac". Modelled on o11proto's
   engine/tests/test_engine_e2e.cpp, through the plug-in's own text commands.
 
+  Ableton Link, with Sync on in both (as by default): one instance in a
+  process leads Link, the first in a room; when it turns Sync off, the other
+  leads it. A Link peer in this process (as Live with its Link on) takes the
+  room's tempo from the plug-in, also after a vote changes it. The peer's part
+  is skipped when Link doesn't see it (no multicast here).
+
 */
+
+// Link's asio includes the Windows headers: first, and for Windows 7 and later
+#if defined(_WIN32)
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+#include <ableton/Link.hpp>
 
 #include <math.h>
 #include <stdio.h>
@@ -214,6 +231,62 @@ int main()
   // the room's bitrate, changed by the guest, reaches the host
   CHECK(room.guest.command("bitrate 128") == "ok");
   CHECK(room.waitFor(room.host, "roomkbps", "128", 10));
+
+  // Link: the host, first in the room, leads it; the guest, in the same process, can't
+  const bool haveLink = field(room.host.command("status"), "link") != "unavailable";
+  if (!haveLink) printf("  Link couldn't start here: its checks are skipped\n");
+  else
+  {
+    CHECK(room.waitFor(room.host, "link", "leading", 5));
+    CHECK(room.waitFor(room.guest, "link", "other", 5));
+    CHECK(room.host.command("synctip").find("Turn on Link in your DAW if it has Link: ") == 0); // no other Link app yet
+    CHECK(room.guest.command("synctip").find(". Another O11 Session in this set leads Link") != std::string::npos);
+
+    // a Link peer at its own tempo, as Live with its Link on: it gets the room's
+    ableton::Link peer(133.0);
+    peer.enable(true);
+    bool seen = false;
+    for (int i = 0; i < 30 && !seen; i ++)
+    {
+      room.advance(0.2);
+      seen = peer.numPeers() > 0 && field(room.host.command("status"), "peers") == "1";
+    }
+    if (!seen) printf("  the plug-in's Link didn't see the peer (no multicast here?): its checks are skipped\n");
+    else
+    {
+      auto peerTempo = [&]() { return peer.captureAppSessionState().tempo(); };
+      for (int i = 0; i < 50 && fabs(peerTempo() - 120.0) > 1e-6; i ++) room.advance(0.2);
+      room.advance(1.0);
+      const std::string st = room.host.command("status");
+      printf("  link: %s, the peer at %.3f BPM\n", st.substr(st.find(" link=")).c_str(), peerTempo());
+      CHECK(fabs(peerTempo() - 120.0) < 1e-6);
+      CHECK(field(st, "leads") == "1");
+      CHECK(field(st, "linkaligned") == "1");
+      CHECK(atoi(field(st, "jumps").c_str()) >= 1);
+      CHECK(room.host.command("chatlog").find("Link: The DAW takes the room's tempo (120 BPM), and its bars start with the intervals.") !=
+            std::string::npos);
+
+      // the room's vote reaches the peer through Link, at the next interval
+      CHECK(room.guest.command("vote bpm 100") == "ok");
+      for (int i = 0; i < 60 && fabs(peerTempo() - 100.0) > 1e-6; i ++) room.advance(0.2);
+      CHECK(fabs(peerTempo() - 100.0) < 1e-6);
+      CHECK(field(room.host.command("status"), "bpm") == "100.0");
+    }
+
+    // Sync off in the host: it leaves Link, and the guest leads it
+    CHECK(room.host.command("follow off") == "ok");
+    CHECK(room.waitFor(room.host, "link", "off", 5));
+    CHECK(room.waitFor(room.guest, "link", "leading", 5));
+    if (seen)
+    {
+      room.advance(1.0);
+      CHECK(fabs(peer.captureAppSessionState().tempo() - 100.0) < 1e-6);
+      CHECK(room.waitFor(room.guest, "leads", "1", 5));
+    }
+    CHECK(room.host.command("follow on") == "ok");
+    CHECK(room.waitFor(room.host, "link", "other", 5));
+    peer.enable(false);
+  }
 
   // transmit off: the host sends nothing from the next interval on, and the guest hears silence
   CHECK(room.host.command("transmit off") == "ok");
