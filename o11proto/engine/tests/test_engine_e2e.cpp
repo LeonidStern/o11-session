@@ -58,6 +58,7 @@ struct Room {
     std::vector<float> heard;                    // listener output 0
     long frames = 0;
     bool listener_runs = true;
+    long listener_start = 0;                     // the listener's clock starts this many frames after the sender's
 
     Room(int rate_, int block_, int bpm = 120, int bpi = 8) : rate(rate_), block(block_) {
         ServerConfig cfg;
@@ -119,7 +120,7 @@ struct Room {
             float* so[2] = {sl.data(), sr.data()};
             float* lo[2] = {ll.data(), lr.data()};
             sender.process(inp, 1, so, 2, block, rate);
-            if (listener_runs) {
+            if (listener_runs && frames >= listener_start) {
                 listener.process(inp, 0, lo, 2, block, rate);
                 heard.insert(heard.end(), ll.begin(), ll.end());
             }
@@ -154,6 +155,7 @@ struct Feed {
     double hz = 997.0, amp = 0.5, phase = 0;
     int sender_topics = 0, listener_topics = 0;
     int sent_for = 0;                           // stream(): the last listener interval fed
+    int whole = kLen;                           // frames in an interval from sendWhole()
     float heard_peak = 0;                       // largest output sample since the test reset it
     std::vector<float> l, r;
 
@@ -269,7 +271,7 @@ struct Feed {
         return g;
     }
     void sendWhole() {
-        std::vector<std::uint8_t> b = flac(kLen);
+        std::vector<std::uint8_t> b = flac(whole);
         send(0, kFourccFlac, b, b.size());
     }
     long dropouts(int ch = 0) const { return listener.channelDropouts(0, ch); }
@@ -584,14 +586,21 @@ TEST(level_while_muted) {                        // 8.6
     CHECK_EQ(f.dropouts(), 0);
 }
 
-TEST(dropouts_per_channel) {                     // 8.7
+TEST(dropouts_per_channel) {                     // 8.7, 13.16
     Feed f;
     REQUIRE(f.connect());
     const int q = Feed::kQuarter, len = Feed::kLen;
     CHECK_EQ(f.dropouts(), 0);
-    // Normal playback: an interval arriving during listener interval j plays
-    // whole in j+1 (L2-L4 here). The one for L4 is 3 frames short, as the
-    // rounding between two sample rates can make it: no dropout either.
+    // A joiner's first interval is partial (it started mid-interval): all of
+    // it arrives, but it holds half an interval (for L2).
+    f.playTo(1, q);
+    std::vector<std::uint8_t> half = f.flac(len / 2);
+    f.send(0, kFourccFlac, half, half.size());
+    CHECK(f.sync());
+    // Then normal playback: an interval arriving during listener interval j
+    // plays whole in j+1 (L3, L4). The one for L4 is 3 frames short, as the
+    // rounding between two sample rates can make it.
+    f.sent_for = 1;
     f.stream(3, q);
     std::vector<std::uint8_t> nearly = f.flac(len - 3);
     f.send(0, kFourccFlac, nearly, nearly.size());
@@ -617,15 +626,14 @@ TEST(dropouts_per_channel) {                     // 8.7
     f.sendWhole();
     CHECK(f.sync());
 
-    // Ran out: the interval for L10 holds half an interval of audio.
+    // Short but all there: the interval for L10 holds half an interval of
+    // audio (its sender's interval was shorter). Not a dropout.
     f.playTo(9, q);
-    std::vector<std::uint8_t> half = f.flac(len / 2);
+    half = f.flac(len / 2);
     f.send(0, kFourccFlac, half, half.size());
     CHECK(f.sync());
-    f.playTo(10, len / 2 - 2000);
-    CHECK_EQ(f.dropouts(), 3);
     f.playTo(10, q * 3);
-    CHECK_EQ(f.dropouts(), 4);
+    CHECK_EQ(f.dropouts(), 3);
 
     // Late data: the interval for L12 stops after its first 9000 bytes (enough
     // to start playing) and the rest comes late in L12. The stream runs dry
@@ -638,7 +646,7 @@ TEST(dropouts_per_channel) {                     // 8.7
     Guid g = f.send(0, kFourccFlac, part, 9000);
     CHECK(f.sync());
     f.playTo(12, len * 5 / 8);
-    CHECK_EQ(f.dropouts(), 5);
+    CHECK_EQ(f.dropouts(), 4);
     f.sender.writeInterval(g, part.data() + 9000, part.size() - 9000, true);
     f.sendWhole();                               // and the interval for L13, on time
     CHECK(f.sync());
@@ -646,25 +654,34 @@ TEST(dropouts_per_channel) {                     // 8.7
     f.playTo(12, len * 7 / 8);
     CHECK(f.heard_peak > 0.45f);                 // caught up within the interval
     f.playTo(13, len);
-    CHECK_EQ(f.dropouts(), 5);
+    CHECK_EQ(f.dropouts(), 4);
 
     // Can't be decoded: a Vorbis interval (no decoder in this engine) for L14.
     std::vector<std::uint8_t> junk(10000, 0x5a);
     f.send(0, kFourccVorbis, junk, junk.size());
     CHECK(f.sync());
     f.playTo(14, q);
-    CHECK_EQ(f.dropouts(), 6);
+    CHECK_EQ(f.dropouts(), 5);
 
     // A deliberate silent interval is no dropout, and nothing is due after it.
     f.sender.sendSilence(0);
     CHECK(f.sync());
-    f.playTo(17, len);
-    CHECK_EQ(f.dropouts(), 6);
+    f.playTo(17, q);
+    CHECK_EQ(f.dropouts(), 5);
+    // The first audio after the silence is not held to time: its data stops
+    // after 9000 bytes like the one for L12 above, but it isn't counted.
+    part = f.flac(len);
+    g = f.send(0, kFourccFlac, part, 9000);
+    CHECK(f.sync());
+    f.playTo(18, len * 5 / 8);
+    f.sender.writeInterval(g, part.data() + 9000, part.size() - 9000, true);
+    f.sendWhole();                               // the interval for L19, on time
+    CHECK(f.sync());
+    f.playTo(19, q);
+    CHECK_EQ(f.dropouts(), 5);
 
     // Unsubscribed, nothing plays and nothing counts; subscribed again,
     // nothing is due until audio comes.
-    f.sent_for = 17;
-    f.stream(19, q);                             // audio again in L19
     f.listener.setChannelSubscribed(0, 0, false);
     CHECK(f.sync());
     f.playTo(20, q);
@@ -674,7 +691,7 @@ TEST(dropouts_per_channel) {                     // 8.7
     f.listener.setChannelSubscribed(0, 0, true);
     CHECK(f.sync());
     f.playTo(23, len);
-    CHECK_EQ(f.dropouts(), 6);
+    CHECK_EQ(f.dropouts(), 5);
 
     // Per channel, counted from the channel's appearance: channel 1 never
     // sent anything; one undecodable interval counts there only, and the
@@ -684,7 +701,7 @@ TEST(dropouts_per_channel) {                     // 8.7
     CHECK(f.sync());
     f.playTo(24, q);
     CHECK_EQ(f.dropouts(1), 1);
-    CHECK_EQ(f.dropouts(0), 6);
+    CHECK_EQ(f.dropouts(0), 5);
     ChannelInfoRecord a, b;
     a.name = "tone";
     b.name = "two";
@@ -695,8 +712,101 @@ TEST(dropouts_per_channel) {                     // 8.7
     CHECK(f.sync());
     CHECK_EQ(f.listener.channelAt(0, 1), 1);
     CHECK_EQ(f.dropouts(1), 0);
-    CHECK_EQ(f.dropouts(0), 6);
+    CHECK_EQ(f.dropouts(0), 5);
     std::printf("  dropouts: channel 0 %ld, channel 1 %ld\n", f.dropouts(0), f.dropouts(1));
+}
+
+// Late data while the listener's own tempo changes isn't counted: the vote
+// arrives during L3, L4 is the first interval at 100 BPM (1.2 s), and the
+// count waits until an interval of the old length and one of the new have
+// played since that boundary. After that late data counts again.
+TEST(tempo_change_on_listener_side) {            // 8.7, 13.16
+    Feed f;
+    REQUIRE(f.connect());
+    const int q = Feed::kQuarter;
+    f.stream(3, q);
+    f.sender.say("!vote bpm 100");
+    CHECK(f.sync());
+    CHECK_EQ(f.listener.serverBpm(), 100);
+    CHECK_EQ(f.listener.bpm(), 120);
+    auto stalled = [&](int loop, int resume_at) {   // an interval for `loop` whose data stops, then comes
+        std::vector<std::uint8_t> part = f.flac(f.whole);
+        Guid g = f.send(0, kFourccFlac, part, 9000);
+        CHECK(f.sync());
+        f.playTo(loop, resume_at);
+        f.sender.writeInterval(g, part.data() + 9000, part.size() - 9000, true);
+        CHECK(f.sync());
+    };
+    stalled(4, 40000);                           // runs dry in L4, at the new tempo
+    CHECK_EQ(f.listener.bpm(), 100);
+    CHECK_EQ(f.listener.usualIntervalLength(), 57600);
+    CHECK_EQ(f.dropouts(), 0);
+    f.whole = 57600;
+    f.sendWhole();                               // for L5
+    CHECK(f.sync());
+    f.sent_for = 4;
+    f.stream(6, q);                              // L5, L6 play normally
+    stalled(7, 40000);                           // well after the change: counted
+    CHECK_EQ(f.dropouts(), 1);
+}
+
+// The room votes 120 -> 100 BPM, then 8 -> 16 BPI, with the listener's clock
+// 1 s behind the sender's, so the two switch at different times and the
+// streams recorded at the old tempo come up short in the listener's longer
+// intervals. No dropouts, and the listener plays normally after.
+TEST(slower_tempo_counts_no_dropouts) {          // 13.16
+    Room room(48000, 512, 120, 8);
+    room.listener_start = 48000;
+    CHECK(room.connectBoth());
+    room.advance(8.5);
+    room.sender.say("!vote bpm 100");
+    room.advance(20.0);
+    CHECK_EQ(room.listener.bpm(), 100);
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);
+    room.sender.say("!vote bpi 16");
+    room.advance(40.0);
+    CHECK_EQ(room.listener.bpi(), 16);
+    CHECK_EQ(room.sender.bpi(), 16);
+    double snr;
+    float peak;
+    room.lastTwo(&snr, &peak);
+    std::printf("  after 100 BPM, 16 BPI: snr %.1f dB, peak %.3f, dropouts %ld\n", snr, peak,
+                room.listener.channelDropouts(0, 0));
+    CHECK(snr >= 35.0);
+    CHECK(peak >= 0.45f && peak <= 0.55f);
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);
+}
+
+// The room votes 100 -> 120 BPM while the listener's clock leads the sender's
+// by 3.9 s of a 4.8 s interval (it starts 0.9 s after the sender's): the
+// listener switches to 4 s intervals one 3.9 s before the sender does, so
+// nothing arrives during one of its intervals and the next one is silent.
+// That gap comes from the tempo change, not the network: no dropout.
+TEST(faster_tempo_gap_counts_no_dropout) {       // 13.16
+    Room room(48000, 512, 100, 8);
+    room.listener_start = 48000 * 9 / 10;
+    CHECK(room.connectBoth());
+    room.advance(9.7);                           // after the sender's boundary at 9.6 s, before the listener's
+    room.sender.say("!vote bpm 120");
+    std::size_t from = room.heard.size();
+    room.advance(20.0);
+    CHECK_EQ(room.listener.bpm(), 120);
+    std::size_t run = 0, longest = 0;
+    for (std::size_t i = from; i < room.heard.size(); ++i) {
+        run = room.heard[i] == 0.0f ? run + 1 : 0;
+        longest = std::max(longest, run);
+    }
+    std::printf("  longest silence after the vote: %.2f s, dropouts %ld\n", static_cast<double>(longest) / room.rate,
+                room.listener.channelDropouts(0, 0));
+    CHECK(longest >= static_cast<std::size_t>(room.intervalLen()) * 9 / 10);   // a whole interval played nothing
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);
+    room.advance(10.0);
+    double snr;
+    float peak;
+    room.lastTwo(&snr, &peak);
+    std::printf("  after 120 BPM: snr %.1f dB, peak %.3f\n", snr, peak);
+    CHECK(snr >= 35.0);
+    CHECK_EQ(room.listener.channelDropouts(0, 0), 0);
 }
 
 TEST_MAIN()

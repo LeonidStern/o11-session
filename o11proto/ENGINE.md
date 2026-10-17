@@ -1,6 +1,6 @@
 # NINJAM client engine specification
 
-Revision 2a, 2026-10-17. Companion to `PROTOCOL.md` (revision 2c), which this
+Revision 2b, 2026-10-17. Companion to `PROTOCOL.md` (revision 2c), which this
 document builds on and never repeats: wire formats, message types, login,
 codec negotiation and chat are defined there, by section number.
 
@@ -621,40 +621,57 @@ are equal. (The reference has only the peak meter.)
 
 ### 8.7 Dropouts
 
-Each remote channel counts its **dropouts**: the intervals, or parts of
-intervals, it couldn't play in full on time. `channelDropouts(user, ch)`
-returns the count, readable from any thread. It is 0 when the channel
-appears (a USERINFO record makes it present when it was not) and grows by at
-most one per interval of the engine's clock, in three cases:
+Each remote channel counts its **dropouts**: intervals, or parts of
+intervals, that a network or decoding problem kept from playing in full on
+time. The count is for a user interface that tells the user a player's
+audio isn't getting through, so nothing else may count.
+`channelDropouts(user, ch)` returns it, readable from any thread. It is 0
+when the channel appears (a USERINFO record makes it present when it was
+not) and grows by at most one per interval of the engine's clock, in three
+cases:
 
-- **Late or missing:** at an interval boundary the channel is subscribed and
+- **Late data:** a piece of the current interval finds fewer frames than it
+  needs (section 8.5) while the interval's download is still arriving (or
+  the stream went bad and decodes no further, section 8.1), and it lacks
+  more than **64** source frames of what the rest of the interval needs. A
+  stream that runs dry and catches up several times in one interval is one
+  dropout.
+- **Missing:** at an interval boundary the channel is subscribed and
   present, slot 0 of its queue is empty, and the channel is **expecting**
   audio: its last current interval was audio (a decoder or an undecodable
   one). The next interval had not arrived, or not become playable (section
-  7.3), when it should have started; it plays one interval later if it comes
-  at all. The channel goes on expecting across such boundaries, so each
-  interval missed counts. It stops expecting when a silent interval (zero
-  GUID) becomes current and when its intervals are discarded (section 7.1);
-  a channel that has sent nothing yet expects nothing.
+  7.3), when it should have started; it plays one interval later if it
+  comes at all. The channel goes on expecting across such boundaries, so
+  each interval missed counts. It stops expecting when a silent interval
+  (zero GUID) becomes current and when its intervals are discarded (section
+  7.1); a channel that has sent nothing yet expects nothing.
 - **Undecodable:** an undecodable interval (section 7.3) becomes current.
-- **Ran out:** a piece of the current interval finds fewer frames than it
-  needs (section 8.5): the data is late, the stream stopped (the sender left,
-  the download timed out) or is bad from some point on (section 8.1), or it
-  ended before the interval did. A stream that has all arrived and been
-  decoded is not counted when it ends within **64** source frames of the end
-  of the interval (the two sides' interval lengths differ by a few frames of
-  rounding when their sample rates differ), nor when the piece lies past the
-  interval's usual length (an interval made longer with `setIntervalEnd`,
-  section 4.5). A stream that runs dry and catches up several times in one
-  interval is one dropout. A change to a slower tempo makes the last stream
-  at the old tempo end early in the first interval at the new one: that is a
-  dropout, the gap is heard.
+  This always counts, also in the cases below.
 
-Not dropouts: a silent interval, an unsubscribed channel, a voice or session
-channel, an interval replaced in slot 1 of a full queue (section 7.3: the
-listener's own audio context stalled, which is not the channel's doing), and
-the part of an interval that the boundary cuts off (a tempo change, or
-`setIntervalEnd` making an interval shorter).
+Not dropouts:
+
+- A stream that has all arrived, however much shorter than the interval it
+  plays in: its sender's interval was shorter (the sender started
+  mid-interval, the interval was recorded at another tempo around a tempo
+  change, the sender's host stopped).
+- Late data in the **first audio interval** of a channel that was not
+  expecting audio (it just appeared, was subscribed again, or comes back
+  from a silent interval): that interval is not held to time.
+- A missing interval at the boundary that ends an interval whose stream
+  **ran long**, with more than 64 frames left over (the engine decodes that
+  far to see): the sender's interval was longer (its interval end moved, it
+  switched to a slower tempo first), so its next one is due that much later.
+- Late data and missing intervals while this engine's **own clock changes**:
+  from a CONFIG_CHANGE with a new BPM or BPI until the boundary that applies
+  it, and from any boundary where the BPM, BPI or interval length change or
+  where `setIntervalEnd` moved the end (section 4.5) until one interval of
+  the old usual length and one of the new have played. Each side switches at
+  its own boundary, so for that long intervals can come early or late by the
+  change alone: when the listener switches to a faster tempo before the
+  sender, one of its new intervals gets nothing and the next plays silence.
+- Silent intervals, unsubscribed channels, voice and session channels, an
+  interval replaced in slot 1 of a full queue (section 7.3: the listener's
+  own audio context stalled), and audio that a boundary cuts off.
 
 ## 9. Metronome
 
@@ -722,7 +739,7 @@ numbers from any thread):
 | default remote channel volume | 0.25 |
 | default metronome volume | 0.5 |
 | drop limit for a FLAC gap | 5 s |
-| dropout slack at the end of a whole stream | 64 source frames |
+| dropout slack for late data at the end of an interval | 64 source frames |
 
 ## 13. Acceptance tests
 
@@ -763,23 +780,32 @@ A conforming implementation passes:
 9. A stream at 48000 played at 44100 keeps time: over 10 s of output the
    consumed source frame count is 480000 ± 100.
 
-**Meters and dropouts (end to end: one engine fed by a protocol client that
-uploads FLAC intervals of a 997 Hz tone at 0.5 when the test says, 1 s
-intervals, simulated clock)**
-15. With the remote channel at volume 1.0: while it is heard, the level
-    equals the peak (both 0.45..0.55); with the channel muted, its user
-    muted, or another channel soloed, the output is 0, the peak falls below
-    0.01 within 1 s and the level stays within 0.45..0.55; at volume 0.5 and
-    pan -1 the level is 0.22..0.28 left and below 0.01 right, muted or not.
-16. Intervals that arrive on time count no dropout, also one that is 3 frames
-    short; one that arrives after the boundary it should have started at
-    counts 1; two missing intervals count 2; one holding half an interval of
-    audio counts 1; one whose data stops after 9000 bytes and comes later
-    in the interval counts 1, and the audio is back before the interval
-    ends; an undecodable (Vorbis) one counts 1; a zero-GUID BEGIN and the
-    silence after it, and intervals while unsubscribed, count 0; the count
-    is per channel and starts again at 0 when a channel goes and comes
-    back. In tests 10-13 every listener counts 0.
+**Meters and dropouts (end to end, simulated clock)**
+15. One engine fed by a protocol client that uploads FLAC intervals of a 997
+    Hz tone at 0.5 when the test says (1 s intervals), the remote channel at
+    volume 1.0: while it is heard, the level equals the peak (both
+    0.45..0.55); with the channel muted, its user muted, or another channel
+    soloed, the output is 0, the peak falls below 0.01 within 1 s and the
+    level stays within 0.45..0.55; at volume 0.5 and pan -1 the level is
+    0.22..0.28 left and below 0.01 right, muted or not.
+16. The same rig. Count 0: a joiner's first interval holding half an
+    interval, then one 3 frames short and a later one holding half an
+    interval, all fully arrived; a zero-GUID BEGIN and the silence after it;
+    intervals while unsubscribed; data that stops after 9000 bytes in the
+    first audio after a silence. Count 1 each: an interval arriving after
+    the boundary it should have started at; each of two missing intervals;
+    data that stops after 9000 bytes and comes later in the interval (the
+    audio is back before the interval ends); an undecodable (Vorbis)
+    interval. The count is per channel and starts again at 0 when a channel
+    goes and comes back. A vote from 120 to 100 BPM arriving during an
+    interval: stalled data in the first interval at the new tempo counts 0,
+    in an interval after the grace of 8.7 it counts 1.
+17. Two engines, Opus, the listener's clock 1 s behind the sender's: votes
+    from 120 to 100 BPM and from 8 to 16 BPI count 0, and the last two
+    intervals have SNR ≥ 35 dB. At 100 BPM with the listener's clock 0.9 s
+    behind, a vote to 120 BPM just after a sender boundary leaves one whole
+    listener interval silent (the listener switches 3.9 s before the
+    sender) and counts 0. In tests 10-13 every listener counts 0.
 
 **Against servers (end to end, needs `o11server` from this repository and may
 also be run against the reference server)**
@@ -840,6 +866,11 @@ also be run against the reference server)**
   remote channel (8.7) and the undecodable queue entry they need (7.3),
   tests 13.15 and 13.16; a counted `!vote` is echoed to the room (protocol
   revision 2c, section 10 here).
+- **2b** (2026-10-17): dropouts count network and decoding problems only
+  (8.7): a stream that has all arrived never counts however short, nor
+  late data in a channel's first audio interval, nor a missing interval
+  after one that ran long, nor anything while the listener's own clock
+  changes; tests 13.16 and 13.17.
 - **1a** (2026-10-17): clarifications after the first implementation: exact
   boundary semantics (4.4), exact resampler positions and undithered exact
   values (6.4), playback phase reset (8.5), tests 13.3, 13.10 and 13.13
