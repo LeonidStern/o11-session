@@ -150,8 +150,12 @@ TEST(rule_cant_and_joining) {
     ps.push_back(old);
     Rule::State st = r.update(7, true, ps);
     CHECK(!st.live && st.reason == RoomReason::CantLive && st.user == 3u);
+    // It leaves: while the room waits, it names no one.
+    std::vector<Rule::Player> without = {player(1), player(2)};
+    st = r.update(7.5, true, without);
+    CHECK(!st.live && st.reason == RoomReason::None && st.user == 0u);
     ps[2].listener = true;                     // unless it can't send at all
-    CHECK(liveAt(r, 7.1, 13, ps) > 0);
+    CHECK(liveAt(r, 7.6, 13, ps) > 0);
     // Over the sender limit; a report that says its Live can't.
     ps = {player(1), player(2)};
     ps[1].sender = false;

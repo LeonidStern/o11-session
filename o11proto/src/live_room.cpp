@@ -132,6 +132,10 @@ const RoomRule::State& RoomRule::update(double now, bool room_on, const std::vec
         return state_;
     }
     if (ok_since_ < 0) ok_since_ = now;
+    if (!state_.live && state_.user && !find(state_.user)) {   // the reason user left: no one's to name
+        state_.reason = RoomReason::None;
+        state_.user = 0;
+    }
     if (!state_.live) {
         const double settle = fallbacks_.size() >= 2 ? kRepeatSettleSeconds : kSettleSeconds;
         if (now - ok_since_ >= settle) state_ = State{true, RoomReason::None, 0};

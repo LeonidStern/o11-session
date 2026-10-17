@@ -253,8 +253,8 @@ void Engine::liveControl() {
 void Engine::liveRoomNotices() {
     LiveLayer& L = *live_;
     const int applied = L.room_applied.load();
-    const bool reasoned = L.has_msg && L.msg.roomOn() && L.has_room && !L.room.live;
     const std::string& u = L.room.user;
+    const bool reasoned = L.has_msg && L.msg.roomOn() && L.has_room && !L.room.live && !u.empty();
     const bool mine = !u.empty() && u == client_.username();
     const std::string who = liveDisplayName(u);
     if (applied != L.room_noticed) {
