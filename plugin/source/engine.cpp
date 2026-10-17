@@ -1255,6 +1255,9 @@ void Engine::updateUsers(Snapshot &snap)
       }
       cv.peak[0] = m_client->channelPeak(u, ch, 0);
       cv.peak[1] = m_client->channelPeak(u, ch, 1);
+      cv.level[0] = m_client->channelLevel(u, ch, 0);
+      cv.level[1] = m_client->channelLevel(u, ch, 1);
+      cv.dropouts = m_client->channelDropouts(u, ch);
       signature += std::to_string(ch) + ":" + cv.name + "\n";
       uv.channels.push_back(cv);
     }
@@ -1593,10 +1596,10 @@ std::string Engine::command(const std::string &lineIn)
     for (auto &u : s.users)
       for (auto &c : u.channels)
       {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s/%d %s vol=%.3f pan=%.3f mute=%d solo=%d peak=%.4f shown=%s\n", u.name.c_str(), c.index,
-                 c.name.c_str(), (double)c.volume, (double)c.pan, c.mute ? 1 : 0, c.solo ? 1 : 0, (double)std::max(c.peak[0], c.peak[1]),
-                 u.displayName.c_str());
+        char buf[384];
+        snprintf(buf, sizeof(buf), "%s/%d %s vol=%.3f pan=%.3f mute=%d solo=%d peak=%.4f level=%.4f drops=%ld shown=%s\n",
+                 u.name.c_str(), c.index, c.name.c_str(), (double)c.volume, (double)c.pan, c.mute ? 1 : 0, c.solo ? 1 : 0,
+                 (double)std::max(c.peak[0], c.peak[1]), (double)std::max(c.level[0], c.level[1]), c.dropouts, u.displayName.c_str());
         out += buf;
       }
     return out;

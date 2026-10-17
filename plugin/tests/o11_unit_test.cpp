@@ -862,6 +862,8 @@ static void test_uitext()
   CHECK_EQ(playersText(4), std::string("4 players"));
   CHECK_EQ(joinedText(0.5), std::string("just joined"));
   CHECK_EQ(joinedText(12.7), std::string("joined 12 s ago"));
+  CHECK_EQ(dropoutsText(1), std::string("1 dropout"));
+  CHECK_EQ(dropoutsText(3), std::string("3 dropouts"));
   CHECK_EQ(ageText(0), std::string("now"));
   CHECK_EQ(ageText(4.9), std::string("now"));
   CHECK_EQ(ageText(12.2), std::string("12 s"));
@@ -895,7 +897,7 @@ static void test_room_events()
   CHECK_EQ(e.text, "anna joined");
   CHECK_EQ(ev(LineKind::Leave, "", false, "anna").text, "anna left");
 
-  // votes: the server names nobody
+  // votes: the voting system's lines, and who voted when the server passes the vote on
   e = ev(LineKind::Server, "[voting system] setting BPM to 100");
   CHECK(e.shown && e.tone == RoomEvent::Change);
   CHECK_EQ(e.text, "BPM set to 100");
@@ -904,6 +906,31 @@ static void test_room_events()
            "Vote for BPM 100: 1 of 2");
   CHECK_EQ(ev(LineKind::Server, "[voting system] leading candidate: 2/3 votes for 8 BPI [each vote expires in 60s]").text,
            "Vote for 8 beats: 2 of 3");
+  CHECK_EQ(uitext::roomEvent(LineKind::Server, "", "[voting system] setting BPM to 100", false, "Anna").text, "Anna set BPM to 100");
+  CHECK_EQ(uitext::roomEvent(LineKind::Server, "", "[voting system] setting BPI to 16", false, "You").text,
+           "You set the interval to 16 beats");
+  CHECK_EQ(uitext::roomEvent(LineKind::Server, "", "[voting system] leading candidate: 1/2 votes for 100 BPM [each vote expires in 60s]",
+                             false, "Anna").text,
+           "Anna voted for BPM 100: 1 of 2");
+  e = ev(LineKind::Chat, "!vote bpm 90", false, "Anna");
+  CHECK(e.shown && e.tone == RoomEvent::Change);
+  CHECK_EQ(e.text, "Anna voted for BPM 90");
+  CHECK_EQ(ev(LineKind::Chat, " !VOTE BPI 32", false, "Sam").text, "Sam voted for 32 beats");
+  CHECK(!ev(LineKind::Chat, "hello", false, "Sam").shown);
+  CHECK(!ev(LineKind::Chat, "!vote bpm", false, "Sam").shown);
+  CHECK(!ev(LineKind::Chat, "!vote tempo 100", false, "Sam").shown);
+  bool bpm = false;
+  int value = 0;
+  CHECK(uitext::parseVote("!vote bpm 100", &bpm, &value) && bpm && value == 100);
+  CHECK(uitext::parseVote("!vote  bpi 16 ", &bpm, &value) && !bpm && value == 16);
+  CHECK(!uitext::parseVote("!voted bpm 100", &bpm, &value));
+  CHECK(!uitext::parseVote("!vote bpm -5", &bpm, &value));
+  CHECK(uitext::voteMatches(true, 100, "[voting system] setting BPM to 100"));
+  CHECK(!uitext::voteMatches(true, 100, "[voting system] setting BPI to 100"));
+  CHECK(!uitext::voteMatches(true, 90, "[voting system] setting BPM to 100"));
+  CHECK(uitext::voteMatches(false, 8, "[voting system] leading candidate: 2/3 votes for 8 BPI [each vote expires in 60s]"));
+  CHECK(!uitext::voteMatches(false, 16, "[voting system] leading candidate: 2/3 votes for 8 BPI [each vote expires in 60s]"));
+  CHECK(!uitext::voteMatches(true, 100, "[voting system] No vote permission"));
   e = ev(LineKind::Server, "[voting system] No vote permission");
   CHECK(e.shown && e.tone == RoomEvent::Warn);
   CHECK_EQ(e.text, "No vote permission");

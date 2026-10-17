@@ -81,7 +81,9 @@ struct RemoteChannelView
   std::string name;
   float volume = 1.0f, pan = 0.0f;
   bool mute = false, solo = false;
-  float peak[2] = { 0, 0 };
+  float peak[2] = { 0, 0 };  // what you hear of them: nothing while muted or another channel is soloed
+  float level[2] = { 0, 0 }; // what they play, with your volume and pan, muted or not
+  long dropouts = 0;         // gaps in their audio since they came in: audio late, cut short or undecodable
   int playerOut = 0; // the plug-in's extra output that plays it alone (1 to Engine::NUM_PLAYER_OUTS), 0 for none
 };
 

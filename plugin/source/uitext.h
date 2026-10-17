@@ -30,6 +30,7 @@ constexpr double PIXELS_PER_BPM = 2.0;               // dragging the BPM box up 
 // the level meters show -60 dB to 0 dB: green, amber from -12 dB, red from -3 dB
 constexpr float METER_FLOOR_DB = -60.0f, METER_AMBER = 0.8f, METER_RED = 0.95f;
 constexpr double JOINED_SECONDS = 30.0;              // a player's row says "joined" this long
+constexpr double DROPOUT_SECONDS = 60.0;             // and how many dropouts it had, this long after one
 
 // the BPM box dragged dy pixels up (down when negative) from start, within BPM_MIN..BPM_MAX
 int dragBpm(int start, double dy, bool fine);
@@ -52,6 +53,8 @@ std::string beatsText(int beats);
 std::string playersText(int players);
 // a player's row, seconds after they joined: "just joined", "joined 12 s ago"
 std::string joinedText(double seconds);
+// a player's gaps in their audio: "1 dropout", "3 dropouts"
+std::string dropoutsText(long n);
 // how long ago something happened, in the room panel: "now", "12 s", "2 min", "1 h"
 std::string ageText(double seconds);
 // a server's line with the players' addresses taken out: "anna@203.0.113.9 set ..." is "anna set ..."
@@ -61,8 +64,9 @@ std::string withoutAddresses(const std::string &text);
 // chat, with the plug-in's own notes and the server's messages): who came and went, what
 // changed (tempo, interval, codec, bitrate), and what the server says. The kinds are the
 // engine's (ChatLine): the plug-in's notes, the server's messages, the built-in server's log,
-// joins, leaves, anything else (people's chat, errors the editor shows elsewhere).
-enum class LineKind { Note, Server, HostLog, Join, Leave, Other };
+// joins, leaves, what players say (only their votes are shown), anything else (errors the
+// editor shows elsewhere).
+enum class LineKind { Note, Server, HostLog, Join, Leave, Chat, Other };
 struct RoomEvent
 {
   enum Tone { Plain, Change, Warn }; // grey, purple, amber
@@ -70,8 +74,15 @@ struct RoomEvent
   Tone tone = Plain;
   std::string text;
 };
-// who: the display name of who joined or left; hosting: you host the room
-RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &text, bool hosting);
+// who: the display name of who joined, left or said it; hosting: you host the room; voter: who
+// cast the vote a voting system line is about ("You" for you), "" when not known
+RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &text, bool hosting,
+                    const std::string &voter = "");
+
+// A player's vote as the server passes it on ("!vote bpm 100"): BPM or interval, and the value.
+bool parseVote(const std::string &text, bool *bpm, int *value);
+// Whether a voting system line is about that vote: the room set to its value, or its value leading.
+bool voteMatches(bool bpm, int value, const std::string &serverText);
 
 // The host bar while hosting, from what the built-in server knows (the Snapshot's host fields).
 struct HostInfo
