@@ -205,6 +205,11 @@ int main()
   CHECK(room.waitFor(room.host, "lookedup", "-", 5));
   CHECK(field(room.host.command("status"), "joinedfrominternet") == "0");
 
+  // the host looks at Link in its room before the guest joins, so it is the first and leads Link
+  // (two joins within one of its looks race for it)
+  for (int i = 0; i < 250 && field(room.host.command("status"), "link") == "waiting"; i ++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
   // the guest joins; it hears the host, who plays alone on a player output
   CHECK(room.guest.command("connect 127.0.0.1:" + std::to_string(port) + " Guest") == "ok");
   CHECK(room.waitFor(room.guest, "state", "connected", 10));

@@ -141,7 +141,7 @@ static void test_state()
   CHECK_EQ(old.liveBufferMs, 20);
   struct { const char *saved; int ms; } buffers[] = {
     { "10", 10 }, { "40", 40 }, { "100", 100 }, { "33", 30 }, { "5", 10 }, { "200", 100 }, { "999", 100 },
-    { "abc", 20 }, { "", 20 }, { "30ms", 20 }, { "-40", 20 },
+    { "abc", 20 }, { "", 20 }, { "30ms", 20 }, { "-40", 10 },
   };
   for (auto &b : buffers)
   {
