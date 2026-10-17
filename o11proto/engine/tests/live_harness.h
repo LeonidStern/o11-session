@@ -370,6 +370,64 @@ inline bool seamless(const Transition& t) {
     return t.step_ratio <= 1.5 && t.silence_ms <= 1.0 && t.rms_low_db >= -1.0 && t.rms_high_db <= 1.0;
 }
 
+// Clicks: for each 5 ms block from `from`, the largest second difference
+// |x[n] - 2 x[n-1] + x[n-2]| (a step, or a bend, in the sound), against the
+// median of the blocks within 200 ms either side of it.
+struct ClickBlock {
+    long frame = 0;                              // where the block starts
+    double d2 = 0;
+    double median = 0;
+};
+inline double secondDifference(const float* x, long from, long to) {
+    double m = 0;
+    for (long n = from; n < to; ++n) m = std::max(m, double(std::fabs(x[n] - 2 * x[n - 1] + x[n - 2])));
+    return m;
+}
+inline std::vector<ClickBlock> clickBlocks(const float* x, long from, long to, int rate) {
+    const long B = rate / 200, around = 40;      // 5 ms blocks; 200 ms either side
+    std::vector<ClickBlock> v;
+    for (long f = std::max(from, 2L); f + B <= to; f += B) {
+        ClickBlock c;
+        c.frame = f;
+        c.d2 = secondDifference(x, f, f + B);
+        v.push_back(c);
+    }
+    std::vector<double> w;
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        w.clear();
+        const std::size_t lo = i >= static_cast<std::size_t>(around) ? i - around : 0;
+        const std::size_t hi = std::min(v.size(), i + around + 1);
+        for (std::size_t k = lo; k < hi; ++k) w.push_back(v[k].d2);
+        std::nth_element(w.begin(), w.begin() + static_cast<std::ptrdiff_t>(w.size() / 2), w.end());
+        v[i].median = std::max(1e-9, w[w.size() / 2]);
+    }
+    return v;
+}
+
+// How far behind `ref` the sound in x[from, to) is, within [lo, hi]
+// frames: the lag with the best normalized correlation.
+inline long bestLag(const float* x, const std::function<float(long)>& ref, long from, long to, long lo, long hi) {
+    long best = lo;
+    double best_c = -2;
+    std::vector<float> r(static_cast<std::size_t>(to - from + hi - lo));
+    for (long k = 0; k < static_cast<long>(r.size()); ++k) r[static_cast<std::size_t>(k)] = ref(from - hi + k);
+    for (long d = lo; d <= hi; ++d) {
+        double c = 0, ex = 0, er = 0;
+        for (long n = from; n < to; ++n) {
+            const double a = x[n], b = r[static_cast<std::size_t>(n - d - (from - hi))];
+            c += a * b;
+            ex += a * a;
+            er += b * b;
+        }
+        const double v = ex > 0 && er > 0 ? c / std::sqrt(ex * er) : 0;
+        if (v > best_c) {
+            best_c = v;
+            best = d;
+        }
+    }
+    return best;
+}
+
 // ------------------------------------------------------------ WAV
 
 inline bool writeWav(const std::string& path, const float* x, long n, int rate) {
