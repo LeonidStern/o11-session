@@ -111,6 +111,8 @@ struct HostBar
   std::string portTip;     // the whole story, with the router's note when it failed
 };
 HostBar hostBar(const HostInfo &h);
+// an address as people type it: without the port when it is the usual 2049 ("203.0.113.7")
+std::string roomAddress(const std::string &address);
 
 } // namespace uitext
 } // namespace o11

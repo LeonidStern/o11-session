@@ -273,9 +273,18 @@ static std::string sharedRouterAddress(const std::string &note)
   return a == 100 && b >= 64 && b <= 127 ? addr : "";
 }
 
+std::string roomAddress(const std::string &address)
+{
+  static const char *port = ":2049";
+  const size_t n = strlen(port);
+  if (address.size() > n && address.compare(address.size() - n, n, port) == 0) return address.substr(0, address.size() - n);
+  return address;
+}
+
 HostBar hostBar(const HostInfo &h)
 {
   HostBar b;
+  const std::string lan = roomAddress(h.localAddress);
   const std::string portNo = std::to_string(h.port);
   const std::string here = h.localAddress.empty() ? std::string("this computer")
                                                   : "this computer (" + h.localAddress.substr(0, h.localAddress.rfind(':')) + ")";
@@ -288,7 +297,7 @@ HostBar hostBar(const HostInfo &h)
   if (!shared.empty())
   {
     b.addressKey = "LAN";
-    b.address = h.localAddress;
+    b.address = lan;
     b.placeholder = "not known";
     b.addressTip = "Where players in your local network join";
     b.port = HostBar::Blocked;
@@ -301,16 +310,16 @@ HostBar hostBar(const HostInfo &h)
   if (!wan.empty())
   {
     b.addressKey = "WAN";
-    b.address = wan;
+    b.address = roomAddress(wan);
     b.placeholder = "not known";
     b.addressTip = "Where players on the internet join" +
                    (forwarded || h.joinedFromInternet ? std::string() : ", once port " + portNo + " is forwarded to " + here) +
-                   (h.localAddress.empty() ? std::string() : "; players in your local network join at " + h.localAddress);
+                   (lan.empty() ? std::string() : "; players in your local network join at " + lan);
   }
   else
   {
     b.addressKey = "LAN";
-    b.address = h.localAddress;
+    b.address = lan;
     b.placeholder = asking ? "looking it up\xe2\x80\xa6" : "not known";
     b.addressTip = "Where players in your local network join; players on the internet join at your public address" +
                    std::string(asking ? ", which is being looked up" : ", which is not known") + ", once port " + portNo +
@@ -321,9 +330,9 @@ HostBar hostBar(const HostInfo &h)
   {
     b.port = HostBar::Open;
     b.portText = "Port open";
-    b.portTip = forwarded ? "Your router forwards port " + portNo + ": players on the internet join at " + wan
+    b.portTip = forwarded ? "Your router forwards port " + portNo + ": players on the internet join at " + roomAddress(wan)
                           : "A player joined from the internet, so port " + portNo + " is open" +
-                              (wan.empty() ? std::string() : ": players join at " + wan);
+                              (wan.empty() ? std::string() : ": players join at " + roomAddress(wan));
   }
   else if (h.portmapPending)
   {
@@ -337,7 +346,7 @@ HostBar hostBar(const HostInfo &h)
     b.port = HostBar::Forward;
     b.portText = "Forward port " + portNo;
     b.portTip = "Your router didn't open port " + portNo + " for O11 Session. Forward port " + portNo + " (TCP) to " + here +
-                " in your router's settings" + (wan.empty() ? std::string() : ", and players on the internet join at " + wan) +
+                " in your router's settings" + (wan.empty() ? std::string() : ", and players on the internet join at " + roomAddress(wan)) +
                 ". If it's forwarded already, they can join now.";
     if (!h.portmapNote.empty()) b.portTip += " (The router said: " + h.portmapNote + ")";
   }
