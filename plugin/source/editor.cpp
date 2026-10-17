@@ -298,7 +298,7 @@ void O11Editor::buildViews()
   // host bar: Host  3 in room  LAN [..][Copy]                          (o) Forward port 2049
   m_hostBar = add(m_root.get(), new Pane(Colors::strip(), 2));
   m_host = add(m_hostBar, new FlatButton("Host", FlatButton::Toggle, f.button));
-  m_host->setTooltip("Host a NINJAM server in this plug-in, and join it");
+  m_host->setTooltip("Host a room in this plug-in, and join it");
   m_host->onChange = [this]() {
     m_hostPending = true;
     m_hostPendingSince = now_seconds();
