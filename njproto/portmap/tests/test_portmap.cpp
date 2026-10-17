@@ -93,6 +93,11 @@ struct FakeRouter {
 
     explicit FakeRouter(const std::string& scenario) {
         std::string cmd = std::string("\"") + PYTHON3_EXE + "\" -I \"" + FAKE_ROUTER_PY + "\" " + scenario;
+#ifdef _WIN32
+        // _popen runs the line through cmd.exe /c, which strips the first and last quote of a
+        // line that starts with one; a second pair of quotes around the whole line keeps both paths
+        cmd = "\"" + cmd + "\"";
+#endif
         pipe = NJ_POPEN(cmd.c_str(), "r");
         if (!pipe) {
             std::printf("  cannot start %s\n", cmd.c_str());

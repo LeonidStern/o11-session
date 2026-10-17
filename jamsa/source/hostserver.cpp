@@ -371,13 +371,17 @@ static bool wait_socket(socket_t s, bool write, std::chrono::steady_clock::time_
     if (left <= 0 || *stop) return false;
     const int slice = (int)std::min<long long>(left, 100); // so stop() never waits long
 #ifdef _WIN32
-    fd_set set;
+    // Winsock reports a failed connect in the except set, not the write set; without it a
+    // refused connection would wait out the whole deadline (getsockopt SO_ERROR then names it)
+    fd_set set, except;
     FD_ZERO(&set);
     FD_SET(s, &set);
+    FD_ZERO(&except);
+    FD_SET(s, &except);
     timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = slice * 1000;
-    const int r = select(0, write ? nullptr : &set, write ? &set : nullptr, nullptr, &tv);
+    const int r = select(0, write ? nullptr : &set, write ? &set : nullptr, write ? &except : nullptr, &tv);
 #else
     // poll, not select: a host can have more files open than an fd_set holds
     pollfd p;
