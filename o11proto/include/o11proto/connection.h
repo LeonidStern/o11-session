@@ -37,7 +37,8 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     // Takes ownership of an already connected (or connecting) socket and
-    // makes it non-blocking with TCP_NODELAY.
+    // makes it non-blocking with TCP_NODELAY, and with SO_NOSIGPIPE where the
+    // system has it (a send to a reset peer is then an error, never SIGPIPE).
     void adopt(socket_t fd);
     socket_t fd() const { return fd_; }
     bool isOpen() const { return fd_ != kInvalidSocket; }

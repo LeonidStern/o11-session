@@ -28,6 +28,8 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -389,6 +391,19 @@ struct PortMapper::Impl {
 
     // Section 4.
     void run() {
+#ifndef _WIN32
+        // miniupnpc talks to the router over TCP sockets it makes itself and
+        // sends with no MSG_NOSIGNAL or SO_NOSIGPIPE, so a router that resets
+        // the connection would raise SIGPIPE and end the process (the host,
+        // in a plug-in). SIGPIPE from a send goes to the thread that sent, so
+        // blocking it in this thread only, for its whole life, keeps it away
+        // without touching the process's signal handling; such a send just
+        // fails with EPIPE.
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGPIPE);
+        pthread_sigmask(SIG_BLOCK, &blocked, nullptr);
+#endif
         const std::string portStr = std::to_string(port);
         emit("asking the router to forward TCP port " + portStr + " to this machine");
         bool warned = false;

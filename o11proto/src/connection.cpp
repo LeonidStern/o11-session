@@ -45,6 +45,7 @@ Connection::~Connection() { close(); }
 void Connection::adopt(socket_t fd) {
     close();
     fd_ = fd;
+    compat::noSigpipe(fd_);
     setNonBlocking(fd_);
     setNoDelay(fd_);
     peer_ = peerAddressOf(fd_);
@@ -110,7 +111,7 @@ bool Connection::flush() {
     while (!outq_.empty()) {
         const auto& front = outq_.front();
         compat::ssize_type n =
-            compat::send(fd_, front.data() + out_off_, front.size() - out_off_, MSG_NOSIGNAL);
+            compat::send(fd_, front.data() + out_off_, front.size() - out_off_, 0);   // never SIGPIPE
         if (n < 0) {
             int err = compat::lastError();
             if (compat::isWouldBlock(err)) return true;

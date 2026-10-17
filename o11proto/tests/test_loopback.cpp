@@ -11,6 +11,10 @@
 #include "o11proto/sha1.h"
 #include "socket_compat.h"
 
+#ifndef _WIN32
+#include <signal.h>
+#endif
+
 using namespace o11proto;
 
 // ------------------------------------------------------------------ harness
@@ -102,7 +106,20 @@ struct Harness {
         }
         c.setChannels(recs);
         if (!c.connect("127.0.0.1", server.port(), o)) return false;
-        return until([&] { return c.loggedIn() || c.state() == Client::State::Failed; }, 3000) && c.loggedIn();
+        if (!until([&] { return c.loggedIn() || c.state() == Client::State::Failed; }, 3000) || !c.loggedIn())
+            return false;
+        return synced(c, rec);
+    }
+    // The client is logged in once AUTH_REPLY is read, but the rest of the
+    // login sequence (config, user list, message of the day, topic, codec
+    // mask) may still be on its way. The server sends all of it before it
+    // reads anything more from this client, and answers `stat` (section 9,
+    // any user) to the sender only, after it: once that answer is here, so
+    // is everything before it on the same connection.
+    bool synced(Client& c, Recorder& rec) {
+        int before = rec.countChat("PRIVMSG", "*");
+        c.admin("stat");
+        return until([&] { return rec.countChat("PRIVMSG", "*") > before; }) && c.loggedIn();
     }
     bool settle(int ms = 60) {
         pump(ms);
@@ -184,7 +201,7 @@ TEST(login_anonymous_and_bad_password) {        // acceptance 1
     CHECK(!h.login(b, rb, "alice", "wrong"));
     CHECK(b.state() == Client::State::Failed);
     CHECK_EQ(b.failReason(), "invalid login/password");
-    CHECK_EQ(rb.replies.size(), 1u);
+    REQUIRE_EQ(rb.replies.size(), 1u);
     CHECK(!rb.replies[0].success());
     CHECK(h.until([&] { return h.server.connectionCount() == 1; }));  // socket closed
 
@@ -251,7 +268,7 @@ TEST(version_licence_and_timeout_refusals) {   // acceptance 2
     // Licence not agreed: a raw peer sends AUTH_USER without bit 0.
     RawPeer p;
     CHECK(p.connect(h.server.port()));
-    CHECK(pumpRaw(h, p, [&] { return p.find(kMsgAuthChallenge) != nullptr; }));
+    REQUIRE(pumpRaw(h, p, [&] { return p.find(kMsgAuthChallenge) != nullptr; }));
     AuthChallenge ch;
     CHECK(decode(p.find(kMsgAuthChallenge)->payload, ch));
     CHECK(ch.has_licence);
@@ -261,7 +278,7 @@ TEST(version_licence_and_timeout_refusals) {   // acceptance 2
     au.passhash = passwordHash(au.username, "", ch.challenge);
     au.client_caps = 0;
     p.c.send(kMsgClientAuthUser, encode(au));
-    CHECK(pumpRaw(h, p, [&] { return p.find(kMsgAuthReply) != nullptr; }));
+    REQUIRE(pumpRaw(h, p, [&] { return p.find(kMsgAuthReply) != nullptr; }));
     AuthReply r;
     CHECK(decode(p.find(kMsgAuthReply)->payload, r));
     CHECK(!r.success());
@@ -283,7 +300,7 @@ TEST(version_licence_and_timeout_refusals) {   // acceptance 2
     // No AUTH_USER at all: authorization timeout (shortened to 1 s here).
     RawPeer q;
     CHECK(q.connect(h.server.port()));
-    CHECK(pumpRaw(h, q, [&] { return q.find(kMsgAuthReply) != nullptr; }, 4000));
+    REQUIRE(pumpRaw(h, q, [&] { return q.find(kMsgAuthReply) != nullptr; }, 4000));
     CHECK(decode(q.find(kMsgAuthReply)->payload, r));
     CHECK_EQ(r.text, "authorization timeout");
     CHECK(pumpRaw(h, q, [&] { return q.closed; }));
@@ -313,7 +330,7 @@ TEST(userinfo_join_and_part) {                  // acceptance 3
     CHECK(h.login(b, rb, "anonymous:second"));
     h.settle();
     // b saw first's channels in the login USERINFO.
-    CHECK_EQ(b.users().count("first@127.0.0.1"), 1u);
+    REQUIRE_EQ(b.users().count("first@127.0.0.1"), 1u);
     const auto& u = b.users().at("first@127.0.0.1");
     CHECK(u.channels[0].active);
     CHECK_EQ(u.channels[0].name, "guitar");
@@ -327,7 +344,7 @@ TEST(userinfo_join_and_part) {                  // acceptance 3
     std::vector<UserInfoRecord> about_second;
     for (const auto& r : ra.infos)
         if (r.username == "second@127.0.0.1") about_second.push_back(r);
-    CHECK_EQ(about_second.size(), 2u);
+    REQUIRE_EQ(about_second.size(), 2u);
     CHECK(about_second[0].active && about_second[0].index == 0 && about_second[0].channel == "");
     CHECK(about_second[1].active && about_second[1].index == 0 && about_second[1].channel == "ch0");
 
@@ -347,6 +364,7 @@ TEST(userinfo_join_and_part) {                  // acceptance 3
     before = ra.infos.size();
     b.setChannels({});
     CHECK(h.until([&] { return ra.infos.size() >= before + 2; }));
+    REQUIRE_EQ(a.users().count("second@127.0.0.1"), 1u);
     CHECK(a.users().at("second@127.0.0.1").channels[0].active);
     CHECK_EQ(a.users().at("second@127.0.0.1").channels[0].name, "");
     CHECK(!a.users().at("second@127.0.0.1").channels[1].active);
@@ -376,8 +394,8 @@ TEST(interval_forwarding_and_subscription) {   // acceptance 4, 5, 6
     for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<std::uint8_t>(i * 31 + 7);
     Guid g = up.beginInterval(1, kFourccVorbis);
     up.writeInterval(g, payload.data(), payload.size(), true);
-    CHECK(h.until([&] { return !rs.ends.empty(); }));
-    CHECK_EQ(rs.begins.size(), 1u);
+    REQUIRE(h.until([&] { return !rs.ends.empty(); }));
+    REQUIRE_EQ(rs.begins.size(), 1u);
     CHECK(rs.begins[0].guid == g);
     CHECK_EQ(rs.begins[0].username, "up@127.0.0.1");
     CHECK_EQ(rs.begins[0].channel, 1);
@@ -563,7 +581,7 @@ TEST(codec_mask_and_silence_substitution) {     // acceptance 9
     Client opus, old, flac;
     Recorder ro, rl, rf;
     CHECK(h.login(opus, ro, "anonymous:opus", "", kCapOpus | kCapFlac));
-    CHECK(h.until([&] { return ro.masks.size() == 1; }));
+    REQUIRE(h.until([&] { return ro.masks.size() == 1; }));
     CHECK_EQ(ro.masks[0].codecs, kCapOpus);
     CHECK_EQ(ro.masks[0].opus_kbps, 128u);        // default room bitrate
     CHECK(opus.hasCodecMask());
@@ -572,7 +590,7 @@ TEST(codec_mask_and_silence_substitution) {     // acceptance 9
 
     // A client without codec bits moves the room to Vorbis.
     CHECK(h.login(old, rl, "anonymous:old"));
-    CHECK(h.until([&] { return ro.masks.size() == 2; }));
+    REQUIRE(h.until([&] { return ro.masks.size() == 2; }));
     CHECK_EQ(ro.masks[1].codecs, 0u);
     const std::string fell = "[server] room audio is now Vorbis, because old@127.0.0.1's client can't play Opus";
     CHECK(h.until([&] { return ro.countChat("MSG", "", fell) == 1; }));
@@ -586,7 +604,7 @@ TEST(codec_mask_and_silence_substitution) {     // acceptance 9
     Guid g = opus.beginInterval(0, kFourccOpus);
     std::vector<std::uint8_t> bytes = {1, 2, 3, 4};
     opus.writeInterval(g, bytes.data(), bytes.size(), true);
-    CHECK(h.until([&] { return !rl.begins.empty(); }));
+    REQUIRE(h.until([&] { return !rl.begins.empty(); }));
     CHECK(guidIsZero(rl.begins[0].guid));
     CHECK_EQ(rl.begins[0].fourcc, 0u);
     CHECK_EQ(rl.begins[0].channel, 0);
@@ -601,14 +619,14 @@ TEST(codec_mask_and_silence_substitution) {     // acceptance 9
 
     // When the old client leaves the room goes back to Opus.
     old.disconnect();
-    CHECK(h.until([&] { return ro.masks.size() == 3; }));
+    REQUIRE(h.until([&] { return ro.masks.size() == 3; }));
     CHECK_EQ(ro.masks[2].codecs, kCapOpus);
     CHECK_EQ(ro.countChat("MSG", "", "[server] room audio is back to Opus"), 1);
 
     // A FLAC-only client joins: Opus is no longer common to everyone, FLAC is
     // (and the server relays it), so the room falls to FLAC.
     CHECK(h.login(flac, rf, "anonymous:flac", "", kCapFlac));
-    CHECK(h.until([&] { return ro.masks.size() == 4; }));
+    REQUIRE(h.until([&] { return ro.masks.size() == 4; }));
     CHECK_EQ(ro.masks[3].codecs, kCapFlac);
     CHECK(h.until([&] { return rf.masks.size() == 1 && rf.masks[0].codecs == kCapFlac; }));
     CHECK(h.until([&] { return ro.countChat("MSG", "", "[server] room audio is now FLAC, because flac@127.0.0.1's client can't play Opus") == 1; }));
@@ -710,7 +728,7 @@ TEST(require_codec) {
     Client v;
     Recorder rv;
     CHECK(h2.login(v, rv, "anonymous:v", "", kCapOpus | kCapFlac));
-    CHECK(h2.until([&] { return rv.masks.size() == 1; }));
+    REQUIRE(h2.until([&] { return rv.masks.size() == 1; }));
     CHECK_EQ(rv.masks[0].codecs, 0u);
     v.say("!codec opus");
     CHECK(h2.until([&] { return rv.countChat("MSG", "", "[server] this server doesn't allow Opus") == 1; }));
@@ -932,6 +950,98 @@ TEST(session_relay_and_hidden_user) {
     CHECK_EQ(rb.chats.back().fields[4], "12.5 2.0");
     h.settle();
     CHECK_EQ(ra.countChat("SESSION"), 0);
+}
+
+// A send to a peer that has reset the connection must come back as an error.
+// On POSIX it would otherwise raise SIGPIPE, whose default action ends the
+// process (the host, for a plug-in), and the library must not rely on
+// anyone ignoring the signal: here it is set to the default action, so a
+// SIGPIPE ends this test with a signal instead of a failed check.
+#ifndef _WIN32
+static void defaultSigpipe() {
+    struct sigaction dfl;
+    std::memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(SIGPIPE, &dfl, nullptr);
+}
+#endif
+
+// Closes a socket with SO_LINGER 0, which sends RST instead of FIN.
+static void resetClose(socket_t fd) {
+    linger l;
+    l.l_onoff = 1;
+    l.l_linger = 0;
+    compat::setOpt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+    compat::closeSocket(fd);
+}
+
+TEST(send_to_reset_peer_is_an_error) {
+#ifndef _WIN32
+    defaultSigpipe();
+#endif
+    compat::startup();
+    socket_t lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(lfd != kInvalidSocket);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    socklen_t len = sizeof(sa);
+    REQUIRE(::bind(lfd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0 && ::listen(lfd, 4) == 0 &&
+            getsockname(lfd, reinterpret_cast<sockaddr*>(&sa), &len) == 0);
+    const std::uint16_t port = ntohs(sa.sin_port);
+
+    // Accepted side: the library's Connection on a socket from accept(), as
+    // the server has; the peer resets right after connecting.
+    socket_t peer = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(::connect(peer, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0);
+    socket_t afd = ::accept(lfd, nullptr, nullptr);
+    REQUIRE(afd != kInvalidSocket);
+    Connection conn(afd);
+    resetClose(peer);
+    bool failed = false, saw_epipe = false;
+    std::vector<std::uint8_t> chunk(1000, 0x55);
+    for (int i = 0; i < 200; ++i) {
+        // Through the Connection, then a bare compat::send with no flags:
+        // neither may raise the signal.
+        if (conn.isOpen() && conn.send(kMsgChat, chunk) && !conn.flush()) failed = true;
+        if (compat::send(afd, chunk.data(), chunk.size(), 0) < 0) {
+            failed = true;
+#ifndef _WIN32
+            if (compat::lastError() == EPIPE) saw_epipe = true;    // where SIGPIPE would come
+#endif
+        }
+#ifndef _WIN32
+        if (saw_epipe) break;
+#else
+        if (failed) break;
+#endif
+        pollfd pfd{};
+        pfd.fd = afd;
+        pfd.events = POLLIN;
+        compat::poll(&pfd, 1, 5);
+    }
+    CHECK(failed);
+#ifndef _WIN32
+    CHECK(saw_epipe);
+#endif
+    conn.close();
+
+    // Connecting side: a Client whose server resets the connection while
+    // the client still has data to send.
+    Client c;
+    Client::Options o;
+    o.username = "anonymous:reset";
+    REQUIRE(c.connect("127.0.0.1", port, o));
+    socket_t sfd = ::accept(lfd, nullptr, nullptr);
+    REQUIRE(sfd != kInvalidSocket);
+    resetClose(sfd);
+    for (int i = 0; i < 200 && c.state() != Client::State::Failed; ++i) {
+        c.sendRaw(kMsgChat, chunk);
+        c.poll(5);
+    }
+    CHECK(c.state() == Client::State::Failed);
+    compat::closeSocket(lfd);
 }
 
 TEST_MAIN()
