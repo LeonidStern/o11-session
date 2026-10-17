@@ -147,7 +147,13 @@ private:
   juce::Label *m_emptyText = nullptr, *m_footer = nullptr;
   ui::AddressBox *m_emptyAddress = nullptr; // your room's address, while nobody else is in it
   std::vector<Row> m_rows;
-  std::map<std::string, double> m_heardAt; // when each row last had sound, by user and channel
+  struct RowTrack
+  {
+    double heard = 0;   // when it last had sound
+    long dropouts = -1; // its dropouts when last seen (-1: not seen yet)
+    double droppedAt = -1; // when they last went up
+  };
+  std::map<std::string, RowTrack> m_tracks; // by user and channel
 
   // room panel
   ui::Strip *m_room = nullptr;
@@ -178,6 +184,12 @@ private:
   unsigned long long m_chatRevision = ~0ull;
   double m_eventsSince = -1;    // the room the events list was made for (Snapshot::roomSince)
   int m_chipsShown = -1;        // how many chips the room panel was laid out for
+  struct Vote
+  {
+    std::string who; // "You" for you
+    int value = 0;
+  };
+  Vote m_lastVote[2];           // the latest vote the server passed on, for BPM and for the interval
   bool m_emptyShown = false, m_emptyAddressShown = false; // the mixer's empty message, and the address in it
   bool m_hostPending = false;   // the switch was used; wait for the engine
   double m_hostPendingSince = 0;

@@ -22,7 +22,7 @@ public:
     FlacEnc(int rate, int channels, int kbps) : Encoder(kFourccFlac, rate, channels, kbps) {
         enc_ = FLAC__stream_encoder_new();
         std::random_device rd;
-        rng_.seed(rd());
+        rng_ = DitherRng((static_cast<std::uint64_t>(rd()) << 32) ^ rd());
     }
     ~FlacEnc() override {
         if (enc_) {
@@ -48,7 +48,7 @@ public:
     void encode(const float* interleaved, int frames) override {
         if (!open_) return;
         buf_.resize(static_cast<std::size_t>(frames) * static_cast<std::size_t>(channels_));
-        for (std::size_t i = 0; i < buf_.size(); ++i) buf_[i] = floatToInt16(interleaved[i], rng_);
+        floatToInt16(interleaved, buf_.data(), buf_.size(), rng_);
         FLAC__stream_encoder_process_interleaved(enc_, buf_.data(), static_cast<unsigned>(frames));
     }
 
@@ -68,7 +68,7 @@ private:
     FLAC__StreamEncoder* enc_ = nullptr;
     bool open_ = false;
     std::vector<FLAC__int32> buf_;
-    std::mt19937 rng_;
+    DitherRng rng_;
 };
 
 // ------------------------------------------------------------- decoder

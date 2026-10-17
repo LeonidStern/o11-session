@@ -76,12 +76,14 @@ public:
 
     void encode(const float* interleaved, int frames) override {
         if (!enc_ || !stream_open_) return;
-        std::vector<float> rs;
-        resampler_.process(interleaved, frames, rs);
-        if (rs.empty()) return;
-        real_ += static_cast<long>(rs.size() / static_cast<std::size_t>(channels_));
-        pending_.insert(pending_.end(), rs.begin(), rs.end());
-        rememberHistory(rs);
+        // The resampled block goes straight onto the end of pending_ (no
+        // temporary vector per block; at 48 kHz the resampler only copies).
+        const std::size_t at = pending_.size();
+        resampler_.process(interleaved, frames, pending_);
+        const std::size_t added = pending_.size() - at;
+        if (added == 0) return;
+        real_ += static_cast<long>(added / static_cast<std::size_t>(channels_));
+        rememberHistory(pending_.data() + at, added);
         encodeWholeFrames();
     }
 
@@ -120,16 +122,17 @@ public:
     }
 
 private:
-    void rememberHistory(const std::vector<float>& rs) {
+    // Keeps the last kLpcHistory frames; `rs` is `n` interleaved samples.
+    void rememberHistory(const float* rs, std::size_t n) {
         const std::size_t ch = static_cast<std::size_t>(channels_);
         std::size_t hframes = static_cast<std::size_t>(kLpcHistory);
-        std::size_t nf = rs.size() / ch;
+        std::size_t nf = n / ch;
         if (nf >= hframes) {
-            std::copy(rs.end() - static_cast<std::ptrdiff_t>(hframes * ch), rs.end(), history_.begin());
+            std::copy(rs + (n - hframes * ch), rs + n, history_.begin());
         } else {
             std::size_t keep = hframes - nf;
             std::copy(history_.begin() + static_cast<std::ptrdiff_t>(nf * ch), history_.end(), history_.begin());
-            std::copy(rs.begin(), rs.end(), history_.begin() + static_cast<std::ptrdiff_t>(keep * ch));
+            std::copy(rs, rs + n, history_.begin() + static_cast<std::ptrdiff_t>(keep * ch));
         }
     }
 

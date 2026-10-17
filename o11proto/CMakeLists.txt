@@ -93,6 +93,8 @@ if(O11PROTO_BUILD_ENGINE)
 
   add_executable(o11jam tools/o11jam.cpp)
   target_link_libraries(o11jam o11proto_engine)
+  add_executable(o11bench tools/o11bench.cpp)
+  target_link_libraries(o11bench o11proto_engine)
 
   foreach(t test_engine_codecs test_engine_clock test_engine_e2e)
     add_executable(${t} engine/tests/${t}.cpp)

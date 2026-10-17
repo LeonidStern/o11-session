@@ -16,7 +16,8 @@
 
   writes, as the hosting instance (Leo) sees it: first-open.png (not in a
   room), alone.png (hosting, nobody else), room.png (four others: one just
-  joined, one muted, one silent; a tempo and an interval to come), full.png
+  joined, one muted, one silent, one with dropouts; a tempo and an interval
+  to come, voted for by Anna), full.png
   (eight in the room, one too loud), small.png (the smallest window) and
   large.png (a larger one). It takes about a minute.
 
@@ -66,6 +67,7 @@ struct Player
   PlayHead head;
   std::thread audio;
   std::atomic<bool> quit { false };
+  std::atomic<double> stallUntil { 0 }; // the host stops calling process() until then (seconds on the steady clock)
   float level;
   double freq;
 
@@ -83,6 +85,13 @@ struct Player
       auto next = std::chrono::steady_clock::now();
       while (!quit)
       {
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (t < stallUntil)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          next = std::chrono::steady_clock::now();
+          continue;
+        }
         buffer.clear();
         for (int i = 0; i < BLOCK; i ++)
         {
@@ -198,10 +207,11 @@ int main(int argc, char **argv)
     idle(*editor, 31);
     join(3);
     check(waitFor([&]() { return leo.snapshot().users.size() == 4; }, 10), "Leo sees four players");
-    // Leo mutes Marco
+    // Leo mutes Marco; Sam's computer stalls for a moment, so his audio comes late
     for (const RemoteUserView &u : leo.snapshot().users)
       if (u.displayName == "Marco")
         for (const RemoteChannelView &c : u.channels) leo.plugin->engine().setRemote(u.name, c.index, Engine::RemoteMute, 1);
+    others[1]->stallUntil = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() + 3.0;
     idle(*editor, 4);
     // Anna asks for 100 BPM and 16 beats just after an interval starts: they come at the next one
     check(waitFor([&]() {
