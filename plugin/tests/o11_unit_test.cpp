@@ -915,7 +915,7 @@ static void test_uitext()
   CHECK_EQ((int)(sizeof(BPI_CHOICES) / sizeof(BPI_CHOICES[0])), NUM_BPI_CHOICES);
   for (int i = 1; i < NUM_BPI_CHOICES; i++) CHECK(BPI_CHOICES[i] > BPI_CHOICES[i - 1]);
   CHECK_EQ(BPI_CHOICES[0], 2); // the server's least
-  CHECK_EQ(BPI_CHOICES[NUM_BPI_CHOICES - 1], 64); // and its most
+  CHECK_EQ(BPI_CHOICES[NUM_BPI_CHOICES - 1], 16); // up to 16 beats
 }
 
 // the room panel's list: what the server and the plug-in say, as the list shows it
