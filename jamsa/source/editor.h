@@ -170,7 +170,7 @@ private:
   bool m_showingOwnServer = false; // the server box shows the server this instance hosts
   ui::AddressBox *m_copied = nullptr; // says "Copied" until m_copiedUntil
   double m_copiedUntil = 0;
-  std::string m_lanShown; // what the address box was laid out for
+  std::string m_lanShown; // what the address box was laid out for (key and text)
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(JamsaEditor)
 };

@@ -561,6 +561,13 @@ void AddressBox::setAddress(const std::string &address, const std::string &place
   repaint();
 }
 
+void AddressBox::setKey(const std::string &key)
+{
+  if (key == m_key) return;
+  m_key = key;
+  repaint();
+}
+
 void AddressBox::setCopyTitle(const std::string &title)
 {
   if (title == m_copyTitle) return;

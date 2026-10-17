@@ -307,9 +307,7 @@ void JamsaEditor::buildViews()
   m_roomCount = add(m_hostBar, makeLabel("", f.value, Colors::status()));
   m_hostHint = add(m_hostBar, makeLabel("", f.label, Colors::label()));
   m_hostHint->setInterceptsMouseClicks(true, false);
-  m_lan = add(m_hostBar, new AddressBox(f, "LAN"));
-  m_lan->setTooltip("Where players in your local network join; players on the internet join at your public address, "
-                    "once the port is forwarded to this computer");
+  m_lan = add(m_hostBar, new AddressBox(f, "LAN")); // WAN once the public address is known (uitext::hostBar)
   m_lan->onCopy = [this]() { copyAddress(m_lan); };
   m_portLed = add(m_hostBar, new Led);
   m_portText = add(m_hostBar, makeLabel("", f.value, Colors::status(), juce::Justification::centredRight));
@@ -905,21 +903,38 @@ void JamsaEditor::updateHostBar(const Snapshot &s)
       setLabel(m_roomCount, count);
       relayout = true;
     }
-    const std::string lan = s.hostLocalAddress;
-    m_lan->setAddress(lan, "not known");
-    if (lan != m_lanShown)
+    // the address box and the port's state, by the rules in uitext::hostBar
+    uitext::HostInfo info;
+    info.port = s.hostPort;
+    info.publicAddress = s.hostPublicAddress;
+    info.lookedUpAddress = s.hostLookedUpAddress;
+    info.localAddress = s.hostLocalAddress;
+    info.portmapNote = s.hostNote;
+    info.portmapPending = s.hostPortmapPending;
+    info.lookupPending = s.hostLookupPending;
+    info.joinedFromInternet = s.hostJoinedFromInternet;
+    const uitext::HostBar bar = uitext::hostBar(info);
+    m_lan->setKey(bar.addressKey);
+    m_lan->setAddress(bar.address, bar.placeholder);
+    m_lan->setTooltip(bar.addressTip);
+    const std::string shown = bar.addressKey + " " + (bar.address.empty() ? bar.placeholder : bar.address);
+    if (shown != m_lanShown)
     {
-      m_lanShown = lan;
+      m_lanShown = shown;
       relayout = true;
     }
-    const std::string portNo = std::to_string(s.hostPort);
-    const std::string here = lan.empty() ? std::string("this computer") : "this computer (" + lan.substr(0, lan.rfind(':')) + ")";
-    // the plug-in doesn't ask the router to open the port: say how to do it by hand
-    port = "Forward port " + portNo;
-    portColor = led = Colors::yellow();
-    lit = true;
-    tip = "Players in your local network join at the LAN address. For players on the internet, forward port " + portNo +
-          " (TCP) to " + here + " in your router's settings; they join at your public address with :" + portNo + ".";
+    port = bar.portText;
+    tip = bar.portTip;
+    if (bar.port == uitext::HostBar::Open)
+    {
+      portColor = led = Colors::green();
+      lit = true;
+    }
+    else if (bar.port == uitext::HostBar::Forward)
+    {
+      portColor = led = Colors::yellow();
+      lit = true;
+    }
   }
   else
   {

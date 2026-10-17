@@ -272,6 +272,7 @@ class AddressBox : public juce::Component, public juce::SettableTooltipClient
 public:
   AddressBox(const Fonts &fonts, const std::string &key);
   void setAddress(const std::string &address, const std::string &placeholder); // the placeholder when there is none
+  void setKey(const std::string &key); // "LAN", "WAN"
   const std::string &address() const { return m_address; }
   void setCopyTitle(const std::string &title); // "Copy", "Copied"
   float preferredWidth() const;

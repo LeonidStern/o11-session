@@ -163,15 +163,19 @@ int main()
   const std::string hostStatus = room.host.command("status");
   const int port = atoi(field(hostStatus, "port").c_str());
   printf("  host: %s\n", hostStatus.c_str());
-  CHECK(port >= 2049);
+  CHECK(port > 0); // any free port (JAMSA_HOST_PORT=0)
   CHECK(field(hostStatus, "hosting") == "1");
   CHECK(field(hostStatus, "codec") == "Opus");
   CHECK(field(hostStatus, "upload") == "OPUr");
   CHECK(field(hostStatus, "bpi") == "4");
   CHECK(field(hostStatus, "roomkbps") == "510"); // the host's own bitrate becomes the room's
+  // the router and the "what's my IP" service are left alone (JAMSA_PORTMAP and JAMSA_WHATSMYIP are off)
+  CHECK(field(hostStatus, "public") == "-");
+  CHECK(room.waitFor(room.host, "lookedup", "-", 5));
+  CHECK(field(room.host.command("status"), "joinedfrominternet") == "0");
 
   // the guest joins; it hears the host, who plays alone on a player output
-  CHECK(room.guest.command("connect localhost:" + std::to_string(port) + " Guest") == "ok");
+  CHECK(room.guest.command("connect 127.0.0.1:" + std::to_string(port) + " Guest") == "ok");
   CHECK(room.waitFor(room.guest, "state", "connected", 10));
   CHECK(room.waitFor(room.guest, "users", "1", 10));
   CHECK(room.waitFor(room.host, "users", "1", 10));
@@ -182,7 +186,7 @@ int main()
   CHECK(users.find("shown=Host") != std::string::npos);
   const std::string chat = room.guest.command("chatlog");
   CHECK(chat.find("Host plays alone on the output Player 1") != std::string::npos);
-  CHECK(chat.find("Connected to localhost:") != std::string::npos);
+  CHECK(chat.find("Connected to 127.0.0.1:") != std::string::npos);
 
   // Opus, at the room's bitrate
   room.advance(12.0);

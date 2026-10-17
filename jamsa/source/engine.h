@@ -121,7 +121,13 @@ struct Snapshot
   bool hosting = false;      // this instance hosts it
   bool hostBusy = false;     // starting or stopping
   int hostPort = 0;
-  std::string hostLocalAddress; // this machine's address in the local network, with the port
+  std::string hostPublicAddress; // host:port on the internet, once the router forwards the port
+  std::string hostLocalAddress;  // this machine's address in the local network, with the port
+  std::string hostNote;          // why there is no public address (the last thing the port mapper said)
+  bool hostPortmapPending = false; // still asking the router
+  std::string hostLookedUpAddress; // from a "what's my IP" service, for when the router doesn't say
+  bool hostLookupPending = false;  // still asking that service
+  bool hostJoinedFromInternet = false; // so the port is open, even if the router didn't say
   int hostUsers = 0;
   int hostedElsewherePort = 0; // another instance in this program hosts one
 

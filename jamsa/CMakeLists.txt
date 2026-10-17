@@ -6,13 +6,14 @@
 #   ctest --test-dir build --output-on-failure
 #
 # Everything it needs is downloaded at configure time and linked statically: JUCE 8.0.9
-# (AGPLv3 or commercial: see README.md), Opus and FLAC (BSD). To use local copies pass
-# -DFETCHCONTENT_SOURCE_DIR_<NAME>=/path for JUCE, OPUS or FLAC.
+# (AGPLv3 or commercial: see README.md), Opus and FLAC (BSD), miniupnpc and libnatpmp (BSD,
+# for the built-in server's port mapping). To use local copies pass
+# -DFETCHCONTENT_SOURCE_DIR_<NAME>=/path for JUCE, OPUS, FLAC, MINIUPNP or LIBNATPMP.
 #
 # On Windows build with the static runtime (-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
 # -DCMAKE_POLICY_DEFAULT_CMP0091=NEW) so Jamsa.vst3 needs no Visual C++ runtime.
 #
-# Targets: jamsa_core (the engine wrapper, host sync, click and the editor's texts: a static
+# Targets: jamsa_core (the engine wrapper, the built-in server, host sync, click and the editor's texts: a static
 # library on juce_core and juce_audio_basics only, which the tests link without a host),
 # Jamsa (the plug-in: processor and editor) and the tests under tests/ (JAMSA_TESTS=ON).
 
@@ -91,6 +92,62 @@ endfunction()
 jamsa_fetch_codecs()
 
 # ---------------------------------------------------------------------------
+# Router port mapping: miniupnpc (UPnP-IGD) and libnatpmp (NAT-PMP), static, as ninjam/vst3
+# builds them. njproto's port mapper (njproto_portmap) takes them as the targets miniupnpc and
+# natpmp when those exist before it is added, so they are made here.
+# ---------------------------------------------------------------------------
+FetchContent_Declare(miniupnp
+    GIT_REPOSITORY https://github.com/miniupnp/miniupnp.git
+    GIT_TAG miniupnpc_2_2_6
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR miniupnpc
+)
+# libnatpmp has no tags: this is master on 2025-04-03 (20230423 plus the CMake fixes after it)
+FetchContent_Declare(libnatpmp
+    GIT_REPOSITORY https://github.com/miniupnp/libnatpmp.git
+    GIT_TAG 134fc89e2781e154e40042641f4d8bcbe42579f1
+    GIT_SHALLOW TRUE
+)
+
+function(jamsa_fetch_portmap_libs)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(BUILD_SHARED_LIBS OFF)
+    set(BUILD_TESTING OFF)
+
+    set(UPNPC_BUILD_STATIC ON)
+    set(UPNPC_BUILD_SHARED OFF)
+    set(UPNPC_BUILD_TESTS OFF)
+    set(UPNPC_BUILD_SAMPLE OFF)
+    set(UPNPC_NO_INSTALL ON)
+    FetchContent_MakeAvailable(miniupnp)
+    set_target_properties(libminiupnpc-static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # The port mapper includes <miniupnpc/miniupnpc.h> and <natpmp.h>, as with the system
+    # packages, so the headers go to one include folder in the build tree. libnatpmp's own
+    # folder is kept off the include path: its file VERSION would be found by <version> on a
+    # case-insensitive file system.
+    set(inc ${CMAKE_BINARY_DIR}/portmap-include)
+    file(COPY ${miniupnp_SOURCE_DIR}/miniupnpc/include/ DESTINATION ${inc}/miniupnpc)
+    add_library(miniupnpc INTERFACE)
+    target_include_directories(miniupnpc INTERFACE ${inc})
+    target_link_libraries(miniupnpc INTERFACE libminiupnpc-static)
+
+    FetchContent_MakeAvailable(libnatpmp) # the static library target natpmp
+    set_target_properties(natpmp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    file(COPY ${libnatpmp_SOURCE_DIR}/natpmp.h ${libnatpmp_SOURCE_DIR}/natpmp_declspec.h DESTINATION ${inc})
+    set_target_properties(natpmp PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${inc})
+    # its command line tools aren't needed
+    foreach(t natpmpc testgetgateway)
+        if(TARGET ${t})
+            set_target_properties(${t} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+        endif()
+    endforeach()
+endfunction()
+
+jamsa_fetch_portmap_libs()
+
+# ---------------------------------------------------------------------------
 # JUCE
 # ---------------------------------------------------------------------------
 FetchContent_Declare(juce
@@ -101,17 +158,24 @@ FetchContent_Declare(juce
 FetchContent_MakeAvailable(juce)
 
 # ---------------------------------------------------------------------------
-# The njproto protocol library and client engine, with the codecs above
+# The njproto protocol library, client engine and port mapper, with the libraries above
 # ---------------------------------------------------------------------------
 set(NJPROTO_BUILD_ENGINE ON CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../njproto ${CMAKE_CURRENT_BINARY_DIR}/njproto)
+if(NOT TARGET njproto_portmap)
+    message(FATAL_ERROR "njproto's port mapper (NJPROTO_BUILD_PORTMAP) is off; the built-in server needs it")
+endif()
 
-# the warnings our own sources are built with (the plug-in must build without any)
+# the warnings our own sources are built with (the plug-in must build without any), and on
+# Windows the lean windows.h without its min and max macros (std::min and std::max are used)
 function(jamsa_warnings target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W3)
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra)
+    endif()
+    if(WIN32)
+        target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     endif()
 endfunction()
 
@@ -144,7 +208,7 @@ target_compile_definitions(jamsa_core
 # don't clash. The headers and definitions are passed on for the tests.
 target_link_libraries(jamsa_core
     PRIVATE juce::juce_audio_basics juce::juce_core
-    PUBLIC njproto_engine njproto juce::juce_recommended_config_flags
+    PUBLIC njproto_engine njproto njproto_portmap juce::juce_recommended_config_flags
 )
 jamsa_warnings(jamsa_core)
 target_include_directories(jamsa_core PUBLIC $<TARGET_PROPERTY:juce::juce_audio_basics,INTERFACE_INCLUDE_DIRECTORIES>)

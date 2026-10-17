@@ -92,5 +92,62 @@ std::string kbpsText(int kbps)
   return std::to_string(kbps) + "k";
 }
 
+
+HostBar hostBar(const HostInfo &h)
+{
+  HostBar b;
+  const std::string portNo = std::to_string(h.port);
+  const std::string here = h.localAddress.empty() ? std::string("this computer")
+                                                  : "this computer (" + h.localAddress.substr(0, h.localAddress.rfind(':')) + ")";
+  // the router's word for the public address, else a "what's my IP" service's
+  const bool forwarded = !h.publicAddress.empty();
+  const std::string wan = forwarded ? h.publicAddress : h.lookedUpAddress;
+  const bool asking = h.lookupPending || h.portmapPending;
+  if (!wan.empty())
+  {
+    b.addressKey = "WAN";
+    b.address = wan;
+    b.placeholder = "not known";
+    b.addressTip = "Where players on the internet join" +
+                   (forwarded || h.joinedFromInternet ? std::string() : ", once port " + portNo + " is forwarded to " + here) +
+                   (h.localAddress.empty() ? std::string() : "; players in your local network join at " + h.localAddress);
+  }
+  else
+  {
+    b.addressKey = "LAN";
+    b.address = h.localAddress;
+    b.placeholder = asking ? "looking it up\xe2\x80\xa6" : "not known";
+    b.addressTip = "Where players in your local network join; players on the internet join at your public address" +
+                   std::string(asking ? ", which is being looked up" : ", which is not known") + ", once port " + portNo +
+                   " is forwarded to " + here;
+  }
+
+  if (forwarded || h.joinedFromInternet)
+  {
+    b.port = HostBar::Open;
+    b.portText = "Port open";
+    b.portTip = forwarded ? "Your router forwards port " + portNo + ": players on the internet join at " + wan
+                          : "A player joined from the internet, so port " + portNo + " is open" +
+                              (wan.empty() ? std::string() : ": players join at " + wan);
+  }
+  else if (h.portmapPending)
+  {
+    b.port = HostBar::Asking;
+    b.portText = "Asking the router\xe2\x80\xa6";
+    b.portTip = "Asking your router to forward port " + portNo;
+  }
+  else
+  {
+    // the router didn't open it: maybe it is forwarded by hand, which nothing here can see
+    b.port = HostBar::Forward;
+    b.portText = "Forward port " + portNo;
+    b.portTip = "Your router didn't open port " + portNo + " for Jamsa. Forward port " + portNo + " (TCP) to " + here +
+                " in your router's settings" + (wan.empty() ? std::string() : ", and players on the internet join at " + wan) +
+                ". If it's forwarded already, they can join now.";
+    if (!h.portmapNote.empty()) b.portTip += " (The router said: " + h.portmapNote + ")";
+  }
+  return b;
+}
+
 } // namespace uitext
 } // namespace jamsa

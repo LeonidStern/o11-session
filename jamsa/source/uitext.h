@@ -9,7 +9,8 @@
 
   What the editor's controls show and take, without JUCE (so the unit test
   can check it): the BPM box (dragged or typed), the BPI choices, the volume
-  boxes' dB, the meters' segments, the beat box.
+  boxes' dB, the meters' segments, the beat box, and the host bar's address and
+  port texts.
 
 */
 
@@ -42,6 +43,33 @@ int litSegments(float peak);
 std::string beatText(int pos, int length, int bpi);
 // an Opus bitrate in the bitrate box: "128k"
 std::string kbpsText(int kbps);
+
+// The host bar while hosting, from what the built-in server knows (the Snapshot's host fields).
+struct HostInfo
+{
+  int port = 0;
+  std::string publicAddress;   // the router's word (the port mapper): host:port
+  std::string lookedUpAddress; // a "what's my IP" service's, with the port
+  std::string localAddress;    // in the local network, with the port
+  std::string portmapNote;     // the last thing the port mapper said, when it failed
+  bool portmapPending = false, lookupPending = false;
+  bool joinedFromInternet = false;
+};
+struct HostBar
+{
+  // The address box: the address people connect to. The router's when it forwarded the port,
+  // else the looked-up public address (the port may be forwarded by hand), else the LAN address.
+  std::string addressKey;  // "WAN" or "LAN"
+  std::string address;     // empty: the placeholder shows
+  std::string placeholder; // "looking it up..." while asking, else "not known"
+  std::string addressTip;
+  // the port's state on the right
+  enum Port { Open, Asking, Forward };
+  Port port = Forward;
+  std::string portText;    // "Port open", "Asking the router...", "Forward port 2049"
+  std::string portTip;     // the whole story, with the router's note when it failed
+};
+HostBar hostBar(const HostInfo &h);
 
 } // namespace uitext
 } // namespace jamsa

@@ -10,9 +10,11 @@
   Tests for the parts of the plug-in that need no network or host: the saved
   state, the players' names, following the host (lining the intervals up with
   its bars, voting for its tempo, the editor's note on its tempo), the
-  metronome's click, what the editor's controls show and take, and the text
-  commands of Engine::command(). Ported from ninjam/vst3's plugin_unit_test.cpp
-  (without its Link, port mapping, text keys and clipboard checks).
+  metronome's click, what the editor's controls show and take, the text
+  commands of Engine::command(), and the built-in server's addresses (the
+  port mapper's lines, the public address lookup against a server on
+  localhost, what the host bar shows). Ported from ninjam/vst3's
+  plugin_unit_test.cpp (without its Link, text keys and clipboard checks).
 
 */
 
@@ -22,13 +24,26 @@
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <map>
 #include <thread>
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include "click.h"
 #include "engine.h"
+#include "hostserver.h"
 #include "hostsync.h"
 #include "uitext.h"
 
@@ -824,11 +839,279 @@ static void test_uitext()
   CHECK_EQ(BPI_CHOICES[NUM_BPI_CHOICES - 1], 64); // and its most
 }
 
+// the port mapper's lines and the server's, as HostServer reads them
+static void test_portmap_messages()
+{
+  HostServer::State st;
+  std::map<std::string, std::string> conns;
+  bool show = false;
+  HostServer::parseLogLine("[portmap] asking the router to forward TCP port 2049 to this machine", st, &show, &conns);
+  CHECK(show && st.portmapPending && st.publicAddress.empty());
+
+  HostServer::parseLogLine("[portmap] UPnP: people can connect to 203.0.113.7:2049", st, &show, &conns);
+  CHECK(show && !st.portmapPending);
+  CHECK_EQ(st.publicAddress, "203.0.113.7:2049");
+  CHECK(st.portmapNote.empty());
+
+  HostServer::parseLogLine("[portmap] lost the forward for TCP port 2049, trying again", st, &show, &conns);
+  CHECK(st.publicAddress.empty() && st.portmapPending);
+  CHECK_EQ(st.portmapNote, "lost the forward for TCP port 2049, trying again");
+
+  HostServer::parseLogLine("[portmap] NAT-PMP: router forwards TCP port 2049 to this machine, but the router's own internet address is 100.64.0.9, "
+                           "which is not public. Your internet provider probably uses carrier-grade NAT.", st, &show, &conns);
+  CHECK(st.publicAddress.empty() && !st.portmapPending);
+  CHECK(st.portmapNote.find("not public") != std::string::npos);
+  CHECK(st.portmapNote.compare(0, 8, "NAT-PMP:") == 0);
+
+  HostServer::parseLogLine("[portmap] could not find a router that supports UPnP or NAT-PMP. Forward TCP port 2049 on your router "
+                           "to this machine by hand, or turn on UPnP in the router's settings. Will keep trying every 5 minutes.", st, &show, &conns);
+  CHECK(show && st.publicAddress.empty() && !st.portmapPending);
+  CHECK(st.portmapNote.compare(0, 24, "could not find a router ") == 0);
+
+  HostServer::parseLogLine("[portmap] NAT-PMP: people can connect to 198.51.100.4:2050.", st, &show, &conns);
+  CHECK_EQ(st.publicAddress, "198.51.100.4:2050"); // without the full stop
+  HostServer::parseLogLine("[portmap] UPnP: removed the forward for TCP port 2049", st, &show, &conns);
+  CHECK(st.publicAddress.empty() && !st.portmapPending);
+
+  // the server's lines: only errors and warnings are shown
+  HostServer::parseLogLine("listening on port 2049", st, &show, &conns);
+  CHECK(!show);
+  HostServer::parseLogLine("warning: Opus bitrate 9 is outside 32-510, using 128", st, &show, &conns);
+  CHECK(show);
+  HostServer::parseLogLine("Error: something", st, &show, &conns);
+  CHECK(show);
+
+  // a player who joins from the internet shows the port is open, one from the local network doesn't
+  CHECK(!st.joinedFromInternet);
+  HostServer::parseLogLine("connection 1 from 192.168.1.20", st, &show, &conns);
+  HostServer::parseLogLine("login 1 as Ana privs=cv", st, &show, &conns);
+  CHECK(!st.joinedFromInternet && !show);
+  HostServer::parseLogLine("connection 2 from 127.0.0.1", st, &show, &conns);
+  HostServer::parseLogLine("login 2 as Bo privs=cv", st, &show, &conns);
+  CHECK(!st.joinedFromInternet);
+  HostServer::parseLogLine("connection 3 from 203.0.113.9", st, &show, &conns);
+  HostServer::parseLogLine("refusing login 3: invalid login/password", st, &show, &conns);
+  CHECK(!st.joinedFromInternet);
+  HostServer::parseLogLine("login 3 as Cy privs=cv", st, &show, &conns);
+  CHECK(st.joinedFromInternet && !show);
+  CHECK(conns.empty()); // forgotten once logged in
+  HostServer::parseLogLine("login 9 as Nobody privs=cv", st, &show, &conns); // never seen connecting
+  CHECK(!show);
+
+  CHECK(HostServer::isPublicIPv4("89.114.98.123"));
+  CHECK(HostServer::isPublicIPv4("172.32.0.1"));
+  CHECK(HostServer::isPublicIPv4("100.128.0.1"));
+  for (const char *a : { "10.0.0.5", "172.16.0.1", "172.31.255.255", "192.168.1.1", "127.0.0.1", "169.254.3.4",
+                         "100.64.0.9", "100.127.255.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "", "1.2.3", "a.b.c.d" })
+    CHECK(!HostServer::isPublicIPv4(a));
+
+  // the public address from a "what's my IP" service
+  std::string ip;
+  CHECK(HostServer::parseWhatsMyIpReply("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n89.114.98.123\n", &ip));
+  CHECK_EQ(ip, "89.114.98.123");
+  CHECK(HostServer::parseWhatsMyIpReply("HTTP/1.0 200 OK\r\n\r\n203.0.113.7", &ip));
+  CHECK_EQ(ip, "203.0.113.7");
+  ip = "kept";
+  CHECK(!HostServer::parseWhatsMyIpReply("HTTP/1.1 503 Service Unavailable\r\n\r\n1.2.3.4\n", &ip));
+  CHECK(!HostServer::parseWhatsMyIpReply("HTTP/1.1 200 OK\r\n\r\n<html>1.2.3.4</html>", &ip));
+  CHECK(!HostServer::parseWhatsMyIpReply("HTTP/1.1 200 OK\r\n\r\n1.2.3.256\n", &ip));
+  CHECK(!HostServer::parseWhatsMyIpReply("HTTP/1.1 200 OK\r\n\r\n1.2.3\n", &ip));
+  CHECK(!HostServer::parseWhatsMyIpReply("HTTP/1.1 200 OK\r\n\r\n2001:db8::1\n", &ip));
+  CHECK(!HostServer::parseWhatsMyIpReply("HTTP/1.1 200 OK\r\n", &ip));
+  CHECK(!HostServer::parseWhatsMyIpReply("", &ip));
+  CHECK_EQ(ip, "kept");
+}
+
+// A "what's my IP" service on localhost: answers each connection with reply and closes. Stops
+// after `answers` connections.
+struct FakeWhatsMyIp
+{
+#ifdef _WIN32
+  typedef SOCKET sock_t;
+#else
+  typedef int sock_t;
+#endif
+  sock_t listener;
+  int port = 0;
+  std::thread thread;
+
+  FakeWhatsMyIp(const std::string &reply, int answers)
+  {
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(0x7f000001u);
+    a.sin_port = 0;
+    socklen_t len = sizeof(a);
+    if (bind(listener, (sockaddr *)&a, sizeof(a)) == 0 && listen(listener, 4) == 0 && getsockname(listener, (sockaddr *)&a, &len) == 0)
+      port = ntohs(a.sin_port);
+    thread = std::thread([this, reply, answers]() {
+      for (int i = 0; i < answers; i ++)
+      {
+        const sock_t c = accept(listener, nullptr, nullptr);
+#ifdef _WIN32
+        if (c == INVALID_SOCKET) break;
+#else
+        if (c < 0) break;
+#endif
+        char buf[1024];
+        recv(c, buf, sizeof(buf), 0); // the request
+        send(c, reply.data(), (int)reply.size(), 0);
+#ifdef _WIN32
+        closesocket(c);
+#else
+        close(c);
+#endif
+      }
+    });
+  }
+  ~FakeWhatsMyIp()
+  {
+    thread.join();
+#ifdef _WIN32
+    closesocket(listener);
+#else
+    close(listener);
+#endif
+  }
+  std::string spec(const char *path = "/") const { return "127.0.0.1:" + std::to_string(port) + path; }
+};
+
+static void test_public_address_lookup()
+{
+  std::atomic<bool> stop { false };
+  {
+    FakeWhatsMyIp service("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n89.114.98.123\n", 1);
+    CHECK(service.port > 0);
+    CHECK_EQ(HostServer::whatsMyIp(service.spec("/ip"), &stop), "89.114.98.123");
+  }
+  {
+    // a service that doesn't give an address
+    FakeWhatsMyIp service("HTTP/1.1 200 OK\r\n\r\n<html>hello</html>\n", 1);
+    CHECK_EQ(HostServer::whatsMyIp(service.spec(), &stop), "");
+  }
+  // "off" asks nobody, and a service nothing listens on gives nothing (at once: the connection is refused)
+  CHECK_EQ(HostServer::whatsMyIp("off", &stop), "");
+  {
+    FakeWhatsMyIp closed("", 0);
+    const int port = closed.port;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_EQ(HostServer::whatsMyIp("127.0.0.1:" + std::to_string(port + 1) + "/", &stop), "");
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(4));
+  }
+  // stopped before it starts
+  std::atomic<bool> stopped { true };
+  CHECK_EQ(HostServer::whatsMyIp("127.0.0.1:1/", &stopped), "");
+}
+
+// what the host bar shows, from what the server knows
+static void test_host_bar()
+{
+  using uitext::HostBar;
+  uitext::HostInfo h;
+  h.port = 2049;
+
+  // nothing known at all
+  HostBar b = uitext::hostBar(h);
+  CHECK_EQ(b.addressKey, "LAN");
+  CHECK(b.address.empty());
+  CHECK_EQ(b.placeholder, "not known");
+  CHECK(b.port == HostBar::Forward);
+  CHECK_EQ(b.portText, "Forward port 2049");
+  CHECK(b.portTip.find("(TCP) to this computer in your router's settings") != std::string::npos);
+  CHECK(b.portTip.find("The router said") == std::string::npos);
+
+  // just started: the LAN address while the router and the service are asked
+  h.localAddress = "192.168.1.20:2049";
+  h.portmapPending = true;
+  h.lookupPending = true;
+  b = uitext::hostBar(h);
+  CHECK_EQ(b.addressKey, "LAN");
+  CHECK_EQ(b.address, "192.168.1.20:2049");
+  CHECK(b.port == HostBar::Asking);
+  CHECK_EQ(b.portText, "Asking the router\xe2\x80\xa6");
+  CHECK(b.addressTip.find("being looked up") != std::string::npos);
+  h.localAddress.clear();
+  b = uitext::hostBar(h);
+  CHECK(b.address.empty());
+  CHECK_EQ(b.placeholder, "looking it up\xe2\x80\xa6");
+  h.localAddress = "192.168.1.20:2049";
+
+  // the mapper's success line: the router's address, port open
+  h.publicAddress = "203.0.113.7:2049";
+  h.portmapPending = false;
+  b = uitext::hostBar(h);
+  CHECK_EQ(b.addressKey, "WAN");
+  CHECK_EQ(b.address, "203.0.113.7:2049");
+  CHECK(b.port == HostBar::Open);
+  CHECK_EQ(b.portText, "Port open");
+  CHECK(b.portTip.find("join at 203.0.113.7:2049") != std::string::npos);
+  CHECK(b.addressTip.find("192.168.1.20:2049") != std::string::npos);
+  // the router's address wins over the service's
+  h.lookedUpAddress = "198.51.100.4:2049";
+  h.lookupPending = false;
+  CHECK_EQ(uitext::hostBar(h).address, "203.0.113.7:2049");
+
+  // the mapper's private-address line: forwarded to a router that isn't on the internet
+  h.publicAddress.clear();
+  h.portmapNote = "NAT-PMP: router forwards TCP port 2049 to this machine, but the router's own internet address is 100.64.0.9, which is not public.";
+  b = uitext::hostBar(h);
+  CHECK_EQ(b.addressKey, "WAN"); // the service's address: the port may be forwarded by hand
+  CHECK_EQ(b.address, "198.51.100.4:2049");
+  CHECK(b.port == HostBar::Forward);
+  CHECK_EQ(b.portText, "Forward port 2049");
+  CHECK(b.portTip.find("(TCP) to this computer (192.168.1.20)") != std::string::npos);
+  CHECK(b.portTip.find("join at 198.51.100.4:2049") != std::string::npos);
+  CHECK(b.portTip.find("(The router said: NAT-PMP: router forwards") != std::string::npos);
+  CHECK(b.addressTip.find("once port 2049 is forwarded") != std::string::npos);
+
+  // the lookup's result alone (no router, or JAMSA_PORTMAP=off)
+  h.portmapNote.clear();
+  b = uitext::hostBar(h);
+  CHECK_EQ(b.address, "198.51.100.4:2049");
+  CHECK(b.port == HostBar::Forward);
+  CHECK(b.portTip.find("The router said") == std::string::npos);
+
+  // the mapper lost the forward: asking again, the service's address stays
+  h.portmapPending = true;
+  b = uitext::hostBar(h);
+  CHECK_EQ(b.address, "198.51.100.4:2049");
+  CHECK(b.port == HostBar::Asking);
+  h.portmapPending = false;
+
+  // no router, the service didn't answer: the LAN address, forward by hand
+  h.lookedUpAddress.clear();
+  b = uitext::hostBar(h);
+  CHECK_EQ(b.addressKey, "LAN");
+  CHECK_EQ(b.address, "192.168.1.20:2049");
+  CHECK_EQ(b.placeholder, "not known");
+  CHECK(b.port == HostBar::Forward);
+  CHECK(b.portTip.find("join at") == std::string::npos);
+
+  // someone joined from the internet: the port is open whatever the router said
+  h.joinedFromInternet = true;
+  b = uitext::hostBar(h);
+  CHECK(b.port == HostBar::Open);
+  CHECK(b.portTip.find("A player joined from the internet, so port 2049 is open") == 0);
+  h.lookedUpAddress = "198.51.100.4:2049";
+  b = uitext::hostBar(h);
+  CHECK(b.portTip.find("players join at 198.51.100.4:2049") != std::string::npos);
+  CHECK(b.addressTip.find("once port") == std::string::npos);
+}
+
 int main()
 {
   test_state();
   test_names();
   test_commands();
+  test_portmap_messages();
+  test_public_address_lookup();
+  test_host_bar();
   test_bar_math();
   test_bar_sync();
   test_tempo_follower();

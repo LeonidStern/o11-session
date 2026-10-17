@@ -15,8 +15,8 @@ Nothing in here derives from the GPL code of NINJAM (`ninjam/njclient*`,
 ## Building
 
 Needs CMake 3.25 or later, Ninja (or another generator) and a C++17 compiler.
-JUCE, Opus and FLAC are fetched by CMake (Opus and FLAC are built in and
-linked statically, as in `ninjam/vst3`; there is no Ogg or Vorbis). On Linux
+JUCE, Opus, FLAC, miniupnpc and libnatpmp are fetched by CMake (all built in
+and linked statically, as in `ninjam/vst3`; there is no Ogg or Vorbis). On Linux
 the JUCE GUI needs the X11, freetype and fontconfig development packages
 (`libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev
 libfreetype-dev libfontconfig-dev`).
@@ -38,8 +38,9 @@ checks the plug-in with pluginval.
 - `jamsa_core`: a static library with the engine wrapper (`engine.cpp`), the
   built-in server (`hostserver.cpp`), following the host (`hostsync.cpp`),
   the metronome's click (`click.cpp`) and the texts of the controls
-  (`uitext.cpp`). It needs only `juce_core`, `juce_audio_basics` and njproto,
-  so the tests link it without a plug-in host.
+  (`uitext.cpp`). It needs only `juce_core`, `juce_audio_basics` and njproto
+  (the engine and the port mapper), so the tests link it without a plug-in
+  host.
 - `Jamsa`: the VST3, from `jamsa_core` plus `processor.cpp` (the
   `juce::AudioProcessor`), `editor.cpp` and `views.cpp` (the editor).
 - `jamsa_unit_test` and `jamsa_e2e_test` (see Tests). njproto's own tests are
@@ -62,6 +63,18 @@ Everything the old plug-in did on its own, in the same way:
   from 2049, anonymous users with chat and vote, 120 BPM and 4 BPI to start,
   Opus and FLAC allowed, the host's Opus bitrate as the room's. A single vote
   changes the room's tempo, interval or codec, as before.
+- The room's addresses: the router is asked to forward the port (UPnP-IGD,
+  then NAT-PMP, with njproto's `PortMapper`, started and stopped with the
+  server; its `[portmap]` lines go to the chat), and a "what's my IP" service
+  (api.ipify.org, then checkip.amazonaws.com, over plain HTTP on a thread of
+  its own; `JAMSA_WHATSMYIP=host:port/path` points it elsewhere, `off` asks
+  nobody) is asked for the public address, for a port forwarded by hand. The
+  host bar's address box shows the address people connect to: the router's
+  when it forwarded the port (WAN), else the looked-up public address (WAN),
+  else the LAN address; the port text says "Port open" (also when a player
+  joined from the internet), "Asking the router…" or "Forward port N", with
+  the router's complaint in the tooltip. `JAMSA_PORTMAP=off` leaves the router
+  alone and `JAMSA_HOST_PORT=0` takes any free port (the tests).
 - Following the host ("Sync"): the intervals start on the host's bars while
   it plays at the room's tempo, with the interval playing when it starts
   shortened or lengthened once, and the room is voted to the host's tempo when
@@ -73,7 +86,8 @@ Everything the old plug-in did on its own, in the same way:
   limits and zoom, the same colours, fonts, texts and tooltips; the BPM box
   that drags and takes typed values, the BPI, codec and bitrate menus, the
   faders and pan knobs, the meters, the beat cells, the chat, the host bar
-  with the server's LAN address to copy, and the licence over everything.
+  with the server's address to copy and the port's state, and the licence over
+  everything.
 - The text commands of `Engine::command()` (`connect`, `disconnect`, `name`,
   `host`, `chat`, `license`, `transmit`, `monitor`, `metronome`, `bitrate`,
   `codec`, `follow`, `vote`, `status`, `users`, `chatlog`, `nextinterval`,
@@ -83,8 +97,13 @@ Everything the old plug-in did on its own, in the same way:
 
 - A player's channel you hear for the first time starts at 0 dB, as in the old
   plug-in (njproto's engine starts them at -12 dB on its own).
-- `status` no longer reports the Link, port mapping and WAN lookup fields
-  (`link*`, `public`, `lookedup`, `joinedfrominternet`); see below.
+- `status` no longer reports the Link fields (`link*`); see below. The port
+  mapping and lookup fields (`public`, `lookedup`, `joinedfrominternet`) are
+  there.
+- The host bar has one address box (the old plug-in showed the WAN address
+  only): it shows the LAN address until a public address is known, and
+  switches to WAN then. The plug-in joins its own room at `127.0.0.1`, not
+  `localhost` (which may resolve to `::1` while the server listens on IPv4).
 - The old plug-in loaded the plug-in to write its VST3 manifest at build time;
   here `VST3_AUTO_MANIFEST` is off, so the build never loads the plug-in. The
   host reads the plug-in's classes from the binary, as it does for plug-ins
@@ -99,9 +118,15 @@ Everything the old plug-in did on its own, in the same way:
   one is installed), the players' names, the text commands, the bar math and
   the bar sync against a simulated host (loops, moves, jitter, long runs),
   the tempo follower, the texts about the host, the click (shape, spectrum,
-  the same at 44.1, 48 and 96 kHz), and the controls' texts.
-- `jamsa_e2e_test`: two engine wrappers in one process, one hosting a room,
-  the other connecting to it; a 997 Hz tone through `process()` with a
+  the same at 44.1, 48 and 96 kHz), the controls' texts, and the room's
+  addresses: the port mapper's and the server's lines as read, the public
+  address lookup against a "what's my IP" service on localhost, and what the
+  host bar shows for each case (the router's address, a private one, pending,
+  the lookup's result, nothing). The port mapper itself is tested in njproto,
+  against a fake router.
+- `jamsa_e2e_test`: two engine wrappers in one process, one hosting a room
+  (on a free port, without the router or the lookup), the other connecting to
+  it; a 997 Hz tone through `process()` with a
   simulated clock, checked for an SNR of at least 35 dB on Opus and 60 dB
   after `codec flac`; the bitrate command reaching the room, transmit off
   giving silence, disconnecting and closing the room.
@@ -113,17 +138,13 @@ Not in this version; `ninjam/vst3` has them on its own stack:
 - Ableton Link (leading or following Link from the room's tempo and beats).
   The `follow` setting and the bar sync with the host are here; Link needs
   the Link SDK and the calibration of when the blocks are heard.
-- Port mapping of the built-in server (UPnP and NAT-PMP) and the WAN address
-  lookup: the host bar shows the LAN address and the port to forward by hand.
 - Live mode and CLAP.
-- On Windows the build is not expected to pass yet: njproto's sockets are
-  POSIX only (`poll.h`, `sys/socket.h`). The Windows job in the workflow is
-  written for when they are ported.
 
 ## Licence
 
 The plug-in's own sources (`jamsa/`) are by the Jamsa contributors. JUCE is
 available under the AGPLv3 or a commercial licence from JUCE; the plug-in is
 built without `JUCE_DISPLAY_SPLASH_SCREEN=0`, as the free licence requires.
-Opus and FLAC are BSD licensed; njproto is this repository's. Under which
+Opus, FLAC, miniupnpc and libnatpmp are BSD licensed; njproto is this
+repository's. Under which
 licence Jamsa itself is released is decided at release, by Leo.

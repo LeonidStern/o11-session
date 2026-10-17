@@ -1009,13 +1009,14 @@ void Engine::doSetHosting(bool on)
       m_hostLogSerial = 0;
       m_hostPort = HostServer::instance().state().port;
       addChat(ChatLine::System, "", "Hosting a server on port " + std::to_string(m_hostPort) + ".");
-      doConnect("localhost:" + std::to_string(m_hostPort), getSettings().userName);
+      // 127.0.0.1, not localhost: the server listens on IPv4, and localhost may resolve to ::1 first
+      doConnect("127.0.0.1:" + std::to_string(m_hostPort), getSettings().userName);
     }
     else addChat(ChatLine::Error, "", err);
   }
   else
   {
-    if (m_server == "localhost:" + std::to_string(m_hostPort)) doDisconnect("Disconnected from your server.");
+    if (m_server == "127.0.0.1:" + std::to_string(m_hostPort)) doDisconnect("Disconnected from your server.");
     addChat(ChatLine::System, "", "Stopping the server...");
     publish();
     HostServer::instance().stop(this);
@@ -1119,7 +1120,13 @@ void Engine::pollHosting(Snapshot &snap)
   {
     snap.hosting = true;
     snap.hostPort = st.port;
+    snap.hostPublicAddress = st.publicAddress;
     snap.hostLocalAddress = st.localAddress;
+    snap.hostNote = st.portmapNote;
+    snap.hostPortmapPending = st.portmapPending;
+    snap.hostLookedUpAddress = st.lookedUpAddress;
+    snap.hostLookupPending = st.lookupPending;
+    snap.hostJoinedFromInternet = st.joinedFromInternet;
     snap.hostUsers = st.users;
     for (const std::string &m : HostServer::instance().messagesSince(&m_hostLogSerial))
       addChat(ChatLine::Server, "", m);
@@ -1354,16 +1361,22 @@ std::string Engine::command(const std::string &lineIn)
     Snapshot s;
     getSnapshot(s);
     char buf[1536];
-    int n = snprintf(buf, sizeof(buf), "state=%s server=%s user=%s bpm=%.1f bpi=%d pos=%d len=%d codec=%s upload=%s kbps=%d users=%d hosting=%d port=%d local=%s license=%d audio=%d",
+    int n = snprintf(buf, sizeof(buf), "state=%s server=%s user=%s bpm=%.1f bpi=%d pos=%d len=%d codec=%s upload=%s kbps=%d users=%d hosting=%d port=%d public=%s local=%s license=%d audio=%d",
                      state_name(s.state), s.server.c_str(), s.userName.c_str(), (double)s.bpm, s.bpi, s.intervalPos, s.intervalLength,
                      s.roomCodec.empty() ? "-" : s.roomCodec.c_str(), s.uploadCodec.empty() ? "-" : s.uploadCodec.c_str(),
                      s.sendKbps, (int)s.users.size(), s.hosting ? 1 : 0, s.hostPort,
+                     s.hostPublicAddress.empty() ? (s.hostPortmapPending ? "?" : "-") : s.hostPublicAddress.c_str(),
                      s.hostLocalAddress.empty() ? "-" : s.hostLocalAddress.c_str(), s.licensePending ? 1 : 0, s.audioRunning ? 1 : 0);
     if (n > 0 && n < (int)sizeof(buf))
       snprintf(buf + n, sizeof(buf) - (size_t)n, " follow=%d hosttempo=%.3f bars=%s barerr=%.3f barfixes=%d tempovotes=%d ownkbps=%d roomkbps=%d",
                s.followTempo ? 1 : 0, s.hostTempo, bar_state_name(s.barState), s.barErrorMs, s.barFixes, s.tempoVotes,
                s.opusKbps, s.roomOpusKbps);
-    return buf;
+    // the public address from the "what's my IP" service ("?" while it is asked), and whether a
+    // player joined from the internet (so the port is open, whatever the router said)
+    std::string out = buf;
+    out += " lookedup=" + (s.hostLookedUpAddress.empty() ? std::string(s.hostLookupPending ? "?" : "-") : s.hostLookedUpAddress);
+    out += std::string(" joinedfrominternet=") + (s.hostJoinedFromInternet ? "1" : "0");
+    return out;
   }
   if (verb == "users")
   {
