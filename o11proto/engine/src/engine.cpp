@@ -40,7 +40,10 @@ void PlaybackResampler::advance(int srcRate, int dstRate, int len, int consumed)
 
 // ------------------------------------------------------------- lifecycle
 
-Engine::Engine() { wireClient(); }
+Engine::Engine() {
+    wireClient();
+    liveInit();
+}
 
 Engine::~Engine() {
     suppress_ = true;
@@ -86,6 +89,7 @@ void Engine::wireClient() {
         has_mask_.store(true);
     };
     client_.on_userinfo = [this](const UserInfoRecord& rec) { handleUserInfo(rec); };
+    client_.on_live = [this](const live::ServerLive& m) { liveMessage(m); };
     client_.on_download_begin = [this](const DownloadBegin& d) { handleDownloadBegin(d); };
     client_.on_download_data = [this](const Guid& g, const std::vector<std::uint8_t>& b) {
         handleDownloadData(g, b, false);
@@ -135,6 +139,7 @@ void Engine::connect(const std::string& host, std::uint16_t port, const std::str
     o.max_server_version = 0x00030000;
     o.login_when_licence_refused = true;
     o.auto_subscribe = false;
+    o.live = live_enabled_.load();
     client_.setChannels(channelList());
     if (!client_.connect(host, port, o)) {
         std::lock_guard<std::mutex> lock(text_mutex_);
@@ -144,6 +149,7 @@ void Engine::connect(const std::string& host, std::uint16_t port, const std::str
 }
 
 void Engine::resetConnectionState() {
+    liveReset();
     got_challenge_ = logged_in_ = got_config_ = false;
     maxchan_.store(0);
     codec_mask_.store(0);
@@ -212,6 +218,7 @@ bool Engine::run() {
     messages_ = 0;
     if (client_.state() != Client::State::Disconnected && client_.state() != Client::State::Failed)
         client_.poll(0);
+    liveControl();
     checkDownloadTimeouts();
     bool uploaded = uploadLoop();
     collectGarbage();
@@ -794,6 +801,7 @@ void Engine::process(const float* const* in, int numIn, float* const* out, int n
         interval_started_.store(false);          // first boundary at the start of this block
         loop_count_.store(0);
     }
+    liveAudioBlock(in, numIn, frames, sampleRate);
 
     if (!running_.load()) {
         mixLocal(in, numIn, out, numOut, frames, sampleRate);
@@ -812,6 +820,7 @@ void Engine::process(const float* const* in, int numIn, float* const* out, int n
         for (int c = 0; c < numIn; ++c) inp[c] = in[c] + pos;
         for (int c = 0; c < numOut; ++c) outp[c] = out[c] + pos;
         mixRemote(outp, numOut, piece, sampleRate);
+        mixLive(outp, numOut, piece, pos, sampleRate);
         mixLocal(inp, numIn, outp, numOut, piece, sampleRate);
         mixMetronome(outp, numOut, piece, sampleRate);
         interval_pos_.store(interval_pos_.load() + piece);
@@ -839,6 +848,7 @@ void Engine::boundary(int sampleRate) {
     next_beat_ = 0;
     beat_index_ = 0;
     uploadBoundary();
+    liveBoundary();
     newIntervalStep();
 }
 
@@ -934,6 +944,7 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
             float vol = std::min(4.0f, std::max(0.0f, u->volume * rc.volume));
             float pan = std::min(1.0f, std::max(-1.0f, u->pan + rc.pan));
             bool muted = any_solo ? !rc.solo : (rc.mute || u->mute);
+            if (&rc == &u->ch[0] && liveCovers(*u)) muted = true;   // heard live instead (engine_live.cpp)
             Decoder& dec = *rc.current;
             int srcRate = dec.rate();
             int needed = rc.rs.needed(srcRate, sampleRate, len);

@@ -1,7 +1,8 @@
 // o11proto engine - the NINJAM client engine (ENGINE.md revision 1).
 //
 // Two contexts: the audio context calls process(); the control context calls
-// run() and everything else. See ENGINE.md section 2.
+// run() and everything else. See ENGINE.md section 2. Live mode (section 16)
+// adds a network thread of its own, which the application never sees.
 #ifndef O11PROTO_ENGINE_H
 #define O11PROTO_ENGINE_H
 
@@ -51,6 +52,8 @@ inline void panGains(float pan, float* left, float* right) {
     *left = pan > 0 ? 1.0f - pan : 1.0f;
     *right = pan < 0 ? 1.0f + pan : 1.0f;
 }
+
+struct LiveLayer;                                 // Live mode's state (engine/src/live_layer.h)
 
 // Interval length of ENGINE.md 4.3, computed exactly as the reference does.
 inline int intervalLengthFor(int bpm, int bpi, int sampleRate) {
@@ -168,6 +171,23 @@ public:
     void admin(const std::string& command);
     void sendChat(const std::array<std::string, 5>& fields);
 
+    // ---- Live mode (section 16): real-time audio over UDP on servers that
+    // have it, in place of each Live player's channel 0 intervals.
+    // Notices come from run(); `error` marks lines shown in the error style.
+    std::function<void(const std::string& text, bool error)> onLiveNotice;
+    void setLiveEnabled(bool v) { live_enabled_.store(v); }   // announce Live at the next connect() (default on)
+    bool liveEnabled() const { return live_enabled_.load(); }
+    void setLiveBufferMs(int ms);               // the jitter buffer setting, 5..200 (default 20)
+    int liveBufferMs() const { return live_setting_ms_.load(); }
+    int liveBufferInUseMs() const;              // B: the setting, raised for long host blocks
+    // The saved `live_buffer_ms=` value: false unless a whole number; clamped to 5..200.
+    static bool parseLiveBufferSetting(const std::string& value, int* ms);
+    bool liveCommand(const std::string& text);  // "/live ...": answered here (true), never sent
+    void setLiveHostState(bool playing, bool offline);   // the host's transport and offline rendering
+    bool liveRunning() const;                   // the Live client (its UDP socket) runs
+    bool userLive(int user) const;              // this user's channel 0 is heard live now
+    void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
+
 private:
     struct UploadBlock {
         enum Kind { Audio, End, Silence } kind = Audio;
@@ -225,6 +245,13 @@ private:
         bool mute = false;
         std::uint32_t submask = 0;
         std::array<RemoteChannel, kMaxChannels> ch;
+        // Live mode: what the control context wants (a slot and its
+        // generation, or -1) and what the mixer plays, taken at a boundary.
+        int live_want = -1;
+        std::uint32_t live_want_gen = 0;
+        int live_slot = -1;
+        std::uint32_t live_gen = 0;
+        std::atomic<bool> live_now{false};
     };
     struct Download {
         std::string user;
@@ -306,6 +333,25 @@ private:
     std::atomic<int> metro_out_{0};
 
     std::vector<float> mix_tmp_;
+
+    // Live mode (engine_live.cpp, live_layer.cpp).
+    struct LiveDeleter {
+        void operator()(LiveLayer* p) const;
+    };
+    void liveInit();
+    void liveMessage(const live::ServerLive& m);
+    void liveControl();                         // run()
+    void liveReset();
+    void liveStatus();
+    void liveNotice(const std::string& text, bool error);
+    double liveOneWayMs(int slot, double* buffer_ms, double* network_ms, double* codec_ms) const;
+    void liveAudioBlock(const float* const* in, int numIn, int frames, int sampleRate);   // process()
+    void liveBoundary();                        // boundary(), before newIntervalStep()
+    bool liveCovers(const RemoteUser& u) const; // channel 0's interval is muted for Live
+    void mixLive(float* const* out, int numOut, int len, int at, int sampleRate);
+    std::atomic<bool> live_enabled_{true};
+    std::atomic<int> live_setting_ms_{20};
+    std::unique_ptr<LiveLayer, LiveDeleter> live_;   // last: its network thread stops first
 };
 
 }  // namespace engine

@@ -55,6 +55,8 @@ public:
     bool start(const Options& o, std::string& error);
     void stop();                               // joins the thread; a no-op when stopped
     bool running() const;
+    // Any thread: changes Options::test_receive_loss while running.
+    void setTestReceiveLoss(double fraction);
 
     // Network thread only. One data datagram to `dest` (0 = the room's
     // other senders); false when the payload is empty or too long, or the

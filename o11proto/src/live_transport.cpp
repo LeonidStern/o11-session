@@ -22,13 +22,15 @@ struct Transport::Impl {
     std::uint64_t stamps[kHelloTimestamps] = {};   // the last hellos' timestamps
     int next_stamp = 0;
     TimePoint last_hello;
-    std::uint32_t rng = 0x9e3779b9u;              // the test loss's generator
+    std::atomic<double> loss{0};                   // the test hook
+    std::uint32_t rng = 0x9e3779b9u;              // and its generator
     bool lose() {
-        if (opt.test_receive_loss <= 0) return false;
+        const double l = loss.load(std::memory_order_relaxed);
+        if (l <= 0) return false;
         rng ^= rng << 13;
         rng ^= rng >> 17;
         rng ^= rng << 5;
-        return (rng & 0xFFFFFF) < static_cast<std::uint32_t>(opt.test_receive_loss * 16777216.0);
+        return (rng & 0xFFFFFF) < static_cast<std::uint32_t>(l * 16777216.0);
     }
 };
 
@@ -45,6 +47,7 @@ Transport::Transport() : impl_(new Impl) {}
 Transport::~Transport() { stop(); }
 
 bool Transport::running() const { return impl_->running; }
+void Transport::setTestReceiveLoss(double fraction) { impl_->loss.store(fraction); }
 
 bool Transport::start(const Options& o, std::string& error) {
     stop();
@@ -75,6 +78,7 @@ bool Transport::start(const Options& o, std::string& error) {
     for (auto& s : m.stamps) s = 0;
     m.next_stamp = 0;
     m.rng = 0x9e3779b9u ^ o.peer_id;
+    m.loss.store(o.test_receive_loss);
     answered_.store(false);
     rtt_ms_.store(-1.0);
     cookie_.store(0);

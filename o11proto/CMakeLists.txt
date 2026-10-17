@@ -72,6 +72,10 @@ if(O11PROTO_BUILD_ENGINE)
     engine/src/opus_codec.cpp
     engine/src/flac_codec.cpp
     engine/src/engine.cpp
+    engine/src/engine_live.cpp
+    engine/src/live_layer.cpp
+    engine/src/live_sink.cpp
+    engine/src/live_aoo.cpp
   )
   target_include_directories(o11proto_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # A parent project that builds the codecs itself (the O11 Session plug-in) defines the targets
@@ -94,6 +98,16 @@ if(O11PROTO_BUILD_ENGINE)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(${t} o11proto_engine)
     add_test(NAME ${t} COMMAND ${t})
+  endforeach()
+
+  # Live mode (ENGINE.md section 16): the unit tests reach the engine's internal headers.
+  foreach(t test_engine_live_units test_engine_live)
+    add_executable(${t} engine/tests/${t}.cpp)
+    target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                                            ${CMAKE_CURRENT_SOURCE_DIR}/engine/src)
+    target_link_libraries(${t} o11proto_engine)
+    add_test(NAME ${t} COMMAND ${t})
+    set_tests_properties(${t} PROPERTIES TIMEOUT 300)
   endforeach()
 endif()
 
