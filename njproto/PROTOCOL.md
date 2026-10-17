@@ -1,6 +1,6 @@
 # NINJAM protocol specification
 
-Revision 2, 2026-10-16 (revision 1 plus the exact server texts and defaults found by running a clean-room implementation against the reference; see section 14). Written from the behaviour of the NINJAM server and client in the Jamsa repository (`LeonidStern/Jamsa`, commit `e040ae1`), including the Jamsa extensions (codec negotiation and the room bitrate). It describes what goes over the wire and how each side must behave; it contains no code. It is meant to be enough to write a new client or server from scratch that works with existing NINJAM clients (ReaNINJAM, JamTaba, JamWide, the original NINJAM clients) and with the Jamsa server and plug-in.
+Revision 2b, 2026-10-17 (revision 1 plus the exact server texts and defaults found by running a clean-room implementation against the reference; see section 14). Written from the behaviour of the NINJAM server and client in the Jamsa repository (`LeonidStern/Jamsa`, commit `e040ae1`), including the Jamsa extensions (codec negotiation and the room bitrate). It describes what goes over the wire and how each side must behave; it contains no code. It is meant to be enough to write a new client or server from scratch that works with existing NINJAM clients (ReaNINJAM, JamTaba, JamWide, the original NINJAM clients) and with the Jamsa server and plug-in.
 
 Where this spec says "Jamsa extension", original NINJAM software doesn't know the feature and ignores it. Everything else is the protocol as Cockos defined it in 2005.
 
@@ -297,7 +297,8 @@ Used by ReaNINJAM to sync a DAW timeline. Audio is uploaded in **2-second** chun
 | fourcc | Bytes | Stream |
 |---|---|---|
 | `OGGv` | `O G G v` | Ogg Vorbis. One complete Ogg logical stream per interval: identification, comment and setup headers, then audio pages; new random serial number for each interval. Every NINJAM client plays this; it is the only codec without the Jamsa extension. |
-| `OPUS` | `O P U S` | Ogg Opus as in RFC 7845: `OpusHead` and `OpusTags` headers, then 20 ms Opus packets, 48 kHz. The encoder's pre-skip is in `OpusHead`; the last packet's granule position marks the end of the real audio and the decoder trims the padding after it (the padding is an extrapolation of the audio, which a client may use for its crossfade). Jamsa extension. |
+| `OPUr` | `O P U r` | Raw Opus (Jamsa, revision 2b): a 12-byte header (`u8` version 1, `u8` channels, `u16` pre-skip in 48 kHz samples, `u32` input sample rate, `u32` reserved 0), then 20 ms Opus packets at 48 kHz each prefixed by its `u16` length, then a trailer `u16` 0 and `u32` the count of real samples after the pre-skip; the decoder trims what follows (an extrapolation of the audio, usable for a crossfade). All little-endian. Needs the same `0x100` capability as `OPUS`: a server maps both fourccs to it. The new engine sends and decodes only this form. |
+| `OPUS` | `O P U S` | Ogg Opus as in RFC 7845 (the original Jamsa plug-in's form): `OpusHead` and `OpusTags` headers, then 20 ms Opus packets, 48 kHz. The encoder's pre-skip is in `OpusHead`; the last packet's granule position marks the end of the real audio and the decoder trims the padding after it (the padding is an extrapolation of the audio, which a client may use for its crossfade). Jamsa extension. |
 | `FLAC` | `F L A C` | Native FLAC: the `fLaC` marker, a STREAMINFO block, then frames. Not in Ogg. Lossless. Jamsa extension. |
 
 Mono or stereo, any sample rate the container allows; the stream's own headers say which. The Jamsa Opus encoder uses constrained VBR at the room's bitrate (section 8.3).
@@ -450,7 +451,7 @@ A server can run in lobby mode: logins land in a lobby where no audio flows and 
 | BPM | admin 20-400, votes 40-400 |
 | BPI | admin 2-1024, votes 2-64 |
 | Opus bitrate | 32-510 kbps |
-| Codec capability bits | `0x100` Opus, `0x200` FLAC; bits 8-15 reserved for codecs |
+| Codec capability bits | `0x100` Opus (fourcc `OPUS` or `OPUr`), `0x200` FLAC; bits 8-15 reserved for codecs |
 
 ## 12. Compatibility notes for a new implementation
 
@@ -481,6 +482,7 @@ A new client or server should pass these against the existing ones (the Jamsa re
 
 ## 14. Revision history
 
+- **Revision 2b (2026-10-17):** fourcc `OPUr`, raw Opus packets with length prefixes (7.8); servers map it to the `0x100` capability like `OPUS`.
 - **Revision 2a (2026-10-16):** two more findings from the same comparison: chat messages always carry five strings (9), and CODEC_MASK is only resent when it changes (8.1).
 - **Revision 2 (2026-10-16):** a clean-room implementation written from revision 1 was run against the reference server and client. Audio, login, channels, subscriptions and forwarding matched at once; the differences were all in things revision 1 left open, now fixed in the text: the exact `[server]` and `[voting system]` chat texts and the fact that they are `MSG` lines with an empty user (8.5, 9.4, 9.5); the default Opus bitrate of 128 kbps; anonymous users don't get multiple logins unless configured; the same-name replacement runs before the capacity check; `!codec` may switch between allowed codecs under RequireCodec.
 - **Revision 1 (2026-10-16):** first version, written from the Jamsa repository at `e040ae1`.

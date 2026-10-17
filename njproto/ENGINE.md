@@ -1,6 +1,6 @@
 # NINJAM client engine specification
 
-Revision 1a, 2026-10-17. Companion to `PROTOCOL.md` (revision 2a), which this
+Revision 2, 2026-10-17. Companion to `PROTOCOL.md` (revision 2b), which this
 document builds on and never repeats: wire formats, message types, login,
 codec negotiation and chat are defined there, by section number.
 
@@ -364,17 +364,22 @@ whole interval. Remote players never get a partial interval.
 Both produce one complete stream per interval, cut exactly at the interval's
 sample count, so the receiver can play intervals back to back.
 
-**Opus** (fourcc `OPUS`, Ogg Opus as in RFC 7845):
+**Opus** (fourcc `OPUr`, raw Opus packets, protocol 7.8; no Ogg and no
+container library):
 
 - Encoder at 48000 Hz, 1 or 2 channels, application "audio", complexity 10,
-  signal type music, constrained VBR at the interval's bitrate. The encoder's
-  lookahead becomes the `pre_skip` of `OpusHead`; `OpusHead` carries the
-  *input* sample rate, output gain 0, channel mapping family 0. `OpusTags`
-  has a vendor string and no comments. Each is its own Ogg page; the first has
-  the beginning-of-stream flag.
-- Frames of 960 samples (20 ms). Each packet's granule position is the number
-  of 48 kHz samples encoded so far including the pre-skip, except the last
-  (below).
+  signal type music, constrained VBR at the interval's bitrate.
+- The stream begins with a **12-byte header**: `u8` version = 1, `u8`
+  channels (1 or 2), `u16` pre-skip (the encoder's lookahead in 48 kHz
+  samples), `u32` input sample rate (informational, like `OpusHead`), `u32`
+  reserved = 0. Little-endian, as everything on the wire.
+- Then **packets**, each as `u16` length (1..65535) followed by that many
+  bytes of one Opus packet of 960 samples (20 ms). Frames are counted by
+  packet: packet *k* starts at 48 kHz sample `960 k` of the decoded stream.
+- The stream ends with a **trailer**: `u16` 0, then `u32` `real`, the number
+  of real 48 kHz samples after the pre-skip. A stream that stops without a
+  trailer (the sender left) is played to its last whole packet with no
+  trimming.
 - Input at another rate is resampled to 48000 Hz with a windowed-sinc (or
   equally good) resampler whose state **persists across intervals** of the
   same encoder, so the stream of one interval begins exactly where the
@@ -389,16 +394,15 @@ sample count, so the receiver can play intervals back to back.
   of the audio (order 24, fitted to the last 1024 samples of each channel,
   with a mild lag window and bandwidth expansion for stability), kept at full
   level for the first 128 samples and then faded out with a raised cosine over
-  the rest. The last packet's granule position is `real + pre_skip` and
-  carries the end-of-stream flag, so a decoder trims the padding; a NINJAM
+  the rest. The trailer's `real` lets the decoder trim the padding; a NINJAM
   decoder uses the trimmed part for the crossfade (section 8.3). The reference
   takes its predictor fit from libvorbis' `lpc.c` (BSD); any Levinson-Durbin
   fit of the same order on the same data serves.
-- Output bytes are the Ogg pages, as the Ogg library produces them (pages are
-  flushed after the headers and at the end; otherwise written when the
-  library decides a page is full).
+- Output bytes are written as produced: the header at once, each packet as
+  soon as it is encoded, the trailer at the end. Overhead is 2 bytes per
+  packet.
 
-**FLAC** (fourcc `FLAC`, native FLAC, no Ogg):
+**FLAC** (fourcc `FLAC`, native FLAC):
 
 - 16-bit samples at the engine's sample rate (no resampling), 1 or 2
   channels, compression level 5, verify off, the "streamable subset" when the
@@ -493,12 +497,13 @@ the trailing audio the stream carried past its real end, used for the
 crossfade (section 8.3). Feeding it the partial data of a stream must never
 fail: it decodes what it can and resumes when more arrives.
 
-**Opus:** Ogg pages are demultiplexed; `OpusHead` gives channels, pre-skip
-and output gain (applied as 10^(gain/(20×256))); packets after the two header
-packets are decoded at 48000 Hz; the first `pre_skip` samples are dropped. On
-the page with the end-of-stream flag, samples past the page's granule position
-are not output but kept as the lapping frames. A stream with channel mapping
-family ≠ 0 or more than two channels is bad and decodes to nothing.
+**Opus:** the 12-byte header gives channels and pre-skip (`rate()` reports
+48000); packets are decoded at 48000 Hz as each one's length and bytes have
+fully arrived; the first `pre_skip` samples are dropped. On the trailer,
+samples past `real` are not output but kept as the lapping frames. A stream
+with version ≠ 1, channels not 1 or 2, or a packet length of more than
+65535 bytes (impossible by construction) or that libopus refuses is bad and
+decodes to nothing from that point.
 
 **FLAC:** STREAMINFO gives channels (more than two: only the first two are
 used), bit depth and sample rate. The library in use may not resume from a
@@ -651,6 +656,7 @@ numbers from any thread):
 | download timeout | 8 s |
 | crossfade length | ≤ 128 frames |
 | Opus rate / frame | 48000 Hz / 960 samples |
+| Opus stream | `OPUr`: 12-byte header, `u16` length + packet, trailer `u16` 0 + `u32` real |
 | Opus padding | LPC order 24 from 1024 samples, 128 full-level |
 | FLAC | 16 bit, level 5, TPDF 1 LSB |
 | meter decay | -36 dB/s |
@@ -717,14 +723,16 @@ also be run against the reference server)**
     arrived during the stall, slot 1 the newest).
 14. Against the reference client (`ninjam/tests/njclient_e2e` sender or
     listener, run by a tester who may read both): engine listener with
-    reference sender and the reverse both reach SNR ≥ 35 dB with Opus.
+    reference sender and the reverse both reach SNR ≥ 60 dB with FLAC. (Opus
+    no longer interoperates with the reference: `OPUr` is not Ogg. The
+    reference ignores it, and the engine ignores the reference's `OPUS`.)
 
 ## 14. Deliverables and dependencies
 
 - A library on top of the njproto client (`include/njproto/engine.h` and
   friends, in the same CMake project, target `njproto_engine`), C++17, no
-  dependency besides the standard library, POSIX sockets, **libopus, libogg
-  and libFLAC** (all BSD-licensed; found with `find_package`/`pkg-config`,
+  dependency besides the standard library, POSIX sockets, **libopus and
+  libFLAC** (both BSD-licensed; no libogg, the Opus framing is the engine's own; found with `find_package`/`pkg-config`,
   with a CMake option to build the engine at all so the protocol library still
   builds without them).
 - Unit tests for sections 13.1-13.9 under `ctest`.
@@ -746,6 +754,10 @@ also be run against the reference server)**
 
 - **1** (2026-10-16): first version, from the behaviour of the reference client
   as the Jamsa plug-in uses it.
+- **2** (2026-10-17): Opus intervals are raw packets with a 2-byte length
+  prefix, fourcc `OPUr` (6.4, 8.1); libogg is no longer a dependency; test
+  13.14 is FLAC only. Decided because the new plug-in does not need to
+  interoperate with Ogg-based NINJAM clients.
 - **1a** (2026-10-17): clarifications after the first implementation: exact
   boundary semantics (4.4), exact resampler positions and undithered exact
   values (6.4), playback phase reset (8.5), tests 13.3, 13.10 and 13.13
