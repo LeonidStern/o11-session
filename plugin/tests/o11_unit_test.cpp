@@ -135,6 +135,27 @@ static void test_state()
   CHECK(offLoaded.deserialize(off.serialize()));
   CHECK(!offLoaded.followHostTempo);
   CHECK(e.followHostTempo);
+
+  // Live's jitter buffer: 20 ms by default and in older states, one of the choices when loaded
+  CHECK_EQ(Settings().liveBufferMs, 20);
+  CHECK_EQ(old.liveBufferMs, 20);
+  struct { const char *saved; int ms; } buffers[] = {
+    { "10", 10 }, { "40", 40 }, { "100", 100 }, { "33", 30 }, { "5", 10 }, { "200", 100 }, { "999", 100 },
+    { "abc", 20 }, { "", 20 }, { "30ms", 20 }, { "-40", 20 },
+  };
+  for (auto &b : buffers)
+  {
+    Settings k;
+    CHECK(k.deserialize(std::string("O11-SESSION-STATE 1\nlive_buffer_ms=") + b.saved + "\n"));
+    CHECK_EQ(k.liveBufferMs, b.ms);
+  }
+  Settings longer;
+  longer.liveBufferMs = 60;
+  Settings longerLoaded;
+  CHECK(longerLoaded.deserialize(longer.serialize()));
+  CHECK_EQ(longerLoaded.liveBufferMs, 60);
+  CHECK_EQ(Settings::nearestLiveBufferMs(25), 20);
+  CHECK_EQ(Settings::nearestLiveBufferMs(70), 60);
 }
 
 static void test_names()
@@ -864,6 +885,16 @@ static void test_uitext()
   CHECK_EQ(joinedText(12.7), std::string("joined 12 s ago"));
   CHECK_EQ(dropoutsText(1), std::string("1 dropout"));
   CHECK_EQ(dropoutsText(3), std::string("3 dropouts"));
+  // Live: the Buffer and Mode boxes, and what the room waits for
+  CHECK_EQ(msText(20), std::string("20 ms"));
+  CHECK_EQ(liveModeText(true, 28), std::string("Live 28 ms"));
+  CHECK_EQ(liveModeText(true, -1), std::string("Live"));
+  CHECK_EQ(liveModeText(false, 28), std::string("Intervals"));
+  CHECK_EQ(liveWaitText(1, "Anna"), std::string("Intervals: Anna's connection"));
+  CHECK_EQ(liveWaitText(1, "You"), std::string("Intervals: your connection"));
+  CHECK_EQ(liveWaitText(2, "Carol"), std::string("Intervals: Carol can't play Live"));
+  CHECK_EQ(liveWaitText(3, "Sam"), std::string("Intervals while Sam joins"));
+  CHECK_EQ(liveWaitText(0, "Anna"), std::string(""));
   CHECK_EQ(ageText(0), std::string("now"));
   CHECK_EQ(ageText(4.9), std::string("now"));
   CHECK_EQ(ageText(12.2), std::string("12 s"));
@@ -965,6 +996,29 @@ static void test_room_events()
   CHECK_EQ(e.text, "Error: something broke");
   // people's chat and the rest are not the list's
   CHECK(!ev(LineKind::Other, "hello").shown);
+
+  // Live: the room's switch, and the whole room going Live or back on intervals
+  e = ev(LineKind::Server, "[server] anna@203.0.113.9 turned Live on: O11 Session players now hear each other in real time.");
+  CHECK(e.shown && e.tone == RoomEvent::Change);
+  CHECK_EQ(e.text, "anna turned Live on");
+  CHECK_EQ(ev(LineKind::Server, "[server] anna@203.0.113.9 turned Live off: everyone hears each other through intervals again.").text,
+           "anna turned Live off");
+  e = ev(LineKind::Live, "The room is Live now, about 28 ms late.");
+  CHECK(e.shown && e.tone == RoomEvent::Change);
+  CHECK_EQ(e.text, "The room went Live: 28 ms late");
+  CHECK_EQ(ev(LineKind::Live, "The room is Live now.").text, "The room went Live");
+  e = ev(LineKind::Live, "The room is back on intervals: anna@203.0.113.9's connection had dropouts.");
+  CHECK(e.shown && e.tone == RoomEvent::Warn);
+  CHECK_EQ(e.text, "Back on intervals: anna's connection");
+  CHECK_EQ(ev(LineKind::Live, "The room is back on intervals: your connection had dropouts.").text, "Back on intervals: your connection");
+  CHECK_EQ(ev(LineKind::Live, "The room is back on intervals while sam@198.51.100.4 joins.").text, "Intervals while sam joins");
+  CHECK_EQ(ev(LineKind::Live, "The room is on intervals: carol@198.51.100.7 can't do Live.").text, "Intervals: carol can't play Live");
+  CHECK_EQ(ev(LineKind::Live, "The room is on intervals: your client can't do Live.").text, "Intervals: your client can't play Live");
+  CHECK_EQ(ev(LineKind::Live, "Live: the server doesn't answer on UDP port 2049 (a firewall?)").text,
+           "No Live: the server's UDP port doesn't answer");
+  // Live's answers to /live and its hints are the Mode box's
+  CHECK(!ev(LineKind::Live, "Live is on. Jitter buffer 20 ms").shown);
+  CHECK(!ev(LineKind::Live, "This server has Live mode: type !live on, and the O11 Session players in the room hear each other").shown);
 }
 
 // the port mapper's lines and the server's, as HostServer reads them

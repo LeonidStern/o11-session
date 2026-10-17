@@ -131,12 +131,21 @@ static float clamp_volume(float v) { return v != v ? 1.0f : std::min(std::max(v,
 static float clamp_pan(float v) { return v != v ? 0.0f : std::min(std::max(v, -1.0f), 1.0f); }
 
 constexpr int Settings::OPUS_KBPS[];
+constexpr int Settings::LIVE_BUFFER_MS[];
 
 int Settings::nearestOpusKbps(int kbps)
 {
   int best = DEFAULT_OPUS_KBPS;
   for (int k : OPUS_KBPS)
     if (abs(k - kbps) < abs(best - kbps)) best = k;
+  return best;
+}
+
+int Settings::nearestLiveBufferMs(int ms)
+{
+  int best = DEFAULT_LIVE_BUFFER_MS;
+  for (int b : LIVE_BUFFER_MS)
+    if (abs(b - ms) < abs(best - ms)) best = b;
   return best;
 }
 
@@ -152,6 +161,7 @@ std::string Settings::serialize() const
   s += std::string("transmit=") + (transmit ? "1" : "0") + "\n";
   s += "opus_kbps=" + std::to_string(opusKbps) + "\n";
   s += std::string("follow_host_tempo=") + (followHostTempo ? "1" : "0") + "\n";
+  s += "live_buffer_ms=" + std::to_string(liveBufferMs) + "\n";
   if (editorWidth > 0 && editorHeight > 0) s += "editor_window=" + std::to_string(editorWidth) + "x" + std::to_string(editorHeight) + "\n";
   for (auto &r : remote)
     s += "remote=" + escape(r.first) + "\t" + num(r.second.volume) + "\t" + num(r.second.pan) + "\t" + (r.second.mute ? "1" : "0") + "\n";
@@ -181,6 +191,11 @@ bool Settings::deserialize(const std::string &data)
     else if (key == "monitor") s.monitor = value == "1";
     else if (key == "transmit") s.transmit = value == "1";
     else if (key == "follow_host_tempo") s.followHostTempo = value == "1";
+    else if (key == "live_buffer_ms")
+    {
+      int ms = 0;
+      if (o11proto::engine::Engine::parseLiveBufferSetting(value, &ms)) s.liveBufferMs = nearestLiveBufferMs(ms);
+    }
     else if (key == "opus_kbps")
     {
       char *end = nullptr;
@@ -320,6 +335,10 @@ Engine::Engine()
     return o11proto::engine::LicenceAnswer::Defer;
   };
   m_client->onChat = [this](const std::array<std::string, 5> &fields) { onChat(fields); };
+  // Live's own lines (the room went Live, or back on intervals), from run() on the network thread
+  m_client->onLiveNotice = [this](const std::string &text, bool error) {
+    addChat(error ? ChatLine::Error : ChatLine::Live, "", text);
+  };
 
   // our input, in stereo (source channels 0 and 1); the plug-in monitors it itself, so the
   // engine's monitoring of it is muted
@@ -434,6 +453,8 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
   // a stopped host: we send silence (and the network thread stops sending at the next interval)
   const bool stopped = timing && timing->transport && !timing->offline && !timing->position.playing;
   m_hostStopped.store(stopped, std::memory_order_relaxed);
+  // Live sends only while the host plays, and nothing while it renders offline
+  m_client->setLiveHostState(!stopped, timing && timing->offline);
   const bool monitor = m_monitor.load(std::memory_order_relaxed) && !m_client->anySolo();
 
   // the host's bars: the interval playing now may end a little early or late, so the next
@@ -796,6 +817,24 @@ void Engine::setHostName(const std::string &name)
   m_hostName = name;
 }
 
+void Engine::setRoomLive(bool on)
+{
+  post([this, on]() {
+    if (m_state == ConnState::Connected) m_client->say(on ? "!live on" : "!live off");
+  });
+}
+
+void Engine::setLiveBuffer(int ms)
+{
+  const int b = Settings::nearestLiveBufferMs(ms);
+  {
+    std::lock_guard<std::mutex> lock(m_settingsMutex);
+    if (m_settings.liveBufferMs == b) return;
+    m_settings.liveBufferMs = b;
+  }
+  post([this]() { applyLocalSettings(); });
+}
+
 void Engine::setRemote(const std::string &user, int channel, RemoteField field, float value)
 {
   const std::string key = remoteKey(user, channel);
@@ -888,6 +927,7 @@ void Engine::applyLocalSettings()
   m_clickVolume = s.metronomeMute ? 0.0f : s.metronomeVolume;
   // the engine monitors the input itself (process()), so it goes on while the host is stopped
   m_monitor = s.monitor;
+  if (m_client->liveBufferMs() != s.liveBufferMs) m_client->setLiveBufferMs(s.liveBufferMs);
 
   applySendKbps();
   applyBroadcast();
@@ -1315,6 +1355,8 @@ void Engine::publish()
   snap.status = m_statusText.empty() ? "Not connected" : m_statusText;
   snap.server = m_server;
   snap.opusKbps = getSettings().opusKbps;
+  snap.liveBufferMs = getSettings().liveBufferMs;
+  snap.liveBufferInUseMs = m_client->liveBufferInUseMs();
   snap.sendKbps = sendKbps();
   if (m_state == ConnState::Connected || m_state == ConnState::Connecting)
   {
@@ -1334,6 +1376,21 @@ void Engine::publish()
       if (upload) snap.uploadCodec = fourcc_text(upload);
       snap.canSend = upload != 0;
       checkCanSend(upload != 0);
+
+      // Live, as the engine plays it now (it switches the whole room at an interval's start)
+      snap.liveServer = m_client->liveServerHas();
+      snap.liveSwitchOn = snap.liveServer && m_client->liveRoomSwitchOn();
+      snap.liveRoom = m_client->liveRoomLive();
+      switch (m_client->liveRoomReason())
+      {
+        case o11proto::engine::Engine::LiveReason::Dropouts: snap.liveReason = Snapshot::LiveDropouts; break;
+        case o11proto::engine::Engine::LiveReason::CantLive: snap.liveReason = Snapshot::LiveCantLive; break;
+        case o11proto::engine::Engine::LiveReason::Joining: snap.liveReason = Snapshot::LiveJoining; break;
+        default: snap.liveReason = Snapshot::LiveNoReason; break;
+      }
+      const std::string who = m_client->liveRoomReasonUser();
+      snap.liveReasonWho = who.empty() ? std::string() : who == m_client->username() ? std::string("You") : displayName(who);
+      snap.liveHeardMs = snap.liveRoom ? m_client->liveHeardMs() : -1;
     }
     updateUsers(snap);
   }
@@ -1527,6 +1584,36 @@ std::string Engine::command(const std::string &lineIn)
     return "ok";
   }
   if (verb == "follow") { setFollowHostTempo(arg == "on" || arg == "1"); return "ok"; }
+  if (verb == "/live")
+  {
+    // the engine's own /live: its answer comes as Live lines, in the chat log
+    post([this, line]() { m_client->liveCommand(line); });
+    return "ok";
+  }
+  if (verb == "live")
+  {
+    if (arg == "on" || arg == "off")
+    {
+      setRoomLive(arg == "on");
+      return "ok";
+    }
+    if (arg.compare(0, 7, "buffer ") == 0)
+    {
+      const int ms = atoi(arg.c_str() + 7);
+      if (Settings::nearestLiveBufferMs(ms) != ms) return "error: the buffer is one of 10 15 20 30 40 60 80 100 (ms)";
+      setLiveBuffer(ms);
+      return "ok";
+    }
+    if (!arg.empty()) return "error: live on|off, live buffer N, or live";
+    Snapshot s;
+    getSnapshot(s);
+    static const char *reasons[] = { "none", "dropouts", "cantlive", "joining" };
+    char buf[256];
+    snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s heard=%d buffer=%d inuse=%d\n",
+             s.liveServer ? 1 : 0, s.liveSwitchOn ? 1 : 0, s.liveRoom ? "live" : "intervals", reasons[(int)s.liveReason],
+             s.liveReasonWho.c_str(), s.liveHeardMs, s.liveBufferMs, s.liveBufferInUseMs);
+    return buf;
+  }
   if (verb == "vote")
   {
     // what the editor's BPM and BPI boxes do

@@ -254,7 +254,7 @@ void O11Editor::buildViews()
   m_footer = add(m_mixer, makeLabel("", f.small, Colors::label()));
   m_footer->setInterceptsMouseClicks(true, false);
 
-  // room panel: Room  4 players / BPM, Interval / Codec, Kbps / changes to come / Recent
+  // room panel: Room  4 players / BPM, Interval / Codec, Kbps / Mode, Buffer / changes to come / Recent
   m_room = add(m_root.get(), new Pane(Colors::pane(), 2));
   m_roomTitle = add(m_room, makeLabel("Room", f.labelBold, Colors::value()));
   m_roomCount = add(m_room, makeLabel("", f.label, Colors::label(), juce::Justification::centredRight));
@@ -302,6 +302,21 @@ void O11Editor::buildViews()
   for (int k : Settings::OPUS_KBPS) m_kbps->addEntry(uitext::kbpsText(k));
   m_kbps->onSelect = [this](int i) {
     if (i >= 0 && i < Settings::NUM_OPUS_KBPS) engine().setOpusKbps(Settings::OPUS_KBPS[i]);
+  };
+  m_modeLabel = add(m_room, makeLabel("Mode", f.label, Colors::label()));
+  m_bufferLabel = add(m_room, makeLabel("Buffer", f.label, Colors::label()));
+  m_mode = add(m_room, new MenuBox(f.value));
+  m_mode->addEntry("Live"); // the order of the choices
+  m_mode->addEntry("Intervals");
+  m_mode->onSelect = [this](int i) {
+    Snapshot s;
+    engine().getSnapshot(s);
+    if (i >= 0 && s.state == ConnState::Connected && s.liveServer && s.liveSwitchOn != (i == 0)) engine().setRoomLive(i == 0);
+  };
+  m_buffer = add(m_room, new MenuBox(f.value));
+  for (int b : Settings::LIVE_BUFFER_MS) m_buffer->addEntry(uitext::msText(b));
+  m_buffer->onSelect = [this](int i) {
+    if (i >= 0 && i < Settings::NUM_LIVE_BUFFERS) engine().setLiveBuffer(Settings::LIVE_BUFFER_MS[i]);
   };
   for (auto &chip : m_chips)
   {
@@ -529,6 +544,12 @@ void O11Editor::layoutRoom(juce::Rectangle<float> pane)
   y += LABEL_H + 2;
   place(m_codec, x0, y, x0 + colW, y + ITEM_H);
   place(m_kbps, xb, y, x1, y + ITEM_H);
+  y += ITEM_H + 5;
+  place(m_modeLabel, x0, y, x0 + colW, y + LABEL_H);
+  place(m_bufferLabel, xb, y, x1, y + LABEL_H);
+  y += LABEL_H + 2;
+  place(m_mode, x0, y, x0 + colW, y + ITEM_H);
+  place(m_buffer, xb, y, x1, y + ITEM_H);
   y += ITEM_H + 5;
   for (Chip *chip : m_chips)
     if (chip->isVisible())
@@ -907,6 +928,36 @@ void O11Editor::updateRoom(const Snapshot &s, double)
     m_kbps->setCurrentIndex(index);
   }
 
+  // Live: the room's switch (picking one switches everyone, from an interval's start), how the
+  // room plays now, and your own jitter buffer
+  const bool liveHere = connected && s.liveServer;
+  m_mode->setEnabled(liveHere);
+  m_mode->setShown(!connected ? "\xe2\x80\x94" : uitext::liveModeText(liveHere && s.liveRoom, s.liveHeardMs));
+  m_mode->setCurrentIndex(liveHere ? (s.liveSwitchOn ? 0 : 1) : -1);
+  if (!connected)
+    setTooltip(m_mode, "Live plays everyone in real time, about 30 ms late, on servers that have it; Intervals plays each "
+                       "player one interval late, in time with the beat");
+  else if (!s.liveServer) setTooltip(m_mode, "This server doesn't have Live, so everyone plays through intervals");
+  else if (s.liveRoom)
+    setTooltip(m_mode, std::string("The room plays Live") +
+                       (s.liveHeardMs > 0 ? ": you hear the others about " + uitext::msText(s.liveHeardMs) + " late" : "") +
+                       ". Pick Intervals to switch everyone back");
+  else if (s.liveSwitchOn)
+    setTooltip(m_mode, "Live is on: the room plays intervals until everyone's connection is clean, then everyone goes Live "
+                       "together at an interval's start");
+  else setTooltip(m_mode, "The room plays intervals: pick Live to play everyone in real time, from an interval's start");
+  m_buffer->setShown(uitext::msText(s.liveBufferMs));
+  {
+    int index = -1;
+    for (int i = 0; i < Settings::NUM_LIVE_BUFFERS; i ++)
+      if (Settings::LIVE_BUFFER_MS[i] == s.liveBufferMs) index = i;
+    m_buffer->setCurrentIndex(index);
+  }
+  setTooltip(m_buffer, "Your Live buffer: a longer one rides out a bad connection, and you hear everyone that much later" +
+                       (s.liveBufferInUseMs > s.liveBufferMs ? std::string(" (your DAW's audio blocks need ") +
+                                                                   uitext::msText(s.liveBufferInUseMs) + " now)"
+                                                             : std::string()));
+
   // what the room changes to at the next interval, and who voted for it (when the server says)
   int shown = 0;
   auto chip = [&](bool on, const std::string &text, const std::string &tip, const Vote &vote, int value) {
@@ -921,7 +972,22 @@ void O11Editor::updateRoom(const Snapshot &s, double)
        "The room's tempo changes to " + std::to_string(roomBpm) + " BPM when the next interval starts", m_lastVote[0], roomBpm);
   chip(playing && s.bpi > 0 && s.bpi != s.intervalBeats, uitext::beatsText(s.bpi) + " from next interval",
        "The intervals last " + uitext::beatsText(s.bpi) + " from the next one on", m_lastVote[1], s.bpi);
-  for (int i = 0; i < 2; i ++) showView(m_chips[i], i < shown);
+  // Live: what the room waits for, or the switch to come at the next interval
+  const Vote nobody;
+  const std::string wait = liveHere && s.liveSwitchOn && !s.liveRoom ? uitext::liveWaitText((int)s.liveReason, s.liveReasonWho) : "";
+  if (!wait.empty())
+    chip(true, wait, s.liveReason == Snapshot::LiveCantLive
+                       ? "Live is on, but a player's client can't play Live, so the whole room plays intervals while they're here"
+                       : s.liveReason == Snapshot::LiveJoining
+                       ? "Live waits a moment for a player who just joined"
+                       : "Live is on, but a connection had dropouts, so the whole room plays intervals; it goes Live again once "
+                         "everyone's audio has been clean for a few seconds",
+         nobody, -1);
+  else if (liveHere && s.liveSwitchOn && !s.liveRoom)
+    chip(true, "Live from next interval", "Everyone goes Live together when the next interval starts", nobody, -1);
+  else if (liveHere && !s.liveSwitchOn && s.liveRoom)
+    chip(true, "Intervals from next interval", "Everyone goes back to intervals when the next interval starts", nobody, -1);
+  for (int i = 0; i < 3; i ++) showView(m_chips[i], i < shown);
   if (shown != m_chipsShown)
   {
     m_chipsShown = shown;
@@ -940,6 +1006,7 @@ static uitext::LineKind lineKind(const ChatLine &l)
     case ChatLine::Join: return uitext::LineKind::Join;
     case ChatLine::Leave: return uitext::LineKind::Leave;
     case ChatLine::Message: return uitext::LineKind::Chat;
+    case ChatLine::Live: return uitext::LineKind::Live;
     case ChatLine::Private: return l.who == "*" ? uitext::LineKind::Server : uitext::LineKind::Other; // the server's message of the day
     default: return uitext::LineKind::Other;
   }

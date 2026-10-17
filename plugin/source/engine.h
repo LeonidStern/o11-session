@@ -67,8 +67,9 @@ double nowSeconds();
 struct ChatLine
 {
   // System: the plug-in's own notes; Server: what the server says (votes, the room's audio);
-  // Host: what the built-in server logs (the port mapper, errors); Join, Leave: who comes and goes
-  enum Kind { System, Server, Host, Join, Leave, Message, Action, Private, Topic, Error };
+  // Host: what the built-in server logs (the port mapper, errors); Join, Leave: who comes and goes;
+  // Live: the engine's Live lines (the room went Live, or back on intervals, and why)
+  enum Kind { System, Server, Host, Join, Leave, Message, Action, Private, Topic, Error, Live };
   Kind kind = System;
   std::string who; // display name, without the @address
   std::string text;
@@ -117,6 +118,18 @@ struct Snapshot
   int sendKbps = 0;          // what you send in Opus rooms: the room's, else your own (from the next interval)
   float localPeak[2] = { 0, 0 };
   bool sendPaused = false;   // the host is stopped, so nothing is sent (transmit stays on)
+
+  // Live: real-time audio, on servers that have it. The whole room plays one way: Live, or
+  // intervals while someone's connection isn't good enough (or someone can't play Live).
+  enum LiveReason { LiveNoReason, LiveDropouts, LiveCantLive, LiveJoining };
+  bool liveServer = false;   // the server has Live (its UDP port is open)
+  bool liveSwitchOn = false; // the room's Live switch (!live on)
+  bool liveRoom = false;     // the room plays Live now
+  LiveReason liveReason = LiveNoReason; // why it plays intervals while the switch is on
+  std::string liveReasonWho; // whose connection or client (display name), "" when no one's
+  int liveHeardMs = -1;      // about how late you hear the others while Live, -1 when not known
+  int liveBufferMs = 20;     // your jitter buffer (Settings::liveBufferMs)
+  int liveBufferInUseMs = 20; // what it is now: raised for the host's long blocks
 
   std::vector<RemoteUserView> users;
   unsigned int usersRevision = 0; // changes when users or channels come or go (not for levels)
@@ -173,6 +186,10 @@ struct Settings
   static constexpr int OPUS_KBPS[] = { 64, 96, 128, 160, 256, 510 };
   static constexpr int NUM_OPUS_KBPS = 6, DEFAULT_OPUS_KBPS = 510; // the best Opus there is, by default
   static int nearestOpusKbps(int kbps);
+  // Live's jitter buffer (ms) to pick from: longer is safer on a bad connection, and later
+  static constexpr int LIVE_BUFFER_MS[] = { 10, 15, 20, 30, 40, 60, 80, 100 };
+  static constexpr int NUM_LIVE_BUFFERS = 8, DEFAULT_LIVE_BUFFER_MS = 20;
+  static int nearestLiveBufferMs(int ms);
 
   std::string userName;
   std::string server;
@@ -183,6 +200,7 @@ struct Settings
   bool transmit = true;
   int opusKbps = DEFAULT_OPUS_KBPS; // what we send in Opus rooms; FLAC is lossless and ignores it
   bool followHostTempo = true; // Sync: follow the host's tempo (and line up with its bars)
+  int liveBufferMs = DEFAULT_LIVE_BUFFER_MS; // Live's jitter buffer, one of LIVE_BUFFER_MS
   int editorWidth = 0, editorHeight = 0; // the editor's size, 0 for the default
 
   struct Remote
@@ -253,6 +271,8 @@ public:
   void setEditorSize(int width, int height);
   void setFollowHostTempo(bool on); // Sync, and with it Ableton Link
   void setHostName(const std::string &name); // the host's name, for the editor
+  void setRoomLive(bool on);       // the room's Live switch (!live on|off), while connected
+  void setLiveBuffer(int ms);      // one of Settings::LIVE_BUFFER_MS: your jitter buffer
 
   enum RemoteField { RemoteVolume, RemotePan, RemoteMute, RemoteSolo };
   void setRemote(const std::string &user, int channel, RemoteField field, float value);
@@ -261,7 +281,9 @@ public:
   //   connect host:port [name], disconnect, name X, host on|off, chat text (sent as typed),
   //   license accept|decline, transmit on|off, monitor on|off, metronome on|off,
   //   bitrate 64|96|128|160|256|510, codec opus|flac, follow on|off (Sync, with Link), vote bpm|bpi N,
-  //   status, users, chatlog, syncnote, nextinterval, synctip (the Sync button's tooltip)
+  //   live on|off (the room's switch), live buffer N, live (its state), /live ... (the engine's
+  //   Live lines, in the chat log), status, users, chatlog, syncnote, nextinterval, synctip (the
+  //   Sync button's tooltip)
   std::string command(const std::string &line);
 
   static std::string remoteKey(const std::string &user, int channel); // user without @address

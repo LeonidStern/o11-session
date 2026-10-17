@@ -159,9 +159,12 @@ private:
   ui::Strip *m_room = nullptr;
   juce::Label *m_roomTitle = nullptr, *m_roomCount = nullptr;
   juce::Label *m_bpmLabel = nullptr, *m_intervalLabel = nullptr, *m_codecLabel = nullptr, *m_kbpsLabel = nullptr, *m_recentLabel = nullptr;
+  juce::Label *m_modeLabel = nullptr, *m_bufferLabel = nullptr;
   ui::DragNumberBox *m_bpm = nullptr;
   ui::MenuBox *m_interval = nullptr, *m_codec = nullptr, *m_kbps = nullptr;
-  ui::Chip *m_chips[2] = { nullptr, nullptr }; // a tempo and an interval the room waits to change to
+  ui::MenuBox *m_mode = nullptr, *m_buffer = nullptr; // Live or intervals (the room's), and your Live buffer
+  // a tempo and an interval the room waits to change to, and Live: what it waits for
+  ui::Chip *m_chips[3] = { nullptr, nullptr, nullptr };
   ui::EventList *m_events = nullptr;
 
   // host bar

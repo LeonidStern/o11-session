@@ -110,6 +110,29 @@ std::string dropoutsText(long n)
   return std::to_string(n) + (n == 1 ? " dropout" : " dropouts");
 }
 
+std::string msText(int ms)
+{
+  return std::to_string(ms) + " ms";
+}
+
+std::string liveModeText(bool live, int heardMs)
+{
+  if (!live) return "Intervals";
+  return heardMs > 0 ? "Live " + msText(heardMs) : "Live";
+}
+
+std::string liveWaitText(int reason, const std::string &who)
+{
+  const bool you = who == "You";
+  switch (reason)
+  {
+    case 1: return who.empty() ? "Intervals: a connection had dropouts" : you ? "Intervals: your connection" : "Intervals: " + who + "'s connection";
+    case 2: return who.empty() ? "Intervals: a player can't play Live" : you ? "Intervals: your client can't play Live" : "Intervals: " + who + " can't play Live";
+    case 3: return who.empty() || you ? "Intervals while you join" : "Intervals while " + who + " joins";
+    default: return "";
+  }
+}
+
 std::string ageText(double seconds)
 {
   if (!(seconds >= 5)) return "now";
@@ -212,6 +235,43 @@ RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &te
       if (!parseVote(text, &bpm, &n)) return e;
       return show(RoomEvent::Change, who + " voted for " + (bpm ? "BPM " + std::to_string(n) : beatsText(n)));
     }
+    case LineKind::Live:
+    {
+      // the room's Live mode switching; the rest of Live's lines (its answers to /live, how to
+      // turn it on) are for the Mode box and its tooltip
+      const std::string t = withoutAddresses(text);
+      if (startsWith(t, "The room is Live now"))
+      {
+        const int ms = numberAfter(t, "about ");
+        return show(RoomEvent::Change, ms > 0 ? "The room went Live: " + msText(ms) + " late" : "The room went Live");
+      }
+      static const char *back = "The room is back on intervals: ", *joins = "The room is back on intervals while ",
+                        *cant = "The room is on intervals: ";
+      if (startsWith(t, back))
+      {
+        // "anna's connection had dropouts", "your connection had dropouts"
+        std::string why = t.substr(strlen(back));
+        const size_t had = why.find(" had dropouts");
+        if (had != std::string::npos) why = why.substr(0, had);
+        return show(RoomEvent::Warn, "Back on intervals: " + why);
+      }
+      if (startsWith(t, joins))
+      {
+        std::string who = t.substr(strlen(joins));
+        const size_t j = who.find(" joins");
+        return show(RoomEvent::Plain, "Intervals while " + (j == std::string::npos ? who : who.substr(0, j)) + " joins");
+      }
+      if (startsWith(t, cant))
+      {
+        // "carol can't do Live.", "your client can't do Live."
+        std::string who = t.substr(strlen(cant));
+        const size_t c = who.find(" can't do Live");
+        if (c != std::string::npos) who = who.substr(0, c);
+        return show(RoomEvent::Warn, "Intervals: " + who + " can't play Live");
+      }
+      if (startsWith(t, "Live: the server doesn't answer on UDP")) return show(RoomEvent::Warn, "No Live: the server's UDP port doesn't answer");
+      return e;
+    }
     case LineKind::Server: break;
     default: return e;
   }
@@ -246,6 +306,12 @@ RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &te
     if (at != std::string::npos) return show(RoomEvent::Change, t.substr(0, at) + " set the codec to " + t.substr(at + strlen(codec)));
     at = t.find(kbps);
     if (at != std::string::npos) return show(RoomEvent::Change, t.substr(0, at) + " set " + t.substr(at + strlen(kbps)));
+    // "anna turned Live on: O11 Session players now hear each other in real time."
+    static const char *liveOn = " turned Live on", *liveOff = " turned Live off";
+    at = t.find(liveOn);
+    if (at != std::string::npos) return show(RoomEvent::Change, t.substr(0, at) + liveOn);
+    at = t.find(liveOff);
+    if (at != std::string::npos) return show(RoomEvent::Change, t.substr(0, at) + liveOff);
     // the rest of a reply about the codec is how to change it by chat
     at = t.find(". Change it with ");
     if (at != std::string::npos) t = t.substr(0, at);

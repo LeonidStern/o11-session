@@ -55,6 +55,16 @@ std::string playersText(int players);
 std::string joinedText(double seconds);
 // a player's gaps in their audio: "1 dropout", "3 dropouts"
 std::string dropoutsText(long n);
+// Live's jitter buffer in the Buffer box: "20 ms"
+std::string msText(int ms);
+// the Mode box: "Live 28 ms" while the room plays Live ("Live" until the delay is known), else
+// "Intervals"
+std::string liveModeText(bool live, int heardMs);
+// why the room plays intervals while its Live switch is on (the Snapshot's liveReason: 1 a
+// connection's dropouts, 2 a client that can't play Live, 3 someone joining) and whose:
+// "Intervals: Anna's connection", "Intervals: your connection", "Intervals: Carol can't play
+// Live", "Intervals while Anna joins"; "" for no reason
+std::string liveWaitText(int reason, const std::string &who);
 // how long ago something happened, in the room panel: "now", "12 s", "2 min", "1 h"
 std::string ageText(double seconds);
 // a server's line with the players' addresses taken out: "anna@203.0.113.9 set ..." is "anna set ..."
@@ -64,9 +74,9 @@ std::string withoutAddresses(const std::string &text);
 // chat, with the plug-in's own notes and the server's messages): who came and went, what
 // changed (tempo, interval, codec, bitrate), and what the server says. The kinds are the
 // engine's (ChatLine): the plug-in's notes, the server's messages, the built-in server's log,
-// joins, leaves, what players say (only their votes are shown), anything else (errors the
-// editor shows elsewhere).
-enum class LineKind { Note, Server, HostLog, Join, Leave, Chat, Other };
+// joins, leaves, what players say (only their votes are shown), the engine's Live lines (the
+// room went Live, or back on intervals), anything else (errors the editor shows elsewhere).
+enum class LineKind { Note, Server, HostLog, Join, Leave, Chat, Live, Other };
 struct RoomEvent
 {
   enum Tone { Plain, Change, Warn }; // grey, purple, amber

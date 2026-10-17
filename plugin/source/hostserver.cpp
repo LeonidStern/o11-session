@@ -82,24 +82,41 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
   cfg.vote_threshold_percent = 1; // a single vote changes BPM or BPI
   cfg.log = [this](const std::string &line) { onLog(line); };
 
+  // Live (real-time audio over UDP, on the TCP port's number): first a port whose UDP is free
+  // too, then any port without Live. The room starts with Live on; the whole room still plays
+  // intervals while anyone's connection or client isn't good enough for it.
+  cfg.live.mode = env_is_off("O11_LIVE") ? o11proto::LiveMode::No : o11proto::LiveMode::Require;
   std::unique_ptr<o11proto::Server> server(new o11proto::Server);
   int port = 0;
   const char *fixedPort = getenv("O11_HOST_PORT"); // the tests: 0 for any free port
-  for (int i = 0; i < PORTS_TO_TRY; i ++)
+  for (int pass = cfg.live.mode == o11proto::LiveMode::No ? 1 : 0; pass < 2 && !port; pass ++)
   {
-    cfg.port = (std::uint16_t)(fixedPort ? atoi(fixedPort) : FIRST_PORT + i);
-    if (server->start(cfg))
+    if (pass == 1) cfg.live.mode = o11proto::LiveMode::No;
+    for (int i = 0; i < PORTS_TO_TRY; i ++)
     {
-      port = server->port();
-      break;
+      cfg.port = (std::uint16_t)(fixedPort ? atoi(fixedPort) : FIRST_PORT + i);
+      if (server->start(cfg))
+      {
+        port = server->port();
+        break;
+      }
+      if (fixedPort) break;
     }
-    if (fixedPort) break;
   }
   if (!port)
   {
     if (error) *error = "Ports " + std::to_string(FIRST_PORT) + " to " + std::to_string(FIRST_PORT + PORTS_TO_TRY - 1) + " are in use by other programs.";
     return false;
   }
+  const bool live = cfg.live.mode != o11proto::LiveMode::No && server->liveUdpOpen();
+  if (live)
+  {
+    cfg.live.mode = o11proto::LiveMode::On;
+    server->setLiveConfig(cfg.live);
+  }
+  else if (!env_is_off("O11_LIVE"))
+    onLog("Live is off in this room: no port from " + std::to_string(FIRST_PORT) + " to " +
+          std::to_string(FIRST_PORT + PORTS_TO_TRY - 1) + " had UDP free as well as TCP, so everyone plays through intervals");
 
   const bool portmap = !env_is_off("O11_PORTMAP");
   {
@@ -123,7 +140,7 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
   {
     m_mapper.reset(new o11proto::PortMapper);
     m_mapper->log = [this](const std::string &line) { onLog(line); };
-    m_mapper->start(port);
+    m_mapper->start(port, live); // with Live, its UDP port too
   }
   m_lookupStop = false;
   m_lookup = std::thread([this, port]() { lookUpPublicAddress(port); });

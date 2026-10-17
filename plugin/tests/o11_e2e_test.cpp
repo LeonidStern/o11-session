@@ -12,7 +12,9 @@
   the first one's process() with a simulated clock (blocks of 512 at 48 kHz,
   paced at real time, as a host would), and the second one must hear it: SNR
   of at least 35 dB with Opus at the room's bitrate, 60 dB once the room is
-  switched to FLAC with "codec flac". Modelled on o11proto's
+  switched to FLAC with "codec flac". The hosted room has Live, switched on:
+  those checks run with it off ("live off"), then with it on again the whole
+  room goes Live and the guest hears the tone in real time. Modelled on o11proto's
   engine/tests/test_engine_e2e.cpp, through the plug-in's own text commands.
 
   Ableton Link, with Sync on in both (as by default): one instance in a
@@ -130,6 +132,18 @@ struct Room
     printf("  status: %s\n", e.command("status").c_str());
     return false;
   }
+  // the same for a field of the "live" reply
+  bool waitForLive(Engine &e, const char *key, const std::string &value, double seconds)
+  {
+    const double deadline = now_seconds() + seconds;
+    while (now_seconds() < deadline)
+    {
+      if (field(e.command("live"), key) == value) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    printf("  live: %s", e.command("live").c_str());
+    return false;
+  }
   // `seconds` of audio through both, at real time (the network threads run meanwhile)
   void advance(double seconds)
   {
@@ -204,6 +218,15 @@ int main()
   const std::string chat = room.guest.command("chatlog");
   CHECK(chat.find("Host plays alone on the output Player 1") != std::string::npos);
   CHECK(chat.find("Connected to 127.0.0.1:") != std::string::npos);
+
+  // the hosted room has Live, switched on; the interval checks below run with it off
+  CHECK(room.waitForLive(room.guest, "server", "1", 10));
+  CHECK(room.waitForLive(room.guest, "switch", "1", 5));
+  CHECK(room.waitForLive(room.host, "switch", "1", 5));
+  CHECK(room.guest.command("live off") == "ok");
+  CHECK(room.waitForLive(room.host, "switch", "0", 5));
+  CHECK(room.waitForLive(room.guest, "switch", "0", 5));
+  CHECK(field(room.guest.command("live"), "room") == "intervals");
 
   // Opus, at the room's bitrate
   room.advance(12.0);
@@ -291,7 +314,39 @@ int main()
     peer.enable(false);
   }
 
-  // transmit off: the host sends nothing from the next interval on, and the guest hears silence
+  // Live on again: the whole room goes Live at an interval's start, once both have been clean for
+  // a few seconds, and the guest hears the tone in real time (Opus at Live's 128 kbps, though the
+  // room's intervals are FLAC)
+  CHECK(room.guest.command("live on") == "ok");
+  for (int i = 0; i < 100 && (field(room.guest.command("live"), "room") != "live" || field(room.host.command("live"), "room") != "live"); i ++)
+    room.advance(0.2);
+  const std::string guestLive = room.guest.command("live");
+  printf("  guest live: %s", guestLive.c_str());
+  CHECK(field(guestLive, "room") == "live");
+  CHECK(field(room.host.command("live"), "room") == "live");
+  room.heard.clear();
+  room.advance(3.0);
+  {
+    const size_t take = (size_t)Room::RATE * 2;
+    const float *p = room.heard.data() + (room.heard.size() - take);
+    const double liveSnr = snrAgainstTone(p, take, room.hz, Room::RATE);
+    float livePeak = 0;
+    for (size_t i = 0; i < take; ++i) livePeak = std::max(livePeak, fabsf(p[i]));
+    const int heardMs = atoi(field(room.guest.command("live"), "heard").c_str());
+    printf("  live: snr %.1f dB, peak %.3f, heard %d ms late\n", liveSnr, livePeak, heardMs);
+    CHECK(liveSnr >= 30.0);
+    CHECK(livePeak >= 0.45f && livePeak <= 0.55f);
+    CHECK(heardMs > 0 && heardMs < 150);
+  }
+  CHECK(room.guest.command("chatlog").find("The room is Live now") != std::string::npos);
+  // the buffer is the guest's own, and saved with its set
+  CHECK(room.guest.command("live buffer 40") == "ok");
+  CHECK(room.waitForLive(room.guest, "buffer", "40", 5));
+  CHECK(room.guest.getSettings().liveBufferMs == 40);
+  CHECK(room.guest.command("live buffer 33").find("error") == 0);
+
+  // transmit off: the host sends nothing from the next interval on (nor Live, at once), and the
+  // guest hears silence
   CHECK(room.host.command("transmit off") == "ok");
   room.advance(2.0 * room.intervalLength() / Room::RATE + 1.0);
   room.heard.clear();
