@@ -102,7 +102,7 @@ if(O11PROTO_BUILD_ENGINE)
   endforeach()
 
   # Live mode (ENGINE.md section 16): the unit tests reach the engine's internal headers.
-  foreach(t test_engine_live_units test_engine_live)
+  foreach(t test_engine_live_units test_engine_live test_engine_live_room)
     add_executable(${t} engine/tests/${t}.cpp)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
                                             ${CMAKE_CURRENT_SOURCE_DIR}/engine/src)
@@ -110,6 +110,7 @@ if(O11PROTO_BUILD_ENGINE)
     add_test(NAME ${t} COMMAND ${t})
     set_tests_properties(${t} PROPERTIES TIMEOUT 300)
   endforeach()
+  set_tests_properties(test_engine_live_room PROPERTIES TIMEOUT 900)
 endif()
 
 # --------------------------------------------------------------- portmap
