@@ -278,13 +278,19 @@ target_sources(O11Session PRIVATE
     source/views.cpp
     source/views.h
 )
+# Inter (SIL Open Font License 1.1, fonts/Inter-LICENSE.txt), the editor's typeface, built in
+juce_add_binary_data(o11_fonts
+    HEADER_NAME O11Fonts.h
+    NAMESPACE O11Fonts
+    SOURCES fonts/Inter-Regular.ttf fonts/Inter-SemiBold.ttf
+)
 target_compile_definitions(O11Session PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
 )
 target_link_libraries(O11Session
-    PRIVATE o11_core juce::juce_audio_processors juce::juce_gui_basics
+    PRIVATE o11_core o11_fonts juce::juce_audio_processors juce::juce_gui_basics
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_lto_flags
 )
 o11_warnings(O11Session)

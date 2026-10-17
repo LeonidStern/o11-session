@@ -61,12 +61,18 @@ namespace o11proto { namespace engine { class Engine; } }
 
 namespace o11 {
 
+// the clock of ChatLine::time and RemoteUserView::joinedAt: seconds, steady
+double nowSeconds();
+
 struct ChatLine
 {
-  enum Kind { System, Server, Message, Action, Private, Topic, Error };
+  // System: the plug-in's own notes; Server: what the server says (votes, the room's audio);
+  // Host: what the built-in server logs (the port mapper, errors); Join, Leave: who comes and goes
+  enum Kind { System, Server, Host, Join, Leave, Message, Action, Private, Topic, Error };
   Kind kind = System;
   std::string who; // display name, without the @address
   std::string text;
+  double time = 0; // when it came (nowSeconds())
 };
 
 struct RemoteChannelView
@@ -83,6 +89,7 @@ struct RemoteUserView
 {
   std::string name;        // as the server names the user (name@address)
   std::string displayName; // without the @address
+  double joinedAt = 0;     // when they joined the room you're in (nowSeconds()), 0 if they were there first
   std::vector<RemoteChannelView> channels;
 };
 
@@ -96,6 +103,8 @@ struct Snapshot
   std::string userName; // the name the server gave us
   float bpm = 0;  // as the server set them
   int bpi = 0;
+  float intervalBpm = 0; // the tempo of the interval playing now (the server's bpm from the next interval)
+  double roomSince = 0;  // when the plug-in started joining the room it is in (nowSeconds()), 0 while in none
   int intervalPos = 0, intervalLength = 0, intervalBeats = 0; // the interval playing now
   bool audioRunning = false; // the host called process() in the last second
   std::string roomCodec;     // "Opus", "FLAC" or "Vorbis" while connected
@@ -116,7 +125,7 @@ struct Snapshot
   // following the host (hostsync.h)
   bool followTempo = true;   // the toggle
   std::string hostLabel;     // "Live", or the host's name
-  std::string hostChip;      // the same, short: "Live", or "Host" for a long name
+  std::string hostChip;      // the same, short: "Live", "Bitwig", or "DAW" when it doesn't fit
   double nextIntervalPpq = -1; // where the next interval starts in the host (quarter notes), -1 when not in line
   int timeSigNum = 0, timeSigDen = 0; // the host's time signature, 0 when it doesn't say
   double hostTempo = 0;      // 0 when the host doesn't say (or doesn't run the audio)
@@ -148,6 +157,7 @@ struct Snapshot
   bool hostLookupPending = false;  // still asking that service
   bool hostJoinedFromInternet = false; // so the port is open, even if the router didn't say
   int hostUsers = 0;
+  int hostMaxUsers = 0;        // how many it lets in
   int hostedElsewherePort = 0; // another instance in this program hosts one
 
   unsigned long long chatRevision = 0;
@@ -345,6 +355,7 @@ private:
   double m_lastPublish = 0;
   unsigned int m_seenProcessCalls = 0;
   std::map<std::string, int> m_playerOutSaid; // the player output we last told about, by user name
+  std::map<std::string, double> m_joinedAt;   // when each user joined (RemoteUserView::joinedAt), by user name
   double m_lastAudio = -10;
   TempoFollower m_tempoFollower;
   double m_noteSince = -1; // since when the host's tempo isn't the room's

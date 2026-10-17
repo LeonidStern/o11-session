@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <algorithm>
 
@@ -68,15 +69,11 @@ std::string dbText(float gain)
   return buf;
 }
 
-int litSegments(float peak)
+float meterFraction(float peak)
 {
-  // dB where each segment lights: five green, then two yellow
-  static const float th[METER_SEGMENTS] = { -48, -36, -24, -16, -10, -5, -1 };
   if (!(peak > 0)) return 0;
   const float db = 20.0f * log10f(peak);
-  int n = 0;
-  while (n < METER_SEGMENTS && db >= th[n]) n++;
-  return n;
+  return std::min(1.0f, std::max(0.0f, (db - METER_FLOOR_DB) / -METER_FLOOR_DB));
 }
 
 std::string beatText(int pos, int length, int bpi)
@@ -92,6 +89,147 @@ std::string kbpsText(int kbps)
   return std::to_string(kbps) + "k";
 }
 
+std::string beatsText(int beats)
+{
+  return std::to_string(beats) + (beats == 1 ? " beat" : " beats");
+}
+
+std::string playersText(int players)
+{
+  return players <= 1 ? std::string("just you") : std::to_string(players) + " players";
+}
+
+std::string joinedText(double seconds)
+{
+  if (!(seconds >= 2)) return "just joined";
+  return "joined " + std::to_string((long)seconds) + " s ago";
+}
+
+std::string ageText(double seconds)
+{
+  if (!(seconds >= 5)) return "now";
+  if (seconds < 60) return std::to_string((long)seconds) + " s";
+  if (seconds < 3600) return std::to_string((long)(seconds / 60)) + " min";
+  return std::to_string((long)(seconds / 3600)) + " h";
+}
+
+std::string withoutAddresses(const std::string &text)
+{
+  // "@" and the address after it: digits, dots, colons, and hex digits for IPv6
+  std::string out;
+  for (size_t i = 0; i < text.size(); i ++)
+  {
+    if (text[i] == '@' && i + 1 < text.size() && (isxdigit((unsigned char)text[i + 1]) || text[i + 1] == ':'))
+    {
+      size_t j = i + 1;
+      while (j < text.size() && (isxdigit((unsigned char)text[j]) || text[j] == '.' || text[j] == ':')) j++;
+      // a full stop at the end of the address ends the sentence
+      if (j > i + 1 && text[j - 1] == '.') j--;
+      i = j - 1;
+      continue;
+    }
+    out += text[i];
+  }
+  return out;
+}
+
+static bool startsWith(const std::string &s, const char *prefix)
+{
+  return s.compare(0, strlen(prefix), prefix) == 0;
+}
+
+static std::string capitalized(std::string s)
+{
+  if (!s.empty() && s[0] >= 'a' && s[0] <= 'z') s[0] = (char)(s[0] - 'a' + 'A');
+  return s;
+}
+
+// the number in s after prefix ("setting BPM to 100": 100), 0 when there is none
+static int numberAfter(const std::string &s, const char *prefix)
+{
+  const size_t at = s.find(prefix);
+  if (at == std::string::npos) return 0;
+  return atoi(s.c_str() + at + strlen(prefix));
+}
+
+RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &text, bool hosting)
+{
+  RoomEvent e;
+  auto show = [&e](RoomEvent::Tone tone, const std::string &t) {
+    e.shown = !t.empty();
+    e.tone = tone;
+    e.text = t;
+    return e;
+  };
+  switch (kind)
+  {
+    case LineKind::Join: return show(RoomEvent::Plain, who + " joined");
+    case LineKind::Leave: return show(RoomEvent::Plain, who + " left");
+    case LineKind::Note:
+      // the plug-in's notes are in the header, the footer and the host bar; this one starts the list
+      if (startsWith(text, "Connected to ")) return show(RoomEvent::Plain, hosting ? "You started the room" : "You joined the room");
+      return e;
+    case LineKind::HostLog:
+      if (startsWith(text, "[portmap]")) return e; // the host bar says what the router did
+      return show(RoomEvent::Warn, capitalized(text));
+    case LineKind::Server: break;
+    default: return e;
+  }
+
+  std::string t = withoutAddresses(text);
+  if (startsWith(t, "[voting system] "))
+  {
+    t = t.substr(strlen("[voting system] "));
+    // "setting BPM to 100", "leading candidate: 1/2 votes for 100 BPM [each vote expires in 60s]"
+    const bool bpm = t.find(" BPM") != std::string::npos, bpi = t.find(" BPI") != std::string::npos;
+    if (startsWith(t, "setting ") && (bpm || bpi))
+    {
+      const int n = numberAfter(t, " to ");
+      return show(RoomEvent::Change, bpm ? "BPM set to " + std::to_string(n) : "Interval set to " + beatsText(n));
+    }
+    if (startsWith(t, "leading candidate: ") && (bpm || bpi))
+    {
+      const int have = atoi(t.c_str() + strlen("leading candidate: ")), need = numberAfter(t, "/"), n = numberAfter(t, "votes for ");
+      return show(RoomEvent::Change, (bpm ? "Vote for BPM " + std::to_string(n) : "Vote for " + beatsText(n)) + ": " +
+                                       std::to_string(have) + " of " + std::to_string(need));
+    }
+    return show(RoomEvent::Warn, capitalized(t));
+  }
+  if (startsWith(t, "[server] "))
+  {
+    t = t.substr(strlen("[server] "));
+    // "anna switched the room's audio to FLAC", "anna set the room's Opus bitrate to 128 kbps"
+    static const char *codec = " switched the room's audio to ", *kbps = " set the room's Opus bitrate to ";
+    size_t at = t.find(codec);
+    if (at != std::string::npos) return show(RoomEvent::Change, t.substr(0, at) + " set the codec to " + t.substr(at + strlen(codec)));
+    at = t.find(kbps);
+    if (at != std::string::npos) return show(RoomEvent::Change, t.substr(0, at) + " set " + t.substr(at + strlen(kbps)));
+    // the rest of a reply about the codec is how to change it by chat
+    at = t.find(". Change it with ");
+    if (at != std::string::npos) t = t.substr(0, at);
+    if (startsWith(t, "room audio is back to ")) return show(RoomEvent::Change, capitalized(t));
+    return show(RoomEvent::Warn, capitalized(t));
+  }
+  return show(RoomEvent::Warn, t); // the server's own news
+}
+
+
+// the router's own internet address in the port mapper's note ("... internet address is
+// 100.64.0.9, which is not public"), when it is in the internet providers' shared range
+// (100.64.0.0/10, carrier-grade NAT); "" otherwise
+static std::string sharedRouterAddress(const std::string &note)
+{
+  static const char *key = "internet address is ";
+  const size_t at = note.find(key);
+  if (at == std::string::npos) return "";
+  std::string addr = note.substr(at + strlen(key));
+  addr = addr.substr(0, addr.find_first_not_of("0123456789."));
+  while (!addr.empty() && addr.back() == '.') addr.pop_back();
+  unsigned a = 0, b = 0, c = 0, d = 0;
+  char tail = 0;
+  if (sscanf(addr.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return "";
+  return a == 100 && b >= 64 && b <= 127 ? addr : "";
+}
 
 HostBar hostBar(const HostInfo &h)
 {
@@ -103,6 +241,21 @@ HostBar hostBar(const HostInfo &h)
   const bool forwarded = !h.publicAddress.empty();
   const std::string wan = forwarded ? h.publicAddress : h.lookedUpAddress;
   const bool asking = h.lookupPending || h.portmapPending;
+  // behind the provider's NAT nobody outside can join: the LAN address, not the looked-up one
+  const std::string shared = forwarded || h.joinedFromInternet || h.portmapPending ? std::string() : sharedRouterAddress(h.portmapNote);
+  if (!shared.empty())
+  {
+    b.addressKey = "LAN";
+    b.address = h.localAddress;
+    b.placeholder = "not known";
+    b.addressTip = "Where players in your local network join";
+    b.port = HostBar::Blocked;
+    b.portText = "Only your network can join";
+    b.portTip = "Your router forwards port " + portNo + ", but its own internet address (" + shared +
+                ") isn't public: your internet provider probably uses carrier-grade NAT, so players outside your network "
+                "can't join. Ask your provider for a public IPv4 address, or host the room on a server on the internet.";
+    return b;
+  }
   if (!wan.empty())
   {
     b.addressKey = "WAN";

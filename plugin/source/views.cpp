@@ -10,6 +10,7 @@
 #include <math.h>
 #include <algorithm>
 
+#include "O11Fonts.h"
 #include "uitext.h"
 
 namespace o11 {
@@ -24,22 +25,18 @@ float gainToSlider(float gain)
   return std::min(1.0f, sqrtf(gain * 0.5f));
 }
 
-static juce::Font makeFont(const char *name, float points, bool bold = false)
+// a size of Inter as CSS gives it (the em, not the line)
+static juce::Font makeFont(const juce::Typeface::Ptr &face, float px)
 {
-  return juce::Font(juce::FontOptions(name, 11.0f, bold ? juce::Font::bold : juce::Font::plain)).withPointHeight(points);
+  return juce::Font(juce::FontOptions(face).withPointHeight(px));
 }
 
 Fonts::Fonts()
-  : value(makeFont("Arial", 11)), label(makeFont("Arial", 10)), bold(makeFont("Arial", 11, true)), small(makeFont("Arial", 9.5f)),
-    tiny(makeFont("Arial", 9)), button(makeFont("Arial", 10.5f)), chat(makeFont("Arial", 10.5f)), chatBold(makeFont("Arial", 10.5f, true)),
-#if defined(__APPLE__)
-    mono(makeFont("Menlo", 10.5f)),
-#elif defined(_WIN32)
-    mono(makeFont("Consolas", 10.5f)),
-#else
-    mono(makeFont(juce::Font::getDefaultMonospacedFontName().toRawUTF8(), 10.5f)),
-#endif
-    menu(makeFont("Arial", 11))
+  : regular(juce::Typeface::createSystemTypefaceFor(O11Fonts::InterRegular_ttf, (size_t)O11Fonts::InterRegular_ttfSize)),
+    semiBold(juce::Typeface::createSystemTypefaceFor(O11Fonts::InterSemiBold_ttf, (size_t)O11Fonts::InterSemiBold_ttfSize)),
+    title(makeFont(semiBold, 11)), value(makeFont(regular, 10)), valueBold(makeFont(semiBold, 10)), label(makeFont(regular, 9)),
+    labelBold(makeFont(semiBold, 9)), small(makeFont(regular, 9.5f)), button(makeFont(regular, 9.5f)), tiny(makeFont(regular, 9)),
+    text(makeFont(regular, 10)), mono(makeFont(regular, 10)), menu(makeFont(regular, 10))
 {
 }
 
@@ -62,11 +59,10 @@ static void fillRect(juce::Graphics &g, juce::Rectangle<float> r, float radius, 
   }
 }
 
-// a value box: #1c1c1c with a #121212 edge
+// a value box: dark, without an edge
 static void drawBox(juce::Graphics &g, juce::Rectangle<float> r)
 {
-  const juce::Colour line = Colors::boxLine();
-  fillRect(g, r, RADIUS, Colors::box(), &line);
+  fillRect(g, r, RADIUS, Colors::box());
 }
 
 static juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
@@ -88,7 +84,7 @@ void Strip::paint(juce::Graphics &g)
 // ---------------------------------------------------------------------------
 
 FlatButton::FlatButton(const std::string &title, Kind kind, const juce::Font &font)
-  : m_title(title), m_kind(kind), m_font(font), m_onFill(Colors::yellow()), m_onLine(Colors::yellowLine())
+  : m_title(title), m_kind(kind), m_font(font), m_onFill(Colors::yellow())
 {
 }
 
@@ -115,15 +111,14 @@ void FlatButton::paint(juce::Graphics &g)
 {
   const juce::Rectangle<float> r = getLocalBounds().toFloat();
   const bool lit = m_kind == Toggle ? m_on : m_pressed;
-  juce::Colour fill = lit ? (m_kind == Toggle ? m_onFill : juce::Colour(0xff5e5e5e)) : Colors::buttonOff();
-  juce::Colour line = lit && m_kind == Toggle ? m_onLine : Colors::box();
+  juce::Colour fill = lit ? (m_kind == Toggle ? m_onFill : Colors::buttonPressed()) : Colors::buttonOff();
   juce::Colour text = lit && m_kind == Toggle ? Colors::dark() : Colors::buttonText();
   if (!isEnabled())
   {
     fill = fill.withMultipliedAlpha(0.5f);
     text = text.withMultipliedAlpha(0.5f);
   }
-  fillRect(g, r, RADIUS, fill, &line);
+  fillRect(g, r, RADIUS, fill);
   g.setFont(m_font);
   g.setColour(text);
   g.drawText(str(m_title), getLocalBounds(), juce::Justification::centred, false);
@@ -178,18 +173,9 @@ void Led::setColor(juce::Colour c, bool lit)
 
 void Led::paint(juce::Graphics &g)
 {
-  const float d = 7;
+  const float d = 6;
   const juce::Point<float> c = getLocalBounds().toFloat().getCentre();
-  if (m_lit)
-  {
-    // the glow
-    for (int i = 3; i >= 1; i --)
-    {
-      g.setColour(m_color.withMultipliedAlpha(0.12f));
-      g.fillEllipse(c.x - d / 2 - (float)i, c.y - d / 2 - (float)i, d + 2.0f * (float)i, d + 2.0f * (float)i);
-    }
-  }
-  g.setColour(m_color);
+  g.setColour(m_lit ? m_color : Colors::ledOff());
   g.fillEllipse(c.x - d / 2, c.y - d / 2, d, d);
 }
 
@@ -201,11 +187,11 @@ DragNumberBox::DragNumberBox(const juce::Font &font)
   setJustificationType(juce::Justification::centred);
   setColour(juce::Label::textColourId, Colors::value());
   setColour(juce::Label::backgroundColourId, Colors::box());
-  setColour(juce::Label::outlineColourId, Colors::boxLine());
+  setColour(juce::Label::outlineColourId, juce::Colours::transparentBlack);
   setColour(juce::Label::textWhenEditingColourId, Colors::value());
   setColour(juce::Label::backgroundWhenEditingColourId, Colors::box());
-  setColour(juce::Label::outlineWhenEditingColourId, Colors::boxLine());
-  setBorderSize(juce::BorderSize<int>(0, 3, 0, 3));
+  setColour(juce::Label::outlineWhenEditingColourId, juce::Colours::transparentBlack);
+  setBorderSize(juce::BorderSize<int>(0, 4, 0, 4));
   setEditable(false, true, true); // double-click to type; losing focus discards
 }
 
@@ -269,14 +255,14 @@ void DragNumberBox::mouseDoubleClick(const juce::MouseEvent &e)
 void DragNumberBox::editorShown(juce::TextEditor *editor)
 {
   editor->setFont(getFont());
-  editor->setJustification(juce::Justification::centred);
+  editor->setJustification(getJustificationType());
   editor->setColour(juce::TextEditor::textColourId, Colors::value());
   editor->setColour(juce::TextEditor::highlightedTextColourId, Colors::dark());
   editor->setColour(juce::TextEditor::highlightColourId, Colors::yellow());
   editor->setColour(juce::TextEditor::backgroundColourId, Colors::box());
   editor->setColour(juce::TextEditor::focusedOutlineColourId, Colors::yellowLine());
-  editor->setColour(juce::TextEditor::outlineColourId, Colors::boxLine());
-  editor->setIndents(3, 0);
+  editor->setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
+  editor->setIndents(4, 0);
   editor->applyFontToAllText(getFont());
   editor->selectAll();
 }
@@ -315,17 +301,16 @@ void MenuBox::paint(juce::Graphics &g)
   // the text, then a small triangle
   const float arrowW = 7;
   const float tw = textWidth(m_font, m_shown);
-  const float total = tw + 3 + arrowW;
-  float x = r.getX() + std::max(4.0f, floorf((r.getWidth() - total) / 2));
+  float x = r.getX() + 4;
   g.setFont(m_font);
   g.setColour(Colors::value().withMultipliedAlpha(a));
   g.drawText(str(m_shown), juce::Rectangle<float>(x, r.getY(), r.getRight() - arrowW - 2 - x, r.getHeight()), juce::Justification::centredLeft, false);
   x = std::min(x + tw + 3, r.getRight() - arrowW - 3);
   const float cy = floorf(r.getCentreY()) + 0.5f;
   juce::Path p;
-  p.startNewSubPath(x, cy - 2);
-  p.lineTo(x + arrowW - 1, cy - 2);
-  p.lineTo(x + (arrowW - 1) / 2, cy + 2);
+  p.startNewSubPath(x, cy - 1.5f);
+  p.lineTo(x + arrowW - 1, cy - 1.5f);
+  p.lineTo(x + (arrowW - 1) / 2, cy + 2.5f);
   p.closeSubPath();
   g.setColour(Colors::label().withMultipliedAlpha(a));
   g.fillPath(p);
@@ -418,18 +403,24 @@ void FaderBox::paint(juce::Graphics &g)
 {
   const juce::Rectangle<float> r = getLocalBounds().toFloat();
   drawBox(g, r);
-  juce::Rectangle<float> fill = r.reduced(1, 1);
-  fill.setWidth(floorf(fill.getWidth() * value() + 0.5f));
-  if (fill.getWidth() > 0)
+  // the fill up to the level, inside the box's round corners, and a light edge there
+  const float w = floorf(r.getWidth() * value() + 0.5f);
+  if (w > 0)
   {
+    juce::Graphics::ScopedSaveState state(g);
+    juce::Path box;
+    box.addRoundedRectangle(r, RADIUS);
+    g.reduceClipRegion(box);
     g.setColour(Colors::faderFill());
-    g.fillRect(fill);
+    g.fillRect(r.withWidth(w));
+    g.setColour(Colors::faderHandle());
+    g.fillRect(juce::Rectangle<float>(std::max(r.getX(), r.getX() + w - 2), r.getY(), 2, r.getHeight()));
   }
   if (format)
   {
     g.setFont(m_font);
-    g.setColour(Colors::buttonText());
-    g.drawText(str(format(value())), getLocalBounds().withTrimmedRight(3), juce::Justification::centredRight, false);
+    g.setColour(Colors::value().withMultipliedAlpha(isEnabled() ? 1.0f : 0.5f));
+    g.drawText(str(format(value())), getLocalBounds().withTrimmedLeft(5), juce::Justification::centredLeft, false);
   }
 }
 
@@ -445,70 +436,269 @@ void ArcKnob::paint(juce::Graphics &g)
   const juce::Rectangle<float> r = getLocalBounds().toFloat();
   const float d = std::min(r.getWidth(), r.getHeight());
   const juce::Point<float> c = r.getCentre();
-  const juce::Rectangle<float> disc(c.x - d / 2, c.y - d / 2, d, d);
-  g.setColour(Colors::box());
-  g.fillEllipse(disc);
+  const float radius = d / 2 - 1; // the middle of the 2 px ring
 
-  // the ring, 2 px wide, 2 px in; then the value's arc over it
-  const juce::Rectangle<float> ring = disc.reduced(3, 3);
-  g.setColour(Colors::knobRing());
-  g.drawEllipse(ring, 2.0f);
-
-  // angles clockwise from the top, as JUCE measures them
-  const double v = value();
-  double from, to;
-  if (m_bipolar)
-  {
-    from = 0; // the top
-    to = (v - 0.5) * 2 * 135;
-  }
-  else
-  {
-    from = -135; // the start of its travel, bottom left
-    to = -135 + v * 270;
-  }
-  if (fabs(to - from) > 0.5)
-  {
+  // angles clockwise from the top, as JUCE measures them; the ring from bottom left to bottom right
+  auto arc = [&](double from, double to, juce::Colour color) {
+    if (to - from < 0.5) return;
     juce::Path p;
-    p.addCentredArc(c.x, c.y, ring.getWidth() / 2, ring.getHeight() / 2, 0, (float)(std::min(from, to) * PI / 180),
-                    (float)(std::max(from, to) * PI / 180), true);
-    g.setColour(Colors::yellow());
+    p.addCentredArc(c.x, c.y, radius, radius, 0, (float)(from * PI / 180), (float)(to * PI / 180), true);
+    g.setColour(color);
     g.strokePath(p, juce::PathStrokeType(2.0f, juce::PathStrokeType::mitered, juce::PathStrokeType::butt));
-  }
-  // a tick at the value
+  };
+  arc(-135, 135, Colors::knobRing());
+  const double v = value();
+  const double from = m_bipolar ? 0 : -135; // the top (pan), or the start of the travel (a volume)
+  const double to = m_bipolar ? (v - 0.5) * 2 * 135 : -135 + v * 270;
+  arc(std::min(from, to), std::max(from, to), Colors::yellow());
+
+  // the pointer, from the middle to the ring
   const double a = to * PI / 180.0;
-  const float rr = ring.getWidth() / 2;
   g.setColour(Colors::value());
-  g.drawLine(c.x + (float)sin(a) * (rr - 3), c.y - (float)cos(a) * (rr - 3), c.x + (float)sin(a) * (rr + 1), c.y - (float)cos(a) * (rr + 1), 1.5f);
+  g.drawLine(c.x, c.y, c.x + (float)sin(a) * (d / 2 - 0.5f), c.y - (float)cos(a) * (d / 2 - 0.5f), 1.5f);
 }
 
 // ---------------------------------------------------------------------------
 
-void SegmentMeter::setPeak(float peak)
+void LevelMeter::setLevel(float peak, double now)
 {
-  const int n = uitext::litSegments(peak);
-  if (n == m_lit) return;
-  m_lit = n;
+  // falls 24 dB a second; the peak mark holds for 1.5 s, then falls as fast
+  const float fall = 24.0f / -uitext::METER_FLOOR_DB;
+  const double dt = m_last > 0 ? std::min(0.25, std::max(0.0, now - m_last)) : 0.0;
+  m_last = now;
+  const float f = uitext::meterFraction(peak);
+  const float level = std::max(f, m_level - fall * (float)dt);
+  float peakMark = m_peak;
+  if (f >= m_peak)
+  {
+    peakMark = f;
+    m_peakAt = now;
+  }
+  else if (now - m_peakAt > 1.5)
+    peakMark = std::max(level, m_peak - fall * (float)dt);
+  const bool clip = m_clip || peak >= 0.999f;
+  if (fabsf(level - m_level) < 0.002f && fabsf(peakMark - m_peak) < 0.002f && clip == m_clip) return;
+  m_level = level;
+  m_peak = peakMark;
+  m_clip = clip;
   repaint();
 }
 
-void SegmentMeter::paint(juce::Graphics &g)
+void LevelMeter::mouseDown(const juce::MouseEvent &e)
+{
+  if (!e.mods.isLeftButtonDown() || !m_clip) return;
+  m_clip = false;
+  repaint();
+}
+
+void LevelMeter::paint(juce::Graphics &g)
 {
   const juce::Rectangle<float> r = getLocalBounds().toFloat();
-  const float h = std::min(8.0f, r.getHeight());
-  const juce::Rectangle<float> m(r.getX(), floorf(r.getCentreY() - h / 2), r.getWidth(), h);
-  g.setColour(Colors::boxLine());
-  g.fillRect(m);
-  const int n = uitext::METER_SEGMENTS;
-  const float gap = 1, inner = m.getWidth() - 2 - gap * (float)(n - 1);
-  for (int i = 0; i < n; i ++)
+  const float h = 6, lampW = 4, top = floorf(r.getCentreY() - h / 2);
+  const juce::Rectangle<float> track(r.getX(), top, std::max(0.0f, r.getWidth() - lampW - 2), h);
+  g.setColour(Colors::meterTrack());
+  g.fillRoundedRectangle(track, 1.0f);
+
+  // green, amber from -12 dB, red from -3 dB, up to the level
+  const float x0 = track.getX(), w = track.getWidth();
+  auto zone = [&](float from, float to, juce::Colour color) {
+    to = std::min(to, m_level);
+    if (to <= from) return;
+    const float a = x0 + floorf(w * from), b = x0 + floorf(w * to + 0.5f);
+    if (b <= a) return;
+    g.setColour(color);
+    g.fillRect(juce::Rectangle<float>(a, top, b - a, h));
+  };
+  zone(0, uitext::METER_AMBER, Colors::green());
+  zone(uitext::METER_AMBER, uitext::METER_RED, Colors::amber());
+  zone(uitext::METER_RED, 1, Colors::red());
+  if (m_peak > 0.01f)
   {
-    const float x0 = m.getX() + 1 + floorf((float)i * (inner / (float)n + gap)), x1 = m.getX() + 1 + floorf((float)i * (inner / (float)n + gap) + inner / (float)n);
-    juce::Colour c = Colors::meterOff();
-    if (i < m_lit) c = i >= n - 2 ? Colors::meterYellow() : Colors::green();
-    g.setColour(c);
-    g.fillRect(juce::Rectangle<float>(x0, m.getY() + 1, x1 - x0, m.getHeight() - 2));
+    g.setColour(Colors::peakMark());
+    g.fillRect(juce::Rectangle<float>(x0 + std::min(w - 1, floorf(w * m_peak)), top, 1, h));
   }
+  g.setColour(m_clip ? Colors::red() : Colors::lampOff());
+  g.fillRoundedRectangle(juce::Rectangle<float>(r.getRight() - lampW, top, lampW, h), 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+
+NameCell::NameCell(const juce::Font &nameFont, const juce::Font &statusFont, float statusGap)
+  : m_nameFont(nameFont), m_statusFont(statusFont), m_gap(statusGap)
+{
+}
+
+void NameCell::setPlayer(const std::string &name, const std::string &channel)
+{
+  if (name == m_name && channel == m_channel) return;
+  m_name = name;
+  m_channel = channel;
+  repaint();
+}
+
+void NameCell::setStatus(const std::string &status, juce::Colour color)
+{
+  if (status == m_status && color == m_statusColor) return;
+  m_status = status;
+  m_statusColor = color;
+  repaint();
+}
+
+void NameCell::setNameColor(juce::Colour c)
+{
+  if (c == m_nameColor) return;
+  m_nameColor = c;
+  repaint();
+}
+
+void NameCell::paint(juce::Graphics &g)
+{
+  const float w = (float)getWidth(), h = (float)getHeight();
+  float x = 0;
+  // as much as fits, cut with an ellipsis: the name first, then the channel, then the status
+  auto part = [&](const std::string &text, const juce::Font &font, juce::Colour color) {
+    if (text.empty() || x >= w - 4) return;
+    g.setFont(font);
+    g.setColour(color);
+    const float tw = textWidth(font, text);
+    g.drawText(str(text), juce::Rectangle<float>(x, 0, w - x, h), juce::Justification::centredLeft, true);
+    x += tw;
+  };
+  part(m_name, m_nameFont, m_nameColor);
+  if (!m_channel.empty()) part(" \xc2\xb7 " + m_channel, m_nameFont, Colors::label());
+  if (!m_status.empty() && x + m_gap < w - 20)
+  {
+    x += m_gap;
+    part(m_status, m_statusFont, m_statusColor);
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+Chip::Chip(const juce::Font &font) : m_font(font)
+{
+  setInterceptsMouseClicks(true, false); // for its tooltip
+}
+
+void Chip::set(const std::string &text, const std::string &who)
+{
+  if (text == m_text && who == m_who) return;
+  m_text = text;
+  m_who = who;
+  repaint();
+}
+
+void Chip::paint(juce::Graphics &g)
+{
+  const juce::Rectangle<float> r = getLocalBounds().toFloat();
+  fillRect(g, r, RADIUS, Colors::chip());
+  g.setFont(m_font);
+  const float whoW = m_who.empty() ? 0 : textWidth(m_font, m_who);
+  if (whoW > 0)
+  {
+    g.setColour(Colors::purpleDim());
+    g.drawText(str(m_who), r.withTrimmedRight(5), juce::Justification::centredRight, true);
+  }
+  g.setColour(Colors::purple());
+  g.drawText(str(m_text), r.withTrimmedLeft(5).withTrimmedRight(5 + (whoW > 0 ? whoW + 4 : 0)), juce::Justification::centredLeft, true);
+}
+
+// ---------------------------------------------------------------------------
+
+EventList::EventList(const juce::Font &font) : m_font(font)
+{
+}
+
+void EventList::setEvents(const std::vector<Event> &events)
+{
+  bool same = events.size() == m_events.size();
+  for (size_t i = 0; same && i < events.size(); i ++)
+    same = events[i].text == m_events[i].text && events[i].time == m_events[i].time && events[i].color == m_events[i].color;
+  if (same) return;
+  // a new line at the top keeps the lines scrolled to where they were
+  if (m_scroll > 0 && !m_events.empty() && events.size() > m_events.size())
+    m_scroll += (int)(events.size() - m_events.size());
+  m_events = events;
+  repaint();
+}
+
+void EventList::setPlaceholder(const std::string &text)
+{
+  if (text == m_placeholder) return;
+  m_placeholder = text;
+  repaint();
+}
+
+void EventList::setNow(double now)
+{
+  m_now = now;
+  // the ages change each second at most
+  const long second = (long)floor(now);
+  if (second == m_shownSecond) return;
+  m_shownSecond = second;
+  if (!m_events.empty()) repaint();
+}
+
+int EventList::visibleLines() const
+{
+  return std::max(1, getHeight() / (int)LINE_H);
+}
+
+void EventList::paint(juce::Graphics &g)
+{
+  const float w = (float)getWidth();
+  g.setFont(m_font);
+  if (m_events.empty())
+  {
+    g.setColour(Colors::faint());
+    g.drawText(str(m_placeholder), juce::Rectangle<float>(0, 0, w, (float)LINE_H), juce::Justification::centredLeft, true);
+    return;
+  }
+  const int rows = visibleLines();
+  const bool more = (int)m_events.size() > rows;
+  m_scroll = std::max(0, std::min(m_scroll, (int)m_events.size() - rows));
+  for (int i = 0; i < rows && m_scroll + i < (int)m_events.size(); i ++)
+  {
+    const Event &e = m_events[(size_t)(m_scroll + i)];
+    const juce::Rectangle<float> line(0, (float)(i * LINE_H), more ? w - 6 : w, (float)LINE_H);
+    const std::string age = uitext::ageText(m_now - e.time);
+    const float ageW = textWidth(m_font, age);
+    g.setColour(Colors::faint());
+    g.drawText(str(age), line, juce::Justification::centredRight, false);
+    g.setColour(e.color);
+    g.drawText(str(e.text), line.withTrimmedRight(ageW + 6), juce::Justification::centredLeft, true);
+  }
+  // more below, or above: a mark at the right edge
+  if (more)
+  {
+    const float trackH = (float)(rows * LINE_H);
+    const float thumbH = std::max(8.0f, trackH * (float)rows / (float)m_events.size());
+    const float top = (trackH - thumbH) * (float)m_scroll / (float)((int)m_events.size() - rows);
+    g.setColour(Colors::separator());
+    g.fillRect(juce::Rectangle<float>(w - 2, top, 2, thumbH));
+  }
+}
+
+void EventList::mouseWheelMove(const juce::MouseEvent &, const juce::MouseWheelDetails &wheel)
+{
+  if (wheel.deltaY == 0) return;
+  double d = wheel.deltaY;
+  if (wheel.isReversed) d = -d;
+  int steps = (int)lround(d * 10);
+  if (!steps) steps = d > 0 ? 1 : -1;
+  m_scroll = std::max(0, std::min(m_scroll - steps, std::max(0, (int)m_events.size() - visibleLines())));
+  repaint();
+}
+
+juce::String EventList::getTooltip()
+{
+  // the line under the mouse, whole
+  const juce::Point<int> p = getMouseXYRelative();
+  const int i = m_scroll + p.y / (int)LINE_H;
+  if (p.y < 0 || i < 0 || i >= (int)m_events.size()) return {};
+  const Event &e = m_events[(size_t)i];
+  const float room = (float)getWidth() - textWidth(m_font, uitext::ageText(m_now - e.time)) - 12;
+  return textWidth(m_font, e.text) > room ? str(e.text) : juce::String();
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +717,7 @@ void BeatCells::paint(juce::Graphics &g)
 {
   const juce::Rectangle<float> r = getLocalBounds().toFloat();
   const int n = m_bpi > 0 ? m_bpi : 16;
-  const float h = std::min(12.0f, r.getHeight());
+  const float h = std::min(11.0f, r.getHeight());
   const float top = floorf(r.getCentreY() - h / 2);
   const float gap = r.getWidth() / (float)n >= 6 ? 2.0f : (r.getWidth() / (float)n >= 3 ? 1.0f : 0.0f);
   const float cellW = (r.getWidth() - gap * (float)(n - 1)) / (float)n;
@@ -535,21 +725,20 @@ void BeatCells::paint(juce::Graphics &g)
   {
     const float x0 = floorf(r.getX() + (float)b * (cellW + gap)), x1 = floorf(r.getX() + (float)b * (cellW + gap) + cellW);
     if (x1 <= x0) continue;
-    juce::Colour fill = b % 4 == 0 ? Colors::downbeat() : Colors::box();
-    if (m_bpi > 0 && b < m_beat) fill = Colors::pastBeat();
+    // the first of each four a little lighter, played or not
+    const bool first = b % 4 == 0;
+    juce::Colour fill = first ? Colors::downbeat() : Colors::box();
+    if (m_bpi > 0 && b < m_beat) fill = first ? Colors::pastDownbeat() : Colors::pastBeat();
     if (m_bpi > 0 && b == m_beat) fill = Colors::yellow();
-    const juce::Rectangle<float> cell(x0, top, x1 - x0, h);
-    g.setColour(Colors::boxLine());
-    g.fillRect(cell);
     g.setColour(fill);
-    g.fillRect(cell.reduced(1, 1));
+    g.fillRoundedRectangle(juce::Rectangle<float>(x0, top, x1 - x0, h), 1.0f);
   }
 }
 
 // ---------------------------------------------------------------------------
 
 AddressBox::AddressBox(const Fonts &fonts, const std::string &key)
-  : m_keyFont(fonts.small), m_monoFont(fonts.mono), m_buttonFont(fonts.label), m_key(key)
+  : m_keyFont(fonts.label), m_monoFont(fonts.mono), m_buttonFont(fonts.button), m_key(key)
 {
 }
 
@@ -579,43 +768,50 @@ float AddressBox::preferredWidth() const
 {
   const std::string shown = m_address.empty() ? m_placeholder : m_address;
   const juce::Font &font = m_address.empty() ? m_keyFont : m_monoFont;
-  return 5 + textWidth(m_keyFont, m_key) + 5 + textWidth(font, shown) + 6 + textWidth(m_buttonFont, "Copied") + 10;
+  return boxLeft() + std::max(84.0f, textWidth(font, shown) + 8) + 5 + textWidth(m_buttonFont, "Copied") + 12;
+}
+
+float AddressBox::boxLeft() const
+{
+  return m_key.empty() ? 0 : textWidth(m_keyFont, m_key) + 5;
 }
 
 juce::Rectangle<float> AddressBox::copyRect() const
 {
   const juce::Rectangle<float> r = getLocalBounds().toFloat();
-  const float w = textWidth(m_buttonFont, "Copied") + 10;
-  return juce::Rectangle<float>(r.getRight() - 1 - w, r.getY() + 1, w, r.getHeight() - 2);
+  const float w = textWidth(m_buttonFont, "Copied") + 12;
+  return juce::Rectangle<float>(r.getRight() - w, r.getY(), w, r.getHeight());
 }
 
 void AddressBox::paint(juce::Graphics &g)
 {
   const juce::Rectangle<float> r = getLocalBounds().toFloat();
-  drawBox(g, r);
-  float x = r.getX() + 5;
-  g.setFont(m_keyFont);
-  g.setColour(Colors::label());
-  g.drawText(str(m_key), juce::Rectangle<float>(x, r.getY(), r.getRight() - x, r.getHeight()), juce::Justification::centredLeft, false);
-  x += textWidth(m_keyFont, m_key) + 5;
+  // the label, then the box with the address, then the button
+  if (!m_key.empty())
+  {
+    g.setFont(m_keyFont);
+    g.setColour(Colors::label());
+    g.drawText(str(m_key), r, juce::Justification::centredLeft, false);
+  }
   const juce::Rectangle<float> copy = copyRect();
-  const juce::Rectangle<float> textArea(x, r.getY(), std::max(0.0f, copy.getX() - 4 - x), r.getHeight());
+  const float x = r.getX() + boxLeft();
+  const juce::Rectangle<float> box(x, r.getY(), std::max(0.0f, copy.getX() - 5 - x), r.getHeight());
+  drawBox(g, box);
   if (m_address.empty())
   {
     g.setFont(m_keyFont);
-    g.setColour(Colors::placeholder());
-    g.drawText(str(m_placeholder), textArea, juce::Justification::centredLeft, true);
+    g.setColour(Colors::faint());
+    g.drawText(str(m_placeholder), box.withTrimmedLeft(4).withTrimmedRight(2), juce::Justification::centredLeft, true);
   }
   else
   {
     g.setFont(m_monoFont);
     g.setColour(Colors::value());
-    g.drawText(str(m_address), textArea, juce::Justification::centredLeft, true);
+    g.drawText(str(m_address), box.withTrimmedLeft(4).withTrimmedRight(2), juce::Justification::centredLeft, true);
   }
   // the button: off when there is nothing to copy
   const bool can = !m_address.empty();
-  g.setColour(m_pressed ? juce::Colour(0xff5e5e5e) : Colors::buttonOff().withMultipliedAlpha(can ? 1.0f : 0.5f));
-  g.fillRect(copy);
+  fillRect(g, copy, RADIUS, m_pressed ? Colors::buttonPressed() : Colors::buttonOff().withMultipliedAlpha(can ? 1.0f : 0.5f));
   g.setFont(m_buttonFont);
   g.setColour(Colors::buttonText().withMultipliedAlpha(can ? 1.0f : 0.4f));
   g.drawText(str(m_copyTitle), copy, juce::Justification::centred, false);
@@ -794,6 +990,7 @@ void TextLinesView::mouseWheelMove(const juce::MouseEvent &, const juce::MouseWh
 
 LookAndFeel::LookAndFeel(const Fonts &fonts) : m_fonts(fonts)
 {
+  setDefaultSansSerifTypeface(fonts.regular);
   setColour(juce::TextEditor::textColourId, Colors::value());
   setColour(juce::TextEditor::highlightedTextColourId, Colors::dark());
   setColour(juce::TextEditor::highlightColourId, Colors::yellow());
@@ -816,7 +1013,8 @@ void LookAndFeel::fillTextEditorBackground(juce::Graphics &g, int width, int hei
 
 void LookAndFeel::drawTextEditorOutline(juce::Graphics &g, int width, int height, juce::TextEditor &editor)
 {
-  g.setColour(editor.hasKeyboardFocus(true) ? Colors::yellowLine() : Colors::boxLine());
+  if (!editor.hasKeyboardFocus(true) || editor.isReadOnly()) return;
+  g.setColour(Colors::yellowLine());
   g.drawRoundedRectangle(juce::Rectangle<float>(0, 0, (float)width, (float)height).reduced(0.5f), RADIUS, 1.0f);
 }
 
@@ -867,7 +1065,7 @@ juce::Rectangle<int> LookAndFeel::getTooltipBounds(const juce::String &tipText, 
 {
   juce::AttributedString s;
   s.setJustification(juce::Justification::centredLeft);
-  s.append(tipText, m_fonts.chat, Colors::value());
+  s.append(tipText, m_fonts.text, Colors::value());
   juce::TextLayout layout;
   layout.createLayout(s, 400.0f);
   const int w = (int)ceilf(layout.getWidth()) + 14, h = (int)ceilf(layout.getHeight()) + 8;
@@ -885,7 +1083,7 @@ void LookAndFeel::drawTooltip(juce::Graphics &g, const juce::String &text, int w
   g.drawRoundedRectangle(r.reduced(0.5f), RADIUS, 1.0f);
   juce::AttributedString s;
   s.setJustification(juce::Justification::centredLeft);
-  s.append(text, m_fonts.chat, findColour(juce::TooltipWindow::textColourId));
+  s.append(text, m_fonts.text, findColour(juce::TooltipWindow::textColourId));
   juce::TextLayout layout;
   layout.createLayout(s, (float)width - 14);
   layout.draw(g, r.reduced(7, 4));
@@ -927,7 +1125,7 @@ juce::TextEditor *makeEdit(const juce::Font &font, const juce::String &placehold
   e->setColour(juce::TextEditor::backgroundColourId, juce::Colours::transparentBlack);
   e->setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
   e->setColour(juce::TextEditor::focusedOutlineColourId, juce::Colours::transparentBlack);
-  e->setTextToShowWhenEmpty(placeholder, Colors::placeholder());
+  e->setTextToShowWhenEmpty(placeholder, Colors::faint());
   e->setSelectAllWhenFocused(false);
   return e;
 }

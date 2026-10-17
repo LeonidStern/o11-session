@@ -156,11 +156,12 @@ private:
 // a tempo as the editor writes it: "120", "109.6", "120.25"
 std::string bpmText(double bpm);
 
-// What to call the host: "Live" for Ableton Live, else its name (or "The DAW")
+// What to call the host: "Live" for Ableton Live, else its name (or "The DAW" when it doesn't say)
 std::string shortHostName(const std::string &hostName);
 
-// The host's name where there is little room (the transport bar): shortHostName() if it is
-// short, else "Host"
+// The host's name where there is little room (the transport bar): shortHostName() without a
+// maker or version in it, or its first word, if that fits in ten characters ("Live", "Bitwig",
+// "Cubase", "REAPER"), else "DAW"
 std::string hostChipName(const std::string &hostName);
 
 // The line the editor shows when the host's tempo isn't the room's, such as

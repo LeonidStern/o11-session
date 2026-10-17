@@ -46,9 +46,12 @@ checks the plug-in with pluginval.
   and `ASIO_DISABLE_VISIBILITY`, so Link's and asio's code stays inside the
   plug-in, apart from the host's own Link.
 - `O11 Session`: the VST3, from `o11_core` plus `processor.cpp` (the
-  `juce::AudioProcessor`), `editor.cpp` and `views.cpp` (the editor).
+  `juce::AudioProcessor`), `editor.cpp` and `views.cpp` (the editor), and
+  `o11_fonts` (Inter, from `fonts/`, as JUCE binary data).
 - `o11_unit_test` and `o11_e2e_test` (see Tests). o11proto's own tests are
   built and run too, as it is added as a subdirectory.
+- `o11_editor_shots`, only with `-DO11_EDITOR_SHOTS=ON`: pictures of the
+  editor (see Tests).
 
 ## What is ported
 
@@ -109,18 +112,44 @@ Everything the old plug-in did on its own, in the same way:
   (playing, ppq and tempo) instead of VST3's `ProcessContext`.
 - The state: the same text format (`O11-SESSION-STATE 1`), so a state saved
   by the old plug-in loads here.
-- The editor, in JUCE: the same 720 x 330 layout, resizable with the same
-  limits and zoom, the same colours, fonts, texts and tooltips; the BPM box
-  that drags and takes typed values, the BPI, codec and bitrate menus, the
-  faders and pan knobs, the meters, the beat cells, the chat, the host bar
-  with the server's address to copy and the port's state, and the licence over
-  everything.
+- The editor, in JUCE, resizable with the same limits and zoom (720 x 330 to
+  start), with the licence over everything; its layout is new (see Changed on
+  purpose).
 - The text commands of `Engine::command()` (`connect`, `disconnect`, `name`,
   `host`, `chat`, `license`, `transmit`, `monitor`, `metronome`, `bitrate`,
   `codec`, `follow`, `vote`, `status`, `users`, `chatlog`, `nextinterval`,
   `syncnote`, `synctip`), for the tests and automation.
 
 ### Changed on purpose
+
+- The editor is laid out anew (layout B, in the style of Max for Live
+  devices), with no chat:
+  - the header: the name, the server (an IP address; "this computer" while
+    hosting), Connect, and the connection's state;
+  - the transport: Sync with the host's tempo, the click and its volume, the
+    beat cells, and the beat of the interval;
+  - the mixer: your row (TX, IN, what you send: "sending", "not sending",
+    "paused: Live stopped", with the host's name), the input fader and meter,
+    then a row per player's channel: name, a short status ("joined 4 s ago"
+    for half a minute, "silent" when nothing was heard for two intervals, or
+    ten seconds if longer), volume, pan, mute, solo, and a meter (green, amber
+    from -12 dB, red from -3 dB, a peak hold, and a clip lamp a click clears;
+    scaled from -60 dB);
+  - the room panel: the players, BPM, interval ("16 beats"), codec and
+    bitrate, a chip for each change coming at the next interval ("BPM 100 from
+    next interval"), and Recent: joins, leaves, votes and settings changes, the
+    server's notes and the host's warnings, newest first, with their age;
+  - the host bar: Host, the players ("8 in room · full"), the address to copy,
+    and the port's state ("Only your network can join" behind carrier-grade
+    NAT).
+
+  The transport bar names the host shortly: "Live", "Bitwig", "Cubase",
+  "REAPER", or "DAW" when the host doesn't say or the name doesn't fit. Text is
+  in Inter, embedded in the plug-in. The chat commands (`chat`, `chatlog`)
+  still work for tests and automation. Not shown, because nothing tells the
+  plug-in: who voted for a change (the server doesn't pass the vote on),
+  dropouts (o11proto's engine doesn't count them), and the level of a muted
+  player (the engine's peak is after the mute).
 
 - A player's channel you hear for the first time starts at 0 dB, as in the old
   plug-in (o11proto's engine starts them at -12 dB on its own).
@@ -148,7 +177,9 @@ Everything the old plug-in did on its own, in the same way:
 - `o11_unit_test`: the saved state (also in a locale that writes 95,5 when
   one is installed), the players' names, the text commands, the bar math and
   the bar sync against a simulated host (loops, moves, jitter, long runs),
-  the tempo follower, the texts about the host, the click (shape, spectrum,
+  the tempo follower, the texts about the host (and its short name), the
+  editor's texts (the meter's scale, beats, players, how long ago), the room's
+  recent events as read from the server's lines, the click (shape, spectrum,
   the same at 44.1, 48 and 96 kHz), the controls' texts, and the room's
   addresses: the port mapper's and the server's lines as read, the public
   address lookup against a "what's my IP" service on localhost, and what the
@@ -172,6 +203,12 @@ Everything the old plug-in did on its own, in the same way:
   Link doesn't see it (no multicast). The old plug-in's Python end-to-end
   checks of a host that follows Link (the measured latency, the restores, the
   hint once its Link is off) are not ported; the unit tests cover that logic.
+- `o11_editor_shots` (with `-DO11_EDITOR_SHOTS=ON`; not run by ctest):
+  plug-in instances in one process with their own audio threads, one hosting
+  a room and up to seven joining it, and the host's editor painted as PNGs at
+  each stage (first open, alone, a room with changes coming, a full room, the
+  smallest and a larger window). It needs a display:
+  `O11_HOST_PORT=0 O11_PORTMAP=off O11_WHATSMYIP=off xvfb-run -a o11_editor_shots <folder>`.
 
 ## Deferred
 
@@ -185,8 +222,10 @@ The plug-in's own sources (`plugin/`) are by the O11 Session contributors. JUCE 
 available under the AGPLv3 or a commercial licence from JUCE; the plug-in is
 built without `JUCE_DISPLAY_SPLASH_SCREEN=0`, as the free licence requires.
 Opus, FLAC, miniupnpc and libnatpmp are BSD licensed; o11proto is this
-repository's. Ableton Link is under the GPL, version 2 or later, and is in
-every build, so the plug-in as built is GPL (with JUCE under its AGPLv3, the
+repository's. The Inter font (`fonts/`, 4.1) is under the SIL Open Font
+License 1.1 (`fonts/Inter-LICENSE.txt`; the licence is in the font files
+too). Ableton Link is under the GPL, version 2 or later, and is in every
+build, so the plug-in as built is GPL (with JUCE under its AGPLv3, the
 combination is under the GPLv3 and AGPLv3 terms) unless Link and JUCE are
 licensed commercially. Under which licence the plug-in's own sources are
 released is decided at release, by Leo.

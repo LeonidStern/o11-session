@@ -38,6 +38,7 @@ static const char *LOCAL_CHANNEL_NAME = "main";
 static const double LICENSE_WAIT_SECONDS = 60.0;
 static const double PUBLISH_INTERVAL = 0.03;
 static const double SYNC_NOTE_DELAY = 3.0; // the host's tempo differs this long before the note shows
+static const double JOIN_GRACE = 3.0;      // the players listed this long after you join were there first
 static const double LINK_POLL = 0.05;
 static const double LINK_DISCOVERY = 2.0;  // Link finds the other apps on the network within this, once on
 static const double LINK_HINT_DELAY = 3.0; // in a room, with no other Link app for this long: "Turn on Link in Live"
@@ -47,6 +48,11 @@ static double now_seconds()
 {
   using namespace std::chrono;
   return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+double nowSeconds()
+{
+  return now_seconds();
 }
 
 static std::string trim(const std::string &s)
@@ -587,6 +593,7 @@ void Engine::addChat(ChatLine::Kind kind, const std::string &who, const std::str
   l.kind = kind;
   l.who = who;
   l.text = text;
+  l.time = now_seconds();
   m_chat.push_back(l);
   while (m_chat.size() > MAX_CHAT_LINES) m_chat.pop_front();
   m_chatRevision ++;
@@ -918,6 +925,7 @@ void Engine::doConnect(const std::string &serverIn, const std::string &userIn)
 
   m_server = server;
   m_appliedRemote.clear();
+  m_joinedAt.clear();
   m_warnedCantSend = false;
   m_state = ConnState::Connecting;
   m_connectTime = now_seconds();
@@ -1192,6 +1200,16 @@ void Engine::updateUsers(Snapshot &snap)
     RemoteUserView uv;
     uv.name = m_client->userName(u);
     uv.displayName = displayName(uv.name);
+    {
+      // the players in the room when you came (the first seconds) were there first
+      auto it = m_joinedAt.find(uv.name);
+      if (it == m_joinedAt.end())
+      {
+        const double t = now_seconds();
+        it = m_joinedAt.emplace(uv.name, m_state == ConnState::Connected && t - m_connectedTime > JOIN_GRACE ? t : 0.0).first;
+      }
+      uv.joinedAt = it->second;
+    }
     signature += uv.name + "\n";
     for (int i = 0; ; i ++)
     {
@@ -1242,6 +1260,13 @@ void Engine::updateUsers(Snapshot &snap)
     }
     snap.users.push_back(uv);
   }
+  // a player who leaves and comes back joins again
+  for (auto it = m_joinedAt.begin(); it != m_joinedAt.end();)
+  {
+    bool here = false;
+    for (const RemoteUserView &u : snap.users) here = here || u.name == it->first;
+    it = here ? std::next(it) : m_joinedAt.erase(it);
+  }
 
   {
     std::lock_guard<std::mutex> lock(m_snapMutex);
@@ -1272,8 +1297,9 @@ void Engine::pollHosting(Snapshot &snap)
     snap.hostLookupPending = st.lookupPending;
     snap.hostJoinedFromInternet = st.joinedFromInternet;
     snap.hostUsers = st.users;
+    snap.hostMaxUsers = HostServer::MAX_USERS;
     for (const std::string &m : HostServer::instance().messagesSince(&m_hostLogSerial))
-      addChat(ChatLine::Server, "", m);
+      addChat(ChatLine::Host, "", m);
   }
   else if (st.owner && st.owner != this) snap.hostedElsewherePort = st.port;
   snap.hostBusy = m_hostBusy;
@@ -1295,8 +1321,10 @@ void Engine::publish()
     snap.bpi = m_client->serverBpi();
     m_client->position(&snap.intervalPos, &snap.intervalLength);
     snap.intervalBeats = m_client->bpi();
+    snap.intervalBpm = (float)m_client->bpm();
     if (m_state == ConnState::Connected)
     {
+      snap.roomSince = m_connectTime;
       snap.roomCodec = codec_name(m_client->codecMask());
       snap.roomOpusKbps = m_client->roomOpusKbps();
       const unsigned int upload = m_client->uploadCodec();
@@ -1412,11 +1440,11 @@ void Engine::onChat(const std::array<std::string, 5> &fields)
   }
   else if (cmd == "JOIN" && !p1.empty())
   {
-    addChat(ChatLine::System, "", displayName(p1) + " joined");
+    addChat(ChatLine::Join, displayName(p1), displayName(p1) + " joined");
   }
   else if (cmd == "PART" && !p1.empty())
   {
-    addChat(ChatLine::System, "", displayName(p1) + " left");
+    addChat(ChatLine::Leave, displayName(p1), displayName(p1) + " left");
   }
 }
 

@@ -581,6 +581,7 @@ static void test_host_note()
   CHECK_EQ(shortHostName(" Live "), "Live");
   CHECK_EQ(shortHostName("Bitwig Studio"), "Bitwig Studio");
   CHECK_EQ(shortHostName(""), "The DAW");
+  CHECK_EQ(shortHostName("Unknown"), "The DAW");
   CHECK_EQ(shortHostName("A very long host name that goes on and on"), "A very long host name that goes ");
   CHECK_EQ(shortHostName("\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9x\xc3\xa9\xc3\xa9"),
            "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9x");
@@ -605,15 +606,23 @@ static void test_host_note()
   // the transport bar's name for the host
   CHECK_EQ(hostChipName("Ableton Live 12 Suite"), "Live");
   CHECK_EQ(hostChipName("REAPER"), "REAPER");
-  CHECK_EQ(hostChipName("Bitwig Studio"), "Host");
-  CHECK_EQ(hostChipName(""), "Host");
+  CHECK_EQ(hostChipName("Bitwig Studio"), "Bitwig");
+  CHECK_EQ(hostChipName("Steinberg Cubase 10.5"), "Cubase");
+  CHECK_EQ(hostChipName("Steinberg Nuendo"), "Nuendo");
+  CHECK_EQ(hostChipName("Studio One"), "Studio One");
+  CHECK_EQ(hostChipName("Tracktion Waveform"), "Waveform");
+  CHECK_EQ(hostChipName("Cakewalk by Bandlab"), "Cakewalk");
+  CHECK_EQ(hostChipName("Reason"), "Reason");
+  CHECK_EQ(hostChipName(""), "DAW");
+  CHECK_EQ(hostChipName("Unknown"), "DAW");
+  CHECK_EQ(hostChipName("Abcdefghijklmnop"), "DAW");
   CHECK_EQ(hostChipName("\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"), "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9");
 
   // where the next interval starts, in the host's bars
   CHECK_EQ(nextIntervalText("Live", 32, 4, 4), "Next interval at Live bar 9");
   CHECK_EQ(nextIntervalText("Live", 31.9999999, 0, 0), "Next interval at Live bar 9"); // 4/4 when the host doesn't say
   CHECK_EQ(nextIntervalText("Live", 34, 4, 4), "Next interval at Live bar 9, beat 3");
-  CHECK_EQ(nextIntervalText("Host", 0, 3, 4), "Next interval at Host bar 1");
+  CHECK_EQ(nextIntervalText("DAW", 0, 3, 4), "Next interval at DAW bar 1");
   CHECK_EQ(nextIntervalText("Live", 9, 6, 8), "Next interval at Live bar 4"); // 6/8: a bar is 3 quarter notes
   CHECK_EQ(nextIntervalText("Live", 10, 6, 8), "Next interval at Live bar 4, beat 3");
   CHECK_EQ(nextIntervalText("Live", 33.25, 4, 4), "Next interval at Live bar 9, beat 2");
@@ -825,17 +834,17 @@ static void test_uitext()
   CHECK_EQ(dbText(0.0f), std::string("-inf dB"));
   CHECK_EQ(dbText(-1.0f), std::string("-inf dB"));
 
-  // the meter: nothing for silence, all seven at 0 dB, the yellow two only near the top
-  CHECK_EQ(litSegments(0.0f), 0);
-  CHECK_EQ(litSegments(0.001f), 0);          // -60 dB
-  CHECK_EQ(litSegments(0.004f), 1);          // -48 dB
-  CHECK_EQ(litSegments(0.1f), 3);            // -20 dB
-  CHECK_EQ(litSegments(0.5f), 5);            // -6 dB: all the green ones
-  CHECK_EQ(litSegments(0.6f), 6);            // -4.4 dB
-  CHECK_EQ(litSegments(0.95f), 7);           // -0.4 dB
-  CHECK_EQ(litSegments(1.0f), METER_SEGMENTS);
-  CHECK_EQ(litSegments(4.0f), METER_SEGMENTS);
-  for (int i = 1; i < 1000; i++) CHECK(litSegments(i / 1000.0f) >= litSegments((i - 1) / 1000.0f));
+  // the meters: -60 dB to 0 dB, amber from -12 dB, red from -3 dB
+  CHECK(meterFraction(0.0f) == 0.0f);
+  CHECK(meterFraction(-1.0f) == 0.0f);
+  CHECK(meterFraction(0.0005f) == 0.0f);                  // -66 dB
+  CHECK(fabsf(meterFraction(0.001f)) < 0.001f);           // -60 dB
+  CHECK(fabsf(meterFraction(0.0316228f) - 0.5f) < 0.001f); // -30 dB
+  CHECK(fabsf(meterFraction(0.2511886f) - METER_AMBER) < 0.001f); // -12 dB
+  CHECK(fabsf(meterFraction(0.7079458f) - METER_RED) < 0.001f);   // -3 dB
+  CHECK(meterFraction(1.0f) == 1.0f);
+  CHECK(meterFraction(4.0f) == 1.0f);
+  for (int i = 1; i < 1000; i++) CHECK(meterFraction(i / 1000.0f) >= meterFraction((i - 1) / 1000.0f));
 
   CHECK_EQ(beatText(0, 48000, 16), std::string("1 / 16"));
   CHECK_EQ(beatText(47999, 48000, 16), std::string("16 / 16"));
@@ -846,12 +855,89 @@ static void test_uitext()
   CHECK_EQ(beatText(0, 48000, 0), std::string("\xe2\x80\x93 / \xe2\x80\x93"));
 
   CHECK_EQ(kbpsText(128), std::string("128k"));
+  CHECK_EQ(beatsText(16), std::string("16 beats"));
+  CHECK_EQ(beatsText(1), std::string("1 beat"));
+  CHECK_EQ(playersText(0), std::string("just you"));
+  CHECK_EQ(playersText(1), std::string("just you"));
+  CHECK_EQ(playersText(4), std::string("4 players"));
+  CHECK_EQ(joinedText(0.5), std::string("just joined"));
+  CHECK_EQ(joinedText(12.7), std::string("joined 12 s ago"));
+  CHECK_EQ(ageText(0), std::string("now"));
+  CHECK_EQ(ageText(4.9), std::string("now"));
+  CHECK_EQ(ageText(12.2), std::string("12 s"));
+  CHECK_EQ(ageText(59.9), std::string("59 s"));
+  CHECK_EQ(ageText(60), std::string("1 min"));
+  CHECK_EQ(ageText(150), std::string("2 min"));
+  CHECK_EQ(ageText(3600 * 2 + 5), std::string("2 h"));
+  CHECK_EQ(withoutAddresses("anna@203.0.113.9 set it"), std::string("anna set it"));
+  CHECK_EQ(withoutAddresses("because old@127.0.0.1's client"), std::string("because old's client"));
+  CHECK_EQ(withoutAddresses("ends with bob@10.0.0.2."), std::string("ends with bob."));
+  CHECK_EQ(withoutAddresses("v6 kai@2001:db8::1 here"), std::string("v6 kai here"));
+  CHECK_EQ(withoutAddresses("mail me @ home"), std::string("mail me @ home"));
 
   // the BPI list holds the room's usual choices, in order
   CHECK_EQ((int)(sizeof(BPI_CHOICES) / sizeof(BPI_CHOICES[0])), NUM_BPI_CHOICES);
   for (int i = 1; i < NUM_BPI_CHOICES; i++) CHECK(BPI_CHOICES[i] > BPI_CHOICES[i - 1]);
   CHECK_EQ(BPI_CHOICES[0], 2); // the server's least
   CHECK_EQ(BPI_CHOICES[NUM_BPI_CHOICES - 1], 64); // and its most
+}
+
+// the room panel's list: what the server and the plug-in say, as the list shows it
+static void test_room_events()
+{
+  using uitext::LineKind;
+  using uitext::RoomEvent;
+  auto ev = [](LineKind kind, const std::string &text, bool hosting = false, const std::string &who = "") {
+    return uitext::roomEvent(kind, who, text, hosting);
+  };
+  RoomEvent e = ev(LineKind::Join, "anna joined", false, "anna");
+  CHECK(e.shown && e.tone == RoomEvent::Plain);
+  CHECK_EQ(e.text, "anna joined");
+  CHECK_EQ(ev(LineKind::Leave, "", false, "anna").text, "anna left");
+
+  // votes: the server names nobody
+  e = ev(LineKind::Server, "[voting system] setting BPM to 100");
+  CHECK(e.shown && e.tone == RoomEvent::Change);
+  CHECK_EQ(e.text, "BPM set to 100");
+  CHECK_EQ(ev(LineKind::Server, "[voting system] setting BPI to 32").text, "Interval set to 32 beats");
+  CHECK_EQ(ev(LineKind::Server, "[voting system] leading candidate: 1/2 votes for 100 BPM [each vote expires in 60s]").text,
+           "Vote for BPM 100: 1 of 2");
+  CHECK_EQ(ev(LineKind::Server, "[voting system] leading candidate: 2/3 votes for 8 BPI [each vote expires in 60s]").text,
+           "Vote for 8 beats: 2 of 3");
+  e = ev(LineKind::Server, "[voting system] No vote permission");
+  CHECK(e.shown && e.tone == RoomEvent::Warn);
+  CHECK_EQ(e.text, "No vote permission");
+
+  // the room's audio: who changed it, without addresses
+  e = ev(LineKind::Server, "[server] marco@203.0.113.9 switched the room's audio to FLAC");
+  CHECK(e.tone == RoomEvent::Change);
+  CHECK_EQ(e.text, "marco set the codec to FLAC");
+  CHECK_EQ(ev(LineKind::Server, "[server] marco@203.0.113.9 set the room's Opus bitrate to 256 kbps").text, "marco set 256 kbps");
+  e = ev(LineKind::Server, "[server] room audio is now Vorbis, because old@127.0.0.1's client can't play Opus");
+  CHECK(e.tone == RoomEvent::Warn);
+  CHECK_EQ(e.text, "Room audio is now Vorbis, because old's client can't play Opus");
+  e = ev(LineKind::Server, "[server] room audio is back to Opus");
+  CHECK(e.tone == RoomEvent::Change);
+  CHECK_EQ(e.text, "Room audio is back to Opus");
+  CHECK_EQ(ev(LineKind::Server, "[server] room audio is Opus. Change it with !codec opus, !codec flac or !codec vorbis").text,
+           "Room audio is Opus");
+  // the server's own news
+  e = ev(LineKind::Server, "Server restarts at 04:00 UTC");
+  CHECK(e.shown && e.tone == RoomEvent::Warn);
+  CHECK_EQ(e.text, "Server restarts at 04:00 UTC");
+
+  // the plug-in's notes: only the start of the room
+  CHECK_EQ(ev(LineKind::Note, "Connected to 127.0.0.1:2049 as Leo", true).text, "You started the room");
+  CHECK_EQ(ev(LineKind::Note, "Connected to 203.0.113.9:2049 as Leo").text, "You joined the room");
+  CHECK(!ev(LineKind::Note, "Leo plays alone on the output Player 1").shown);
+  CHECK(!ev(LineKind::Note, "Connecting to 203.0.113.9:2049...").shown);
+  // the built-in server's log: the router is the host bar's, errors are news
+  CHECK(!ev(LineKind::HostLog, "[portmap] UPnP: asking the router").shown);
+  e = ev(LineKind::HostLog, "error: something broke");
+  CHECK(e.shown && e.tone == RoomEvent::Warn);
+  CHECK_EQ(e.text, "Error: something broke");
+  // people's chat and the rest are not the list's
+  CHECK(!ev(LineKind::Other, "hello").shown);
 }
 
 // the port mapper's lines and the server's, as HostServer reads them
@@ -1080,9 +1166,20 @@ static void test_host_bar()
   h.lookupPending = false;
   CHECK_EQ(uitext::hostBar(h).address, "203.0.113.7:2049");
 
-  // the mapper's private-address line: forwarded to a router that isn't on the internet
+  // the mapper's private-address line from behind the provider's NAT (100.64.0.0/10): nobody
+  // outside can join, so the LAN address
   h.publicAddress.clear();
   h.portmapNote = "NAT-PMP: router forwards TCP port 2049 to this machine, but the router's own internet address is 100.64.0.9, which is not public.";
+  b = uitext::hostBar(h);
+  CHECK_EQ(b.addressKey, "LAN");
+  CHECK_EQ(b.address, "192.168.1.20:2049");
+  CHECK(b.port == HostBar::Blocked);
+  CHECK_EQ(b.portText, "Only your network can join");
+  CHECK(b.portTip.find("internet address (100.64.0.9) isn't public") != std::string::npos);
+  CHECK(b.portTip.find("carrier-grade NAT") != std::string::npos);
+
+  // the same line from behind another router (a private address): forward it there by hand
+  h.portmapNote = "NAT-PMP: router forwards TCP port 2049 to this machine, but the router's own internet address is 192.168.0.9, which is not public.";
   b = uitext::hostBar(h);
   CHECK_EQ(b.addressKey, "WAN"); // the service's address: the port may be forwarded by hand
   CHECK_EQ(b.address, "198.51.100.4:2049");
@@ -1640,6 +1737,7 @@ int main()
   test_host_note();
   test_click();
   test_uitext();
+  test_room_events();
   test_link_math();
   test_block_clock();
   test_calibrator();
