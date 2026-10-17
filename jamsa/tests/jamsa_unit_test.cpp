@@ -221,22 +221,22 @@ static void test_commands()
   en.stop();
 }
 
-static bool near(double a, double b, double eps = 1e-9) { return fabs(a - b) <= eps; }
+static bool nearly(double a, double b, double eps = 1e-9) { return fabs(a - b) <= eps; }
 
 static void test_bar_math()
 {
   using namespace barmath;
-  CHECK(near(hostIntervalPos(0, 4, 96000), 0));
-  CHECK(near(hostIntervalPos(1, 4, 96000), 24000));
-  CHECK(near(hostIntervalPos(9.5, 4, 96000), 36000)); // bar 3, beat 2 and a half
-  CHECK(near(hostIntervalPos(-1, 4, 96000), 72000));  // before bar 1 (a count-in)
-  CHECK(near(hostIntervalPos(16, 16, 96000), 0));
-  CHECK(near(hostIntervalPos(5, 0, 96000), 0));
+  CHECK(nearly(hostIntervalPos(0, 4, 96000), 0));
+  CHECK(nearly(hostIntervalPos(1, 4, 96000), 24000));
+  CHECK(nearly(hostIntervalPos(9.5, 4, 96000), 36000)); // bar 3, beat 2 and a half
+  CHECK(nearly(hostIntervalPos(-1, 4, 96000), 72000));  // before bar 1 (a count-in)
+  CHECK(nearly(hostIntervalPos(16, 16, 96000), 0));
+  CHECK(nearly(hostIntervalPos(5, 0, 96000), 0));
 
-  CHECK(near(wrapSamples(100, 1000), 100));
-  CHECK(near(wrapSamples(900, 1000), -100));
-  CHECK(near(wrapSamples(-900, 1000), 100));
-  CHECK(near(wrapSamples(500, 1000), -500)); // [-len/2, len/2)
+  CHECK(nearly(wrapSamples(100, 1000), 100));
+  CHECK(nearly(wrapSamples(900, 1000), -100));
+  CHECK(nearly(wrapSamples(-900, 1000), 100));
+  CHECK(nearly(wrapSamples(500, 1000), -500)); // [-len/2, len/2)
 
   // the interval playing now ends when the host's next one starts, or the one after,
   // whichever is closer to the usual length
