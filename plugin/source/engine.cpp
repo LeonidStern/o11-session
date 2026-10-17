@@ -1108,7 +1108,7 @@ void Engine::updateLink()
       if (a.why == LinkTempoKeeper::Action::NotTaken)
         snprintf(buf, sizeof(buf), "The room stays at %d BPM, so %s goes back to it.", room, live.c_str());
       else if (a.why == LinkTempoKeeper::Action::OutOfRange)
-        snprintf(buf, sizeof(buf), "A NINJAM room can't have %s BPM (only %d to %d), so %s goes back to the room's %d.",
+        snprintf(buf, sizeof(buf), "A room can't have %s BPM (only %d to %d), so %s goes back to the room's %d.",
                  bpmText(m_linkTempo).c_str(), TempoFollower::MIN_BPM, TempoFollower::MAX_BPM, live.c_str(), room);
       if (buf[0]) addChat(ChatLine::System, "", buf);
     }

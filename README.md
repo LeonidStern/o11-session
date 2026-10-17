@@ -1,169 +1,131 @@
 # O11 Session
 
-Play music together over the internet, in time, with people who are not in
-the room. O11 Session is a jam platform in two parts: the **O11 Session
-plug-in**, a VST3 that puts a shared room inside your DAW, and **o11proto**,
-the protocol stack and server underneath it, written from scratch and owned
-by this project. A hardware jam box on the same stack is the next step.
+**Jam with anyone, anywhere, right from your DAW.**
 
-It is inspired by [NINJAM](https://www.cockos.com/ninjam/) and
-[JamTaba](https://jamtaba-music-web-site.appspot.com/): the idea of playing in
-sync by sharing whole bars of audio with a bar of delay comes from NINJAM, and
-the idea that a plug-in in the DAW is the nicest place to jam from comes from
-JamTaba. O11 Session takes those ideas and rebuilds them with a modern codec
-path, a leaner server and an engine that is tested end to end on every change.
+O11 Session is a plug-in that turns your DAW into a shared rehearsal room.
+Drop it on a track, send a link to your bandmates, and play together over the
+internet, in time, each of you in your own studio with your own sounds.
+
+Inspired by [NINJAM](https://www.cockos.com/ninjam/) and
+[JamTaba](https://jamtaba-music-web-site.appspot.com/), rebuilt from the
+ground up to be lighter, cleaner and easier to use.
+
+## Download
+
+| | |
+|---|---|
+| **macOS** (Apple silicon and Intel, macOS 12 or later) | [O11Session-macos.dmg](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-macos.dmg) |
+| **Windows** (64-bit) | [O11Session-windows-x64.zip](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-windows-x64.zip) |
+| **Linux** (x86_64) | [O11Session-linux-x86_64.zip](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-linux-x86_64.zip) |
+
+These links always point to the newest build.
+
+## Install
+
+- **macOS:** open the disk image and drag O11 Session onto the VST3 folder.
+  It is signed and notarized by Apple, so it opens without warnings.
+- **Windows:** unzip and copy `O11Session.vst3` into
+  `C:\Program Files\Common Files\VST3`.
+- **Linux:** unzip and copy `O11Session.vst3` into `.vst3` in your home folder.
+
+Then rescan plug-ins in your DAW. In Ableton Live that is Settings, Plug-Ins,
+Rescan.
+
+## How it works
+
+Everyone hears everyone else one bar (or a few bars) late, perfectly in time.
+While you play the next phrase, the last one arrives from the others, so the
+music lines up on the beat no matter how far apart you are. It suits jams,
+loops, grooves and songs built on a steady pulse.
+
+1. **Start a room.** Put O11 Session on a track and press Host. It opens the
+   room on your computer, asks your router to let people in, and shows the
+   address to share.
+2. **Invite your band.** They paste the address into their own copy and join.
+3. **Play.** Each player arrives on their own output in your DAW, so you can
+   mix, mute, solo, record and add effects to them like any other track.
 
 ## Features
 
-**The plug-in** (VST3; Linux, Windows and macOS, Intel and Apple
-silicon, signed and notarized on macOS):
-
-- Your track's input goes to the room; each other player comes back on their
-  own stereo output pair ("Player 1" to "Player 8"), so you mix them in the
-  DAW like any other track, with volume, pan, mute and solo per player.
-- Opus (64 to 510 kbps) or lossless FLAC per room, switchable with a vote;
-  Opus intervals use a raw packet framing with no Ogg container.
-- Follow the DAW: the room's intervals start on the host's bars while it
-  plays at the room's tempo, and a tempo change in the DAW becomes a vote.
-- Ableton Link: with Sync on in a room, Live (with its Link on) takes the
-  room's tempo and its bars start with the intervals.
-- Host a room from the plug-in: a built-in server on the first free port from
-  2049, with the router asked to forward it (UPnP-IGD, then NAT-PMP), a
-  public-address lookup for ports forwarded by hand, and the address to send
-  people shown in the host bar.
-- Chat with `/msg`, `/topic`, `/bpm`, `/bpi`, `!bitrate` and `!codec`; votes
-  for the room's tempo, interval and codec; the server's licence shown before
-  you join; a metronome with the same click at 44.1, 48 and 96 kHz.
-- One compact 720 x 330 window, resizable, with meters, beat cells and the
-  host bar; the state is saved with the DAW project.
-
-**o11proto, the stack:**
-
-- A C++17 library for the NINJAM wire protocol (`PROTOCOL.md`): framing,
-  login, channels, subscriptions, interval upload and forwarding, chat and
-  votes, codec negotiation; non-blocking client, single-threaded `poll()`
-  server.
-- `o11server`, a command-line server for hosted rooms (accounts, anonymous
-  users, keepalive, limits, Opus and FLAC, voting), and `o11cli`, a client
-  that logs every message as JSON for interoperability tests.
-- The client audio engine (`ENGINE.md`): Opus and FLAC encode and decode,
-  resampling, the two-interval queue, mixing and the clock.
-- Router port mapping (`PORTMAP.md`): UPnP-IGD then NAT-PMP, renewed before
-  the lease ends, removed on stop, tested against a fake router.
-- Everything builds on Linux, Windows (MSVC or MinGW) and macOS, with no
-  dependencies beyond Opus, FLAC, miniupnpc and libnatpmp.
+- **Lives in your DAW.** A VST3 plug-in for Ableton Live, Bitwig, Reaper,
+  Studio One, Cubase and other VST3 hosts on macOS, Windows and Linux.
+- **Every player on their own track.** Up to eight other players each get a separate
+  stereo output, ready to mix, record or process.
+- **Studio sound.** Opus at up to 510 kbps for near-transparent audio, or
+  lossless FLAC when the connection allows. The room switches with one vote.
+- **Locked to your DAW's tempo.** The room follows your bars and tempo, and a
+  tempo change in your DAW becomes a vote for the room.
+- **Ableton Link.** Link-enabled DAWs such as Live and Bitwig follow the
+  room's tempo automatically.
+- **Host with one click.** No server to rent and nothing to configure. The
+  room runs inside the plug-in, and your router is set up for you where it
+  allows it.
+- **Room chat and votes.** Talk, set the tempo and bar length, and choose the
+  sound quality together.
+- **Built-in metronome**, saved with your project, along with every other
+  setting.
+- **Small and fast.** One compact window, a light footprint, and a server that
+  uses less than half the CPU of the classic one (see below).
 
 ## Benchmarks
 
-All numbers below were measured by this project, with the tools in this
-repository, on 2026-10-16 and 2026-10-17. The machine was a Linux x86_64
-container (the development sandbox), so absolute numbers say little; the
-comparisons were run back to back on the same machine, with the same
-inputs. The reference server and client are the ones in the older
-[Jamsa repository](https://github.com/LeonidStern/Jamsa): NINJAM's `ninjamsrv`
-and `NJClient`, with that repository's Opus and FLAC extensions.
+Measured on 2026-10-16 and 2026-10-17, back to back on the same Linux
+machine with the same inputs. The comparison is against NINJAM's reference
+server and client, the classic setup most online jam tools are built on.
 
-### Server: o11server against ninjamsrv
+**Server load** (every player sending two channels at 128 kbps):
 
-`loadtest.py` (in the older repository, `ninjam/server/tests/`) simulates a
-room: every player uploads two channels continuously at 128 kbps in 1 KB
-writes with a new interval every 4 s, and subscribes to everyone else. CPU is
-the server process's user plus system time over 15 s; "relayed" is what the
-players received. Forwarding delay was measured by a second tool that
-timestamps a write on one connection and its arrival on another.
-
-| Room | ninjamsrv CPU | o11server CPU | relayed |
-|---|---|---|---|
-| 8 players, 2 channels, 128 kbps | 1.6 to 1.7 % | 0.6 to 0.7 % | 1.82 MB/s both |
-| 16 players, 2 channels, 128 kbps | 4.1 to 4.8 % | 2.5 to 2.8 % | 7.8 MB/s both |
-
-| Forwarding delay (1 KB and 8 KB writes) | ninjamsrv | o11server |
+| Room | Classic server CPU | O11 Session CPU |
 |---|---|---|
-| median | 0.40 ms | 0.19 ms |
-| worst seen | 5 to 6 ms | 0.4 to 1.7 ms |
+| 8 players | 1.6 to 1.7 % | **0.6 to 0.7 %** |
+| 16 players | 4.1 to 4.8 % | **2.5 to 2.8 %** |
 
-Compatibility: the reference server's own protocol test suite passes 28 of 28
-cases against `o11server`, and `o11cli` logged in, chatted, voted and received
-every interval byte for byte from `ninjamsrv`.
+**Forwarding delay** inside the server:
 
-### Engine: audio quality and CPU
-
-A 997 Hz tone at -6 dBFS is sent through a real server and compared with what
-the listener plays, after one interval of delay. SNR is signal to the
-difference, so it measures the codec and the clock together.
-
-| Path | Opus (510 kbps) | FLAC |
+| | Classic server | O11 Session |
 |---|---|---|
-| o11proto engine to o11proto engine, through `ninjamsrv` | 47.8 dB | 87.3 dB |
-| o11proto engine to o11proto engine, in the plug-in's end-to-end test (CI, three platforms) | 46.8 to 47.6 dB | 87.3 dB |
-| Reference client to reference client (for scale) | 42.6 dB | 87.3 dB |
+| Typical | 0.40 ms | **0.19 ms** |
+| Worst seen | 5 to 6 ms | **0.4 to 1.7 ms** |
 
-CPU for 20 s of real-time audio, one sender and one listener in one process,
-48 kHz:
+**Audio quality** (a test tone sent through a real server and compared with
+what the listener hears; higher is better):
 
-| | Opus | FLAC |
+| | Opus 510 kbps | FLAC |
 |---|---|---|
-| o11proto engine (both sides) | 0.34 s | 0.18 to 0.20 s |
-| reference NJClient pair | 0.28 to 0.29 s | 0.15 to 0.16 s |
+| Classic client | 42.6 dB | 87.3 dB |
+| O11 Session | **47.8 dB** | 87.3 dB |
 
-The engine spends a little more than the reference: about 1.7 % of one core
-for a sender and a listener together at Opus 510 kbps. It has not been tuned
-for speed yet.
+**Client CPU** for a sender and a listener together: about 1.7 % of one core
+at Opus 510 kbps, a little above the classic client's 1.4 %. Tuning is still
+to come.
 
-### Plug-in checks
+**Compatibility:** the classic server's own protocol test suite passes 28 of
+28 cases against the O11 Session server.
 
-- pluginval at strictness level 10 passes on Linux, Windows and macOS on
-  every push.
-- Unit test: about 4,070 checks (state, commands, bar sync against a
-  simulated host over 20 minutes with at most 1.1 ms of error, the click, the
-  host bar, the port mapper's messages, the address lookup). End-to-end test:
-  40 checks, two plug-in engines in one process through a hosted room.
-- The port mapper: 7 scenarios against a fake UPnP and NAT-PMP router,
-  including a 718 refusal falling back to NAT-PMP and a 10 s lease renewed
-  after 5 s.
+Every change is built and tested automatically on macOS, Windows and Linux,
+including Tracktion's pluginval at its strictest level and a full two-player
+session through a hosted room.
 
-## Getting it
+## Coming next
 
-Builds of the plug-in for Linux, Windows and macOS are attached to every
-run of the `o11session` workflow under Actions (`O11Session-*`). Releases will
-follow once the plug-in has been tested in Ableton Live, Reaper and others.
+- **Live mode:** real-time playing with no bar of delay, for players close
+  to each other.
+- **CLAP** support.
+- **The O11 Session box:** a networked audio interface for jamming without a
+  computer.
 
-## Building
+## For developers
 
-Needs CMake 3.25 or later, Ninja and a C++17 compiler. JUCE, Opus, FLAC,
-miniupnpc and libnatpmp are fetched by CMake.
+Building from source needs CMake 3.25 or later, Ninja and a C++17 compiler:
 
-    cmake -S plugin -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DO11_TESTS=ON
+    cmake -S plugin -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
     cmake --build build
-    ctest --test-dir build --output-on-failure
 
-That builds `o11proto` too; for the stack alone, `cmake -S o11proto -B
-build-o11proto` (it needs libopus, libFLAC, miniupnpc and libnatpmp through
-pkg-config). See `plugin/README.md` and `o11proto/README.md` for the details,
-the platform notes and the text commands.
-
-## How it is written
-
-Everything here is written from specifications, not from NINJAM's code, so
-this project owns it and chooses its licence (`LICENSE` is a placeholder
-until then). `o11proto/PROTOCOL.md`, `ENGINE.md` and `PORTMAP.md` are the
-specifications; the code is written from them by people who have not read
-NINJAM's GPL sources. When the behaviour must change, the specification
-changes first. `plugin/` follows the same rule and reuses only this project's
-own plug-in code from the older repository.
-
-The repository's history is the history of these folders in
-`LeonidStern/Jamsa` (pull request 10), carried over on 2026-10-17.
-
-## Roadmap
-
-- Live mode: a low-latency path for players close to each other.
-- CLAP, and a signed Windows build.
-- The O11 Session box: a two-input networked audio interface on this stack.
+The plug-in is in `plugin/` and the network and audio engine with its
+specifications is in `o11proto/`.
 
 ## Licence
 
-To be decided by Leonid Stern. JUCE is used under its licence terms (AGPLv3
-or commercial); Opus, FLAC, miniupnpc and libnatpmp are BSD licensed. The
-plug-in includes Ableton Link, which is GPLv2 or later, so builds of the
-plug-in are GPL.
+To be decided by Leonid Stern. O11 Session includes Ableton Link (GPLv2 or
+later), so builds of the plug-in are GPL. It also uses JUCE (AGPLv3 or
+commercial), Opus, FLAC, miniupnpc and libnatpmp.

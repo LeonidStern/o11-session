@@ -219,6 +219,7 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)".*/\1/')
           if [ -z "$IDENTITY" ]; then echo "MACOS_CERT_P12 has no Developer ID Application certificate"; exit 1; fi
+          echo "DEVID_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
 
           codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$BUNDLE"
           codesign --verify --deep --strict --verbose=2 "$BUNDLE"
@@ -239,10 +240,6 @@ jobs:
           xcrun stapler staple "$BUNDLE"
           xcrun stapler validate "$BUNDLE"
           codesign --verify --deep --strict --verbose=2 "$BUNDLE"
-
-      - name: Remove the signing keychain
-        if: always() && steps.devid.outputs.notarize == 'true'
-        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
 
       - name: pluginval (with the editor)
         run: |
@@ -272,6 +269,54 @@ jobs:
           test "$(xattr -px com.apple.FinderInfo "$UNZIPPED" | tr -d ' \n' | cut -c17-20)" = 2000
           codesign --verify --deep --verbose=2 "$UNZIPPED"
 
+      - name: Disk image
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          NOTARIZE: ${{ steps.devid.outputs.notarize }}
+        run: |
+          # The Mac download: a disk image with O11Session.vst3 next to a shortcut to the VST3
+          # folder, over a background that says to drag one onto the other (plugin/packaging).
+          # dmgbuild lays it out in a read-write image; the bundle bit is set in there, for the
+          # reasons above, and then the image is compressed, signed and notarized.
+          python3 -m venv "$RUNNER_TEMP/dmgbuild"
+          "$RUNNER_TEMP/dmgbuild/bin/pip" install -q dmgbuild==1.6.7
+          "$RUNNER_TEMP/dmgbuild/bin/dmgbuild" -s plugin/packaging/dmg_settings.py \
+            -D bundle="$BUNDLE" -D background=plugin/packaging/dmg-background.png \
+            "O11 Session" "$RUNNER_TEMP/O11Session-rw.dmg"
+          RW="$RUNNER_TEMP/dmg-rw"
+          hdiutil attach -nobrowse -noautoopen -mountpoint "$RW" "$RUNNER_TEMP/O11Session-rw.dmg"
+          xattr -wx com.apple.FinderInfo 0000000000000000200000000000000000000000000000000000000000000000 "$RW/O11Session.vst3"
+          hdiutil detach "$RW" || { sleep 5; hdiutil detach -force "$RW"; }
+          DMG=dist/O11Session-macos.dmg
+          hdiutil convert "$RUNNER_TEMP/O11Session-rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
+          if [ "$NOTARIZE" = true ]; then
+            codesign --force --timestamp --sign "$DEVID_IDENTITY" "$DMG"
+            xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" --wait --output-format json > "$RUNNER_TEMP/notarize-dmg.json" || true
+            cat "$RUNNER_TEMP/notarize-dmg.json"
+            STATUS=$(plutil -extract status raw "$RUNNER_TEMP/notarize-dmg.json" 2>/dev/null || echo unknown)
+            if [ "$STATUS" != "Accepted" ]; then echo "Notarization of the disk image: $STATUS"; exit 1; fi
+            xcrun stapler staple "$DMG"
+            xcrun stapler validate "$DMG"
+          fi
+          ls -l dist
+          # what someone gets: the shortcut, the layout, the bundle bit, a valid signature
+          RO="$RUNNER_TEMP/dmg-check"
+          hdiutil attach -nobrowse -noautoopen -readonly -mountpoint "$RO" "$DMG"
+          ls -la "$RO"
+          test "$(readlink "$RO/VST3 Plug-Ins")" = /Library/Audio/Plug-Ins/VST3
+          test -f "$RO/.DS_Store"
+          ls "$RO"/.background.*
+          test "$(xattr -px com.apple.FinderInfo "$RO/O11Session.vst3" | tr -d ' \n' | cut -c17-20)" = 2000
+          codesign --verify --deep --verbose=2 "$RO/O11Session.vst3"
+          hdiutil detach "$RO"
+
+      - name: Remove the signing keychain
+        if: always() && steps.devid.outputs.notarize == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
       - uses: actions/upload-artifact@v4
         with:
           name: O11Session-macos-universal
@@ -283,3 +328,50 @@ jobs:
           name: logs-o11session-macos
           path: pluginval-logs/
           if-no-files-found: ignore
+
+  # The downloads in the README: each push to main puts that build of all three in the
+  # release "o11session-latest" (the tag moves to the commit), replacing the files there.
+  release:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: o11session-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: O11Session-linux-x86_64
+          path: linux
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: O11Session-windows-x64
+          path: windows
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: O11Session-macos-universal
+          path: macos
+
+      - name: Zip the downloads
+        run: |
+          mkdir release
+          (cd linux && zip -qr ../release/O11Session-linux-x86_64.zip O11Session.vst3)
+          (cd windows && zip -qr ../release/O11Session-windows-x64.zip O11Session.vst3)
+          # made on the Mac, with the bundle bit (see the macos job)
+          cp macos/O11Session-macos.dmg macos/O11Session-macos.zip release/
+          ls -l release
+
+      - name: Publish to the o11session-latest release
+        run: |
+          NOTES="The newest build of O11 Session, from ${GITHUB_SHA::7} on main. See the README for how to install it."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "O11 Session (latest build)" --notes "$NOTES"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "O11 Session (latest build)" --notes "$NOTES" --latest
+          fi
+          gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
