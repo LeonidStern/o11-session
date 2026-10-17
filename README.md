@@ -104,9 +104,9 @@ CPU for 20 s of real-time audio, one sender and one listener in one process,
 | njproto engine (both sides) | 0.34 s | 0.18 to 0.20 s |
 | reference NJClient pair | 0.28 to 0.29 s | 0.15 to 0.16 s |
 
-The engine spends a little more than the reference (about 1.5 % of one core
-for a pair at Opus 510 kbps) because it resamples with a higher-quality
-filter and mixes in float; it was not tuned for speed yet.
+The engine spends a little more than the reference: about 1.7 % of one core
+for a sender and a listener together at Opus 510 kbps. It has not been tuned
+for speed yet.
 
 ### Plug-in checks
 
