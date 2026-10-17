@@ -63,6 +63,7 @@ struct Options {
     std::uint32_t codec = kCapOpus;              // the interval codec: kCapOpus or kCapFlac
     int bpm = 120, bpi = 4;                      // 2 s intervals
     bool live_on = true;
+    bool live_server = true;                     // false: a server without Live (LiveMode::No)
 };
 
 struct Room {
@@ -95,7 +96,7 @@ struct Room {
         cfg.opus_kbps = 128;
         cfg.bpm = static_cast<std::uint16_t>(opt.bpm);
         cfg.bpi = static_cast<std::uint16_t>(opt.bpi);
-        cfg.live.mode = opt.live_on ? LiveMode::On : LiveMode::Yes;
+        cfg.live.mode = !opt.live_server ? LiveMode::No : opt.live_on ? LiveMode::On : LiveMode::Yes;
         if (!server.start(cfg)) std::printf("    the server didn't start\n");
         server_thread = std::thread([this] {
             while (!server_stop.load()) server.poll(1);

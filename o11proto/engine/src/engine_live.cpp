@@ -109,6 +109,27 @@ bool Engine::userLive(int user) const {
 
 bool Engine::liveRoomLive() const { return live_->room_applied.load() == 1; }
 
+bool Engine::liveServerHas() const { return live_->has_msg && live_->msg.udpOpen(); }
+
+bool Engine::liveRoomSwitchOn() const { return live_->has_msg && live_->msg.roomOn(); }
+
+int Engine::liveHeardMs() const {
+    const LiveLayer& L = *live_;
+    if (!liveRoomLive()) return -1;
+    std::vector<double> v;
+    for (int s = 0; s < kLiveSlots; ++s) {
+        const SinkStats& st = L.sinks[s]->stats;
+        if (!L.slot_peer[s] || st.gen.load() != L.gen[s].load() || !st.active.load()) continue;
+        const double ms = liveOneWayMs(s, nullptr, nullptr, nullptr);
+        if (ms >= 0) v.push_back(ms);
+    }
+    if (v.empty()) return -1;
+    std::sort(v.begin(), v.end());
+    const std::size_t k = v.size() / 2;
+    const double median = v.size() % 2 ? v[k] : (v[k - 1] + v[k]) / 2;
+    return static_cast<int>(std::nearbyint(median));   // rounded as num() rounds
+}
+
 Engine::LiveReason Engine::liveRoomReason() const {
     const LiveLayer& L = *live_;
     if (liveRoomLive() || !L.has_msg || !L.msg.roomOn() || !L.has_room || L.room.live) return LiveReason::None;
@@ -259,13 +280,9 @@ void Engine::liveRoomNotices() {
     const std::string who = liveDisplayName(u);
     if (applied != L.room_noticed) {
         if (applied == 1) {
-            double worst = -1;
-            for (int s = 0; s < kLiveSlots; ++s) {
-                const SinkStats& st = L.sinks[s]->stats;
-                if (L.slot_peer[s] && st.gen.load() == L.gen[s].load() && st.active.load())
-                    worst = std::max(worst, liveOneWayMs(s, nullptr, nullptr, nullptr));
-            }
-            liveNotice("The room is Live now" + (worst >= 0 ? ", about " + num(worst) + " ms late." : std::string(".")),
+            const int heard = liveHeardMs();
+            liveNotice("The room is Live now" +
+                           (heard >= 0 ? ", about " + std::to_string(heard) + " ms late." : std::string(".")),
                        false);
             L.cant_said.clear();
         } else if (reasoned && L.room.reason == live::RoomReason::Dropouts) {

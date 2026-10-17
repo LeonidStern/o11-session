@@ -6,6 +6,7 @@
 // steady tone's, the longest near-silence, and the 10 ms RMS against the
 // steady RMS. The last case writes live-transitions.wav for listening.
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -437,6 +438,50 @@ TEST(slot_lost_mid_interval) {
         CHECK(in.step <= 1.5 * in.after.step);
         CHECK(std::fabs(dB(in.after.rms / live.rms)) <= 0.5);
         CHECK(std::fabs(dB(steady(x, s + 20 * ms, s + 30 * ms).rms / in.after.rms)) <= 1.0);
+    }
+}
+
+// 16.2: what a UI reads from the control context. liveServerHas() and
+// liveRoomSwitchOn() follow the latest SERVER_LIVE, and liveHeardMs() is the
+// N of "The room is Live now, about N ms late." while the room is Live.
+TEST(accessors_for_a_ui) {
+    {
+        Options o;
+        Room r(o, {"alice", "bob"});
+        r[0].signal = [](long n, int rt) { return tone(n, rt, 500); };
+        r[1].signal = [](long n, int rt) { return tone(n, rt, 700); };
+        CHECK(!r[1].e.liveServerHas() && !r[1].e.liveRoomSwitchOn() && r[1].e.liveHeardMs() == -1);
+        r.startHost();
+        REQUIRE(r.connect());
+        CHECK(r.until([&] { return r[1].e.liveServerHas() && r[1].e.liveRoomSwitchOn(); }, 5));
+        REQUIRE(r.roomIs(true, 30));
+        CHECK(r.until([&] { return !r[1].findNotice("The room is Live now, about ").empty(); }, 5));
+        const std::string notice = r[1].findNotice("The room is Live now, about ");
+        const int n = notice.empty() ? -2 : std::atoi(notice.c_str() + 28);
+        const int heard = r[1].e.liveHeardMs();
+        std::printf("    Live: has %d, switch %d, heard %d ms; the notice: %s\n", r[1].e.liveServerHas(),
+                    r[1].e.liveRoomSwitchOn(), heard, notice.c_str());
+        CHECK(heard >= 5 && heard <= 200);
+        CHECK(std::abs(heard - n) <= 1);         // the estimate may have moved since
+        CHECK(r[0].e.liveCommand("/live off"));
+        CHECK(r.until([&] { return !r[1].e.liveRoomSwitchOn(); }, 5));
+        CHECK(r.roomIs(false, 5));
+        std::printf("    after !live off: has %d, switch %d, heard %d\n", r[1].e.liveServerHas(),
+                    r[1].e.liveRoomSwitchOn(), r[1].e.liveHeardMs());
+        CHECK(r[1].e.liveServerHas());
+        CHECK(r[1].e.liveHeardMs() == -1);
+    }
+    {
+        Options o;
+        o.live_server = false;
+        Room r(o, {"alice", "bob"});
+        r.startHost();
+        for (int i = 0; i < 2; ++i) r[i].e.connect("127.0.0.1", r.server.port(), "anonymous:" + r[i].name, "");
+        REQUIRE(r.until([&] { return r[0].e.status() == Status::Ok && r[1].e.status() == Status::Ok; }, 10));
+        r.wait(1);                               // no Live client starts (Room::connect would wait for one)
+        std::printf("    a server without Live: has %d, switch %d, heard %d\n", r[1].e.liveServerHas(),
+                    r[1].e.liveRoomSwitchOn(), r[1].e.liveHeardMs());
+        CHECK(!r[1].e.liveServerHas() && !r[1].e.liveRoomSwitchOn() && r[1].e.liveHeardMs() == -1);
     }
 }
 

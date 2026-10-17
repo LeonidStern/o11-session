@@ -195,6 +195,16 @@ public:
     bool liveRoomLive() const;
     LiveReason liveRoomReason() const;
     std::string liveRoomReasonUser() const;
+    // For a UI, from the control context: the latest SERVER_LIVE says the
+    // server has Live with its UDP port open (liveServerHas()) and the
+    // room's `!live` switch is on (liveRoomSwitchOn()); liveHeardMs() is
+    // about how late this listener hears the Live players (the median of
+    // the 6.10 estimates of the slots playing live, rounded; the N of "The
+    // room is Live now, about N ms late."), -1 while the room isn't Live or
+    // there is no estimate yet.
+    bool liveServerHas() const;
+    bool liveRoomSwitchOn() const;
+    int liveHeardMs() const;
     void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
     void setLiveTestSendGap(int ms);            // test hook: the Live data sent in the next `ms` is lost
 
