@@ -22,6 +22,10 @@ specification leaves room, the choice is listed here.
   in-process `Server` with a simulated audio clock, plus duplex rooms where
   both engines send and listen with offset interval clocks, FLAC and Opus).
 - `tools/o11jam.cpp`: the command-line client of section 14.
+- `tools/o11bench.cpp`: a CPU benchmark for profiling (not part of the
+  specification): a sender and a listener on an in-process server with a
+  simulated audio clock, printing the CPU time (getrusage) and SNR, e.g.
+  `valgrind --tool=callgrind o11bench --codec flac --seconds 20`.
 - CMake option `O11PROTO_BUILD_ENGINE` (default ON) finds opus and flac with
   pkg-config; OFF builds only the protocol library.
 
