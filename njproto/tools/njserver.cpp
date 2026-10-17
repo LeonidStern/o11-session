@@ -3,7 +3,7 @@
 //   njserver <port> [--anon] [--user name:pass:privs]... [--bpm N] [--bpi N]
 //            [--allow-codecs opus,flac] [--require-codec opus] [--opus-kbps N]
 //            [--keepalive N] [--max-users N] [--topic TEXT] [--motd LINE]
-//            [--licence FILE] [--mask-ip] [--vote-threshold PCT] [--quiet]
+//            [--licence FILE] [--mask-ip] [--vote-threshold PCT] [--port-map] [--quiet]
 //
 // Privilege letters: t topic, c chat, b bpm/bpi, k kick, r reserved slot,
 // m multiple logins, h hidden, v vote, p see private rooms, s status account,
@@ -19,6 +19,9 @@
 
 #include "njproto/server.h"
 #include "socket_compat.h"
+#ifdef NJPROTO_HAVE_PORTMAP
+#include "njproto/portmap.h"
+#endif
 
 using namespace njproto;
 
@@ -45,6 +48,7 @@ static void usage() {
         "  --mask-ip              show anonymous users as name@1.2.3.x\n"
         "  --vote-threshold PCT   percent of users for a vote to pass (default 50; >100 disables)\n"
         "  --login-timeout N      seconds to wait for AUTH_USER (default 30)\n"
+        "  --port-map             ask the router to forward the port (UPnP-IGD, then NAT-PMP)\n"
         "  --quiet                no log output\n"
         "privileges: t topic, c chat, b bpm/bpi, k kick, r reserve, m multi-login,\n"
         "            h hidden, v vote, p private rooms, s status account, * all\n");
@@ -71,6 +75,7 @@ int main(int argc, char** argv) {
     ServerConfig cfg;
     cfg.port = static_cast<std::uint16_t>(std::atoi(argv[1]));
     bool quiet = false;
+    bool portMap = false;
     auto need = [&](int& i) -> const char* {
         if (i + 1 >= argc) {
             std::fprintf(stderr, "%s needs a value\n", argv[i]);
@@ -139,6 +144,7 @@ int main(int argc, char** argv) {
         } else if (a == "--mask-ip") cfg.mask_addresses = true;
         else if (a == "--vote-threshold") cfg.vote_threshold_percent = std::atoi(need(i));
         else if (a == "--login-timeout") cfg.login_timeout_seconds = std::atoi(need(i));
+        else if (a == "--port-map") portMap = true;
         else if (a == "--quiet") quiet = true;
         else if (a == "-h" || a == "--help") {
             usage();
@@ -163,7 +169,24 @@ int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);   // Windows has no SIGPIPE
 #endif
     if (!quiet) std::fprintf(stderr, "[njserver] ready on port %u\n", server.port());
+#ifdef NJPROTO_HAVE_PORTMAP
+    // The mapper logs from its own thread; the server's log just prints, so
+    // forwarding to it is safe. It is stopped (and the mapping removed) before
+    // the server goes away.
+    PortMapper mapper;
+    if (portMap) {
+        mapper.log = [&cfg](const std::string& s) {
+            if (cfg.log) cfg.log(s);
+        };
+        mapper.start(server.port());
+    }
+#else
+    if (portMap) std::fprintf(stderr, "[njserver] --port-map is not available in this build (NJPROTO_BUILD_PORTMAP)\n");
+#endif
     while (!g_stop) server.poll(200);
+#ifdef NJPROTO_HAVE_PORTMAP
+    mapper.stop();
+#endif
     server.stop();
     return 0;
 }

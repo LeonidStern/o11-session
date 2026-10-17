@@ -38,7 +38,7 @@ libopus and libFLAC, found with pkg-config. Pass
              [--require-codec opus|flac] [--opus-kbps N|none]
              [--keepalive N] [--max-users N] [--max-pending TOTAL PER_IP]
              [--max-channels N] [--topic TEXT] [--motd LINE]... [--licence FILE]
-             [--mask-ip] [--vote-threshold PCT] [--login-timeout N] [--quiet]
+             [--mask-ip] [--vote-threshold PCT] [--login-timeout N] [--port-map] [--quiet]
 
 Defaults: Opus relayed besides Vorbis, room Opus bitrate 128 kbps (a value
 outside 32-510 is ignored with a warning; `none` means clients send at their
@@ -66,6 +66,27 @@ Privilege letters for `--user`:
 Anonymous users (`--anon`) get `c` and `v`, plus `m` with `--anon-multi`. Example:
 
     njserver 2049 --anon --user admin:secret:tcbkv --opus-kbps 128 --topic "jam"
+
+`--port-map` asks the home router to forward the listening port to this
+machine (see below); the mapper's lines appear in the server log and the
+mapping is removed when the server exits.
+
+## Router port mapping
+
+`include/njproto/portmap.h` (`njproto::PortMapper`, library `njproto_portmap`)
+implements `PORTMAP.md`: it maps one TCP port through UPnP-IGD (miniupnpc)
+first and NAT-PMP (libnatpmp) second, on its own thread, renews the mapping at
+half the granted lease, retries every five minutes when no router answers and
+removes the mapping on `stop()`. Every event is one log line starting with
+`[portmap] `; a line with `people can connect to <addr>:<port>` means success.
+`NINJAM_UPNP_ROOTDESC` (a root description URL) skips the multicast discovery
+and `NINJAM_NATPMP_GATEWAY` overrides the default route; the test
+`test_portmap` uses both against the fake router in
+`portmap/tests/fake_router.py` (Python 3, standard library only). The CMake
+option `NJPROTO_BUILD_PORTMAP` defaults to ON when both libraries are found
+(miniupnpc through pkg-config, libnatpmp by header and library name). On
+Windows, link a static miniupnpc with `MINIUPNP_STATICLIB` defined and a
+static libnatpmp with `NATPMP_STATICLIB`. See `portmap/NOTES.md`.
 
 ## njcli
 
@@ -135,5 +156,5 @@ intervals. `--two` runs a sender and a listener (`NAME_l`) in one process and
 reports the listener's figures; `--say "!codec flac"` switches the room to
 FLAC. On an anonymous server use `--user anonymous:NAME`.
 
-See `NOTES.md` for interpretation choices and what is not implemented, and
-`engine/NOTES.md` for the engine.
+See `NOTES.md` for interpretation choices and what is not implemented,
+`engine/NOTES.md` for the engine and `portmap/NOTES.md` for the port mapper.
