@@ -160,8 +160,12 @@ void Resampler::process(const float* in, int frames, std::vector<float>& out) {
     }
     buf_.insert(buf_.end(), in, in + static_cast<std::size_t>(frames) * ch);
     const std::size_t have = buf_.size() / ch;
+    // About frames * out / in output frames follow; reserve them once.
+    out.reserve(out.size() + (static_cast<std::size_t>(frames) * static_cast<std::size_t>(out_rate_) /
+                              static_cast<std::size_t>(in_rate_) + 2) * ch);
     // Output frame j is at input position origin_ + j*in/out and needs input
     // frames floor(pos)-kTaps+1 .. floor(pos)+kTaps.
+    float kern[2 * kTaps];
     while (true) {
         long num = j_ * in_rate_;
         long fl = origin_ + num / out_rate_;
@@ -173,12 +177,43 @@ void Resampler::process(const float* in, int frames, std::vector<float>& out) {
         float pw = static_cast<float>(pf - p0);
         const float* t0 = &table_[static_cast<std::size_t>(p0) * 2 * kTaps];
         const float* t1 = &table_[static_cast<std::size_t>(p0 + 1) * 2 * kTaps];
+        // The interpolated kernel is the same for every channel: build it
+        // once per output frame instead of once per tap and channel.
+        for (int t = 0; t < 2 * kTaps; ++t) kern[t] = t0[t] + (t1[t] - t0[t]) * pw;
+        // base >= 1 always (the buffer starts with kTaps frames of history and
+        // the trimming below keeps kTaps), so no bounds test per tap; the
+        // guarded loop stays for safety.
         for (std::size_t c = 0; c < ch; ++c) {
-            float acc = 0;
-            for (int t = 0; t < 2 * kTaps; ++t) {
-                long idx = base + t;
-                float x = idx < 0 ? 0.0f : buf_[static_cast<std::size_t>(idx) * ch + c];
-                acc += x * (t0[t] + (t1[t] - t0[t]) * pw);
+            float acc;
+            if (base >= 0) {
+                const float* x = &buf_[static_cast<std::size_t>(base) * ch + c];
+                // Four partial sums so the compiler can keep them in one SIMD
+                // register; the order of additions differs from a single
+                // running sum only by float rounding.
+                float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                if (ch == 1) {
+                    for (int t = 0; t < 2 * kTaps; t += 4) {
+                        a0 += x[t] * kern[t];
+                        a1 += x[t + 1] * kern[t + 1];
+                        a2 += x[t + 2] * kern[t + 2];
+                        a3 += x[t + 3] * kern[t + 3];
+                    }
+                } else {
+                    for (int t = 0; t < 2 * kTaps; t += 4) {
+                        a0 += x[static_cast<std::size_t>(t) * ch] * kern[t];
+                        a1 += x[static_cast<std::size_t>(t + 1) * ch] * kern[t + 1];
+                        a2 += x[static_cast<std::size_t>(t + 2) * ch] * kern[t + 2];
+                        a3 += x[static_cast<std::size_t>(t + 3) * ch] * kern[t + 3];
+                    }
+                }
+                acc = (a0 + a1) + (a2 + a3);
+            } else {
+                acc = 0;
+                for (int t = 0; t < 2 * kTaps; ++t) {
+                    long idx = base + t;
+                    float x = idx < 0 ? 0.0f : buf_[static_cast<std::size_t>(idx) * ch + c];
+                    acc += x * kern[t];
+                }
             }
             out.push_back(acc);
         }
