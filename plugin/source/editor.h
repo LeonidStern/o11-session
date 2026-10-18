@@ -128,10 +128,9 @@ private:
 
   // transport
   ui::Strip *m_transport = nullptr;
-  juce::Label *m_syncText = nullptr, *m_beatBox = nullptr;
-  ui::Strip *m_sep[2] = { nullptr, nullptr };
-  ui::FlatButton *m_sync = nullptr, *m_click = nullptr;
-  ui::Led *m_syncLed = nullptr;
+  juce::Label *m_beatBox = nullptr;
+  ui::Strip *m_sep = nullptr;
+  ui::FlatButton *m_click = nullptr;
   ui::ArcKnob *m_clickVolume = nullptr;
   ui::BeatCells *m_beats = nullptr;
 
@@ -158,11 +157,14 @@ private:
   // room panel
   ui::Strip *m_room = nullptr;
   juce::Label *m_roomTitle = nullptr, *m_roomCount = nullptr;
-  juce::Label *m_bpmLabel = nullptr, *m_intervalLabel = nullptr, *m_codecLabel = nullptr, *m_kbpsLabel = nullptr, *m_recentLabel = nullptr;
+  juce::Label *m_bpmLabel = nullptr, *m_codecLabel = nullptr, *m_kbpsLabel = nullptr, *m_recentLabel = nullptr;
   juce::Label *m_modeLabel = nullptr;
   ui::DragNumberBox *m_bpm = nullptr;
-  ui::MenuBox *m_interval = nullptr, *m_codec = nullptr, *m_kbps = nullptr;
-  ui::MenuBox *m_mode = nullptr; // Live or intervals (the room's)
+  ui::FlatButton *m_sync = nullptr; // follow the DAW's tempo
+  ui::Led *m_syncLed = nullptr;
+  juce::Label *m_syncText = nullptr; // the DAW's tempo
+  ui::MenuBox *m_codec = nullptr, *m_kbps = nullptr;
+  ui::MenuBox *m_mode = nullptr; // the room's: Live, or intervals of one of uitext::BPI_CHOICES beats
   // a tempo and an interval the room waits to change to, and Live: what it waits for
   ui::Chip *m_chips[3] = { nullptr, nullptr, nullptr };
   ui::EventList *m_events = nullptr;
