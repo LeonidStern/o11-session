@@ -364,6 +364,73 @@ TEST(sink_keeps_its_delay_after_a_gap) {        // 16.6: back in time with the o
     std::printf("    after gaps of 20 to 250 ms, lost or held back: the delay moved at most %.2f ms\n", worst * 5.0 / 90);
 }
 
+TEST(sink_marks_where_its_concealment_begins) {   // 16.8: the mixer's hold counts from that frame
+    // A sender in real time, a tone in 240-frame Opus blocks, against
+    // 270-frame host blocks, and a lost gap. The frame where the sink's
+    // concealment begins (quietFrom(), firstReal()) is where the first lost
+    // block's turn comes, on the stream's delay, wherever in a host block
+    // that falls; and its audio comes back the lost blocks' length later.
+    int err = 0;
+    OpusEncoder* enc = opus_encoder_create(48000, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+    REQUIRE(enc != nullptr);
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(128000));
+    std::vector<float> pcm(2 * 240), out(2 * 270);
+    long first_delay = -1;
+    int runs = 0, off = 0, wrong_length = 0;
+    for (int gap_ms : {50, 120, 250}) {
+        for (int phase = 0; phase < 9; ++phase) {   // 9 blocks of 240 against 8 of 270: every place in a host block
+            LiveSink k;
+            k.configure(20, 270, 48000);
+            k.apply(item(SinkItem::Start, 0), 1);
+            opus_encoder_ctl(enc, OPUS_RESET_STATE);
+            const long g0 = 48000 + phase * 240 + 37, g1 = g0 + gap_ms * 48;
+            const long s0 = (g0 + 239) / 240, s1 = (g1 + 239) / 240;   // the first lost block, the first after
+            std::int32_t sent = 0;
+            long onset = -1, back = -1;
+            bool was_real = false;
+            for (long b = 0; b < (g1 + 24000) / 270; ++b) {
+                while ((sent + 1) * 240L <= (b + 1) * 270L) {
+                    for (int i = 0; i < 240; ++i)
+                        pcm[2 * i] = pcm[2 * i + 1] =
+                            0.3f * static_cast<float>(std::sin(2 * M_PI * 440 * (sent * 240.0 + i) / 48000));
+                    SinkItem it = item(SinkItem::Data, sent);
+                    const int n = opus_encode_float(enc, pcm.data(), 240, it.data, 1275);
+                    REQUIRE(n > 0);
+                    it.len = static_cast<std::uint16_t>(n);
+                    if (sent * 240L < g0 || sent * 240L >= g1) k.apply(it, 1);
+                    ++sent;
+                }
+                k.render(out.data(), 270, 48000, 1);
+                const int first = k.firstReal(), from = k.quietFrom();
+                if (onset < 0 && was_real && from < 270) onset = b * 270 + from;
+                if (onset >= 0 && back < 0 && b * 270 + 270 > onset && first >= 0 && b * 270 + first > onset)
+                    back = b * 270 + first;
+                was_real = first >= 0 && from == 270;
+            }
+            ++runs;
+            const long delay = onset - s0 * 240;
+            if (first_delay < 0) first_delay = delay;
+            if (onset < 0 || delay != first_delay) {
+                ++off;
+                std::printf("    a %d ms gap at phase %d: the concealment began at %ld, %ld frames after the first "
+                            "lost block's start (%ld before)\n", gap_ms, phase, onset, delay, first_delay);
+            }
+            if (back - onset != (s1 - s0) * 240) {
+                ++wrong_length;
+                std::printf("    a %d ms gap at phase %d: concealed for %ld frames, not %ld\n", gap_ms, phase,
+                            back - onset, (s1 - s0) * 240);
+            }
+        }
+    }
+    std::printf("    %d gaps: the concealment began %ld frames after the first lost block's start in the stream every "
+                "time but %d, and lasted the lost blocks' length every time but %d\n", runs, first_delay, off,
+                wrong_length);
+    CHECK(first_delay > 0);
+    CHECK_EQ(off, 0);
+    CHECK_EQ(wrong_length, 0);
+    opus_encoder_destroy(enc);
+}
+
 TEST(sink_stop_and_reset) {
     Playing p(10);
     p.sink.apply(item(SinkItem::Stop, 0), p.now);

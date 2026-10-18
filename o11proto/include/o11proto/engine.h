@@ -220,6 +220,10 @@ public:
     int liveHeardMs() const;
     void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
     void setLiveTestSendGap(int ms);            // test hook: the Live data sent in the next `ms` is lost
+    // Test hook: the frame (counted from this engine's first process()
+    // block) where this user's live audio last went into concealment, -1
+    // for never.
+    long liveTestConcealedFrom(int user) const;
 
 private:
     struct UploadBlock {

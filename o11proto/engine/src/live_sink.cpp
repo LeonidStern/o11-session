@@ -308,7 +308,7 @@ void LiveSink::sizesChanged() {
 }
 
 int LiveSink::concealSamples() const {
-    return static_cast<int>((kLiveConcealBuffers * latency_ms_ + kLiveFadeMs + 10.0) * 48.0);
+    return static_cast<int>((kLiveConcealBuffers * latency_ms_ + kLiveFadeMs + kLiveConcealSpareMs) * 48.0);
 }
 
 void LiveSink::configure(double latency_ms, int host_block, int host_rate) {
@@ -516,6 +516,7 @@ void LiveSink::prime() {
 void LiveSink::decodeNext(std::int64_t now_ns) {
     fifo_at_ = 0;
     fifo_n_ = block_;
+    fifo_real_ = false;
     if (phase_ == Buffering) {
         const int held = heldBlocks();
         if (realign_) {                          // after running dry: back on its delay
@@ -602,6 +603,7 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
             } else {
                 if (n < block_) std::memset(fifo_ + 2 * n, 0, sizeof(float) * 2 * static_cast<std::size_t>(block_ - n));
                 clampDecoded(fifo_, 2 * static_cast<std::size_t>(block_));
+                fifo_real_ = true;
                 if (concealer_->concealing() || concealer_->joining())
                     concealer_->join(fifo_, block_);
                 else
@@ -642,6 +644,8 @@ void LiveSink::hostGap(int host_frames, int host_rate) {
 }
 
 bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
+    first_real_ = -1;
+    quiet_from_ = 0;
     if (phase_ == Idle && tail48_ <= 0) {
         std::memset(out, 0, sizeof(float) * 2 * static_cast<std::size_t>(frames));
         return false;
@@ -677,7 +681,15 @@ bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
                 x_[2][c] = x_[3][c];
                 x_[3][c] = fifo_[2 * fifo_at_ + c];
             }
+            xr_[0] = xr_[1];
+            xr_[1] = xr_[2];
+            xr_[2] = xr_[3];
+            xr_[3] = fifo_real_;
             ++fifo_at_;
+        }
+        if (xr_[1]) {                            // this frame is mostly x_[1]
+            if (first_real_ < 0) first_real_ = i;
+            quiet_from_ = i + 1;
         }
         const float t = static_cast<float>(t_);
         for (int c = 0; c < 2; ++c) {            // Catmull-Rom between x_[1] and x_[2]
