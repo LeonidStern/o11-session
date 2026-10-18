@@ -311,6 +311,12 @@ bool Transport::pathUp(std::uint32_t peer) const {
     return p && p->direct();
 }
 
+bool Transport::pathOpening(std::uint32_t peer) const {
+    std::lock_guard<std::mutex> lock(impl_->paths_mutex);
+    const DirectPath* p = impl_->path(peer);
+    return p && !p->forced && p->state == DirectPath::Opening;
+}
+
 void Transport::setRoomRoute(bool relay_fallback, bool room_relay) {
     std::lock_guard<std::mutex> lock(impl_->paths_mutex);
     impl_->relay_fallback = relay_fallback;
@@ -459,7 +465,7 @@ void Transport::stop() {
 
 // ------------------------------------------------------------- sending
 
-bool Transport::send(std::uint32_t dest, const std::uint8_t* payload, std::size_t len) {
+bool Transport::send(std::uint32_t dest, const std::uint8_t* payload, std::size_t len, bool through_relay) {
     Impl& m = *impl_;
     if (m.fd == kInvalidSocket || len == 0 || len > kMaxPayload) return false;
     // Where it goes: directly (with the pair's key) while the path is up,
@@ -467,7 +473,7 @@ bool Transport::send(std::uint32_t dest, const std::uint8_t* payload, std::size_
     udp::Addr direct_to;
     std::uint64_t pair_key = 0;
     bool direct = false, relayed = true, lost = false;
-    if (dest != 0) {
+    if (dest != 0 && !through_relay) {
         std::lock_guard<std::mutex> lock(m.paths_mutex);
         const DirectPath* p = m.path(dest);
         if (!m.room_relay && !m.force_relay && p) {

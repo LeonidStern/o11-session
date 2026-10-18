@@ -415,7 +415,8 @@ TEST(relay_fallback_takes_the_room_to_the_relay) {
 // A player whose client sends through the relay only (the test setting,
 // for benchmarks): the others reach it through the relay, and each other
 // directly, and everyone hears everyone evenly. Without the setting, it
-// goes direct with the others.
+// goes direct with the others, make before break: its streams come by the
+// relay until their paths are up, a path that opens late too.
 TEST(forced_relay) {
     Options o;
     o.sides = 3;
@@ -444,11 +445,27 @@ TEST(forced_relay) {
     CHECK(relayed >= 2 * 4 * 180 && relayed <= 2 * 4 * 220 + 80);
     for (int a = 0; a < 3; ++a) CHECK(r[a].e.liveAdviceReason() == Engine::LiveAdvice::None);
 
+    // alice can send directly again. Make before break: each stream the
+    // relay carried goes on through it until its path is up. Her path
+    // with bob opens late (the test's block, for 1.5 s): meanwhile their
+    // two streams still come by the relay, and nobody hears a gap.
+    r[0].e.setLiveTestBlockPeer("bob@127.0.0.1", true);
     r[0].e.setLiveTestForceRelay(false);
     const long open_at = r.frames.load();
+    auto late = [](int a, int b) { return (a == 0 && b == 1) || (a == 1 && b == 0) ? LiveRoute::Relay : LiveRoute::Direct; };
+    REQUIRE(streamsAre(r, late, 8));
+    r.wait(1.5);
+    printRoutes(r);
+    CHECK(streamsAre(r, late, 0.1));
+    r[0].e.setLiveTestBlockPeer("bob@127.0.0.1", false);
     REQUIRE(streamsAre(r, [](int, int) { return LiveRoute::Direct; }, 8));
     r.wait(2.0);
     printRoutes(r);
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+            if (a != b)
+                std::printf("    %s's stream of %s came by: %s\n", r[a].name.c_str(), r[b].name.c_str(),
+                            routeEvents(r, a, b).c_str());
     hearsEveryoneEvenly(r, open_at - r.opt.rate, r.frames.load(), "across alice's change to direct");
     CHECK_EQ(relayedOver(r, 1.0), 0u);
 }

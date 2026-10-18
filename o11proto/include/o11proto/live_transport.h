@@ -13,9 +13,10 @@
 // through the relay, as before. setRoomRoute() takes the room's route
 // (SERVER_LIVE_ROOM): without the server's relay fallback, nothing goes to
 // a peer whose path isn't up (direct only: not even while it opens, nor
-// the second copy while suspect); with it, while the room is on the relay,
-// everything goes through the relay. The paths are probed throughout, and
-// pathStates() says how each stands, for CLIENT_LIVE_PATHS.
+// the second copy while suspect), unless its owner sends it through the
+// relay itself (send()'s through_relay); with it, while the room is on the
+// relay, everything goes through the relay. The paths are probed
+// throughout, and pathStates() says how each stands, for CLIENT_LIVE_PATHS.
 //
 // The transport runs its own network thread. Every callback runs on that
 // thread, and send() may only be called from inside one: the thread owns the
@@ -123,8 +124,9 @@ public:
     // Network thread only. One data datagram to `dest` (0 = the room's
     // other senders, through the relay): directly where its path is up,
     // else through the relay; false when the payload is empty or too long,
-    // or the send failed.
-    bool send(std::uint32_t dest, const std::uint8_t* payload, std::size_t len);
+    // or the send failed. `through_relay`: through the relay whatever its
+    // path is (the owner's make-before-break while a path opens).
+    bool send(std::uint32_t dest, const std::uint8_t* payload, std::size_t len, bool through_relay = false);
 
     // The direct paths. Any thread. setPaths() takes the room's other
     // players that can be reached directly (0x09, a full list each time;
@@ -149,6 +151,7 @@ public:
     enum class Route : std::uint8_t { None = 0, Direct = 1, Relay = 2, Off = 3 };
     Route route(std::uint32_t peer) const;
     bool pathUp(std::uint32_t peer) const;      // its direct path holds (up or suspect)
+    bool pathOpening(std::uint32_t peer) const; // listed, never answered yet, and not yet unreachable
     // The room's route: whether the server falls back to the relay (else
     // direct only), and whether the room is on the relay now. Direct only
     // until it is told otherwise: a path that opens before the room's

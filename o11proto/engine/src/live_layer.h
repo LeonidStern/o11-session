@@ -229,6 +229,10 @@ struct LiveLayer {
         TimePoint pong_answered{}, start_answered{}, stop_answered{};
         double tokens = 16;
         TimePoint refill{};
+        // The relay's run of the source's blocks to it (steady ns, 0 for
+        // none): the first and the latest, for sendAudio()'s make before break.
+        std::int64_t relay_from_ns = 0, relay_last_ns = 0;
+        o11proto::live::Transport::Route route = o11proto::live::Transport::Route::None;   // this block's
     };
     struct NetSlot {                            // a slot's network side
         std::uint32_t peer = 0;

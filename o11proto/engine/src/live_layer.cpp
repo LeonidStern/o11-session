@@ -858,22 +858,40 @@ void LiveLayer::encodeAndSend(TimePoint now) {
 // All-to-all: a block once to each listed peer, directly where the pair's
 // path is up, through the relay to a peer without a path (its
 // destination, while bound), and not at all to one whose path isn't up in
-// a room that is direct only. When everything would go through the relay,
-// once to the room (5.8): one datagram, and an older server does the same.
+// a room that is direct only. Make before break: a peer the relay has
+// carried the stream to for kRelayRunNs, up to the block before, still
+// gets it through the relay while its new path opens, until the path is
+// up (or unreachable: then not at all). The first blocks that come by
+// the relay between a peer's listing and its path's are no such run. When
+// everything would go through the relay, once to the room (5.8): one
+// datagram, and an older server does the same.
 void LiveLayer::sendAudio(const std::uint8_t* p, std::size_t n) {
     using Route = o11proto::live::Transport::Route;
+    constexpr std::int64_t kRelayRunNs = 1000000000LL, kRelayBreakNs = 250000000LL;
+    const std::int64_t now = steadyNs(Clock::now());
     bool any = false;
-    for (const auto& q : peers) {
-        const Route r = transport_.route(q.id);
-        any = any || r == Route::Direct || r == Route::Off;
+    for (auto& q : peers) {
+        q.route = transport_.route(q.id);
+        if (q.route == Route::Off && q.bound && q.relay_last_ns != 0 && now - q.relay_last_ns <= kRelayBreakNs &&
+            q.relay_last_ns - q.relay_from_ns >= kRelayRunNs && transport_.pathOpening(q.id))
+            q.route = Route::Relay;
+        any = any || q.route == Route::Direct || q.route == Route::Off;
+    }
+    for (auto& q : peers) {                     // the relay's runs
+        if (!q.bound || (any && q.route != Route::Relay)) {
+            q.relay_from_ns = q.relay_last_ns = 0;
+            continue;
+        }
+        if (q.relay_last_ns == 0 || now - q.relay_last_ns > kRelayBreakNs) q.relay_from_ns = now;
+        q.relay_last_ns = now;
     }
     if (!any) {
         send(0, p, n);
         return;
     }
     for (const auto& q : peers) {
-        const Route r = transport_.route(q.id);
-        if (r == Route::Direct || (r == Route::Relay && q.bound)) send(q.id, p, n);
+        if (q.route == Route::Direct) send(q.id, p, n);
+        else if (q.route == Route::Relay && q.bound) transport_.send(q.id, p, n, true);
     }
 }
 
