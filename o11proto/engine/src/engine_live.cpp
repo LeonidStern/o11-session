@@ -1011,6 +1011,58 @@ void lineUp(LiveMix& m, int in, int rate) {
     }
 }
 
+// mixLive()'s loop while both fades are at rest: path p heard at gain g[p]
+// (0 or 1) throughout, from its ring `delay[p]` frames back, or straight
+// from the frames just written there (ibuf, lbuf) when neither path has a
+// delay. The same arithmetic as mixLive()'s own loop, without the fades.
+template <bool Mono, bool Direct>
+void mixAtRestAs(const LiveMix& m, int n, float vol, float gl, float gr, float* o0, float* o1, float* pk0,
+                 float* pk1) {
+    constexpr int R = LiveMix::kRing - 1;
+    const float g0 = m.pos[0], g1 = m.pos[1];
+    const float* r0 = m.ring[0].get();
+    const float* r1 = m.ring[1].get();
+    float p0 = *pk0, p1 = *pk1;
+    for (int i = 0; i < n; ++i) {
+        const float* a;
+        const float* b;
+        if (Direct) {
+            a = m.ibuf + 2 * i;
+            b = m.lbuf + 2 * i;
+        } else {
+            a = r0 + 2 * ((m.w + i - m.delay[0]) & R);
+            b = r1 + 2 * ((m.w + i - m.delay[1]) & R);
+        }
+        const float s1 = g0 * a[0] + g1 * b[0];
+        const float s2 = g0 * a[1] + g1 * b[1];
+        if (Mono) {
+            const float v = clip1((s1 + s2) * 0.5f * vol);
+            o0[i] += v;
+            p0 = std::max(p0, std::fabs(v));
+        } else {
+            const float lv = clip1(s1 * vol * gl), rv = clip1(s2 * vol * gr);
+            o0[i] += lv;
+            o1[i] += rv;
+            p0 = std::max(p0, std::fabs(lv));
+            p1 = std::max(p1, std::fabs(rv));
+        }
+    }
+    *pk0 = p0;
+    *pk1 = p1;
+}
+
+void mixAtRest(const LiveMix& m, int n, float vol, float gl, float gr, bool mono, float* o0, float* o1, float* pk0,
+               float* pk1) {
+    const bool direct = m.delay[0] == 0 && m.delay[1] == 0;
+    if (mono) {
+        if (direct) mixAtRestAs<true, true>(m, n, vol, gl, gr, o0, o1, pk0, pk1);
+        else mixAtRestAs<true, false>(m, n, vol, gl, gr, o0, o1, pk0, pk1);
+    } else {
+        if (direct) mixAtRestAs<false, true>(m, n, vol, gl, gr, o0, o1, pk0, pk1);
+        else mixAtRestAs<false, false>(m, n, vol, gl, gr, o0, o1, pk0, pk1);
+    }
+}
+
 }  // namespace
 
 // 6.6 and 16.8: channel 0 of every user with a mixer, from its interval
@@ -1096,7 +1148,15 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                 m.ring[1][2 * f] = m.lbuf[2 * k];
                 m.ring[1][2 * f + 1] = m.lbuf[2 * k + 1];
             }
-            for (int i = 0; i < n; ++i) {
+            // At rest, as nearly always: each fade already where it is going
+            // and staying there for this whole piece, so nothing moves and
+            // each path is heard at 0 or 1 throughout.
+            bool rest = m.pos[0] == target[0] && (m.pos[1] == 0.0f || m.pos[1] == 1.0f);
+            for (int i = 0; rest && i < n; ++i)
+                rest = (live && slot_ok && quietAt(i) <= keep ? 1.0f : 0.0f) == m.pos[1];
+            if (rest && audible)
+                mixAtRest(m, n, vol, gl, gr, mono, out[idx] + done, mono ? nullptr : out[idx + 1] + done, &pk0, &pk1);
+            for (int i = 0; !rest && i < n; ++i) {
                 target[1] = live && slot_ok && quietAt(i) <= keep ? 1.0f : 0.0f;
                 float g[2];
                 for (int p = 0; p < 2; ++p) {
