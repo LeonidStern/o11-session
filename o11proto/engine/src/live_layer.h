@@ -46,6 +46,8 @@ constexpr int kLiveMaxHostBlock = 16384;     // longer host blocks play interval
 // The network thread's housekeeping wait: the audio thread wakes it for
 // each block it queues, and a datagram does (live::Transport::Options).
 constexpr int kLiveNetworkWaitMs = 10;
+// "The room is Live now, about N ms late." waits this long at most for N.
+constexpr int kLiveNoticeWaitMs = 1500;
 
 // The buffer in use, B (6.8), and the longest host block that plays well.
 int liveBufferInUse(int setting_ms, int host_block, int host_rate);
@@ -140,6 +142,7 @@ struct LiveLayer {
     bool report_ever = false;
     TimePoint report_at{};
     int room_noticed = 0;                       // the applied mode the notices last spoke of
+    TimePoint room_notice_by{};                 // "The room is Live now" waits for an estimate until then
     std::string advice_said;                    // whose advice the notices last spoke of ("" for none)
     o11proto::live::Advice advice_said_reason = o11proto::live::Advice::None;
     int advice_said_count = 0;
