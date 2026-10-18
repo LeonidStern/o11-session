@@ -75,6 +75,9 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
   cfg.anonymous_privs = o11proto::kPrivChat | o11proto::kPrivVote;
   cfg.bpm = DEFAULT_BPM;
   cfg.bpi = DEFAULT_BPI;
+  // benchmarks and tests: the hosted room's tempo
+  if (const char *v = getenv("O11_HOST_BPM")) if (atoi(v) > 0) cfg.bpm = (std::uint16_t)atoi(v);
+  if (const char *v = getenv("O11_HOST_BPI")) if (atoi(v) > 0) cfg.bpi = (std::uint16_t)atoi(v);
   cfg.max_users = MAX_USERS;
   cfg.allow_codecs = o11proto::kCapOpus | o11proto::kCapFlac;
   cfg.chosen_codec = o11proto::kCapOpus;

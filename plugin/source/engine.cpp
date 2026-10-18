@@ -373,9 +373,12 @@ void Engine::start()
   if (const char *log = getenv("O11_LIVE_LOG")) m_liveLog = atoi(log) != 0; // before the thread reads it
   m_thread = std::thread([this]() { threadProc(); });
 
-  // benchmarks, with no window: join a room once loaded (O11_CONNECT="host:port name"), pick
-  // Live's buffer (O11_LIVE_BUFFER_MS) and print the `live` line when it changes (O11_LIVE_LOG=1)
+  // benchmarks, with no window: join a room once loaded (O11_CONNECT="host:port name") or host one
+  // (O11_HOST=1, on O11_HOST_PORT), pick the Opus bitrate (O11_BITRATE) and Live's buffer
+  // (O11_LIVE_BUFFER_MS), and print the `live` line when it changes (O11_LIVE_LOG=1)
   if (const char *ms = getenv("O11_LIVE_BUFFER_MS")) setLiveBuffer(Settings::nearestLiveBufferMs(atoi(ms)));
+  if (const char *k = getenv("O11_BITRATE")) setOpusKbps(atoi(k)); // before hosting: the host's bitrate is the room's
+  if (const char *h = getenv("O11_HOST")) setHosting(atoi(h) != 0);
   if (const char *c = getenv("O11_CONNECT"))
   {
     const std::string s = c;
