@@ -75,15 +75,26 @@ mapping is removed when the server exits. With Live mode open it forwards the
 UDP port of the same number too.
 
 `--live` turns on Live mode (PROTOCOL.md section 15): players who are on Live
-hear each other in real time through a UDP relay on the TCP port's number.
-`yes` opens the UDP port with the room's Live switch off, `on` with it on, and
-`require` is `yes` that refuses to start when the UDP port can't be opened.
-Players switch it with `!live on` / `!live off` in chat. `--live-kbps`,
+hear each other in real time over UDP, directly between each pair of players
+where they can (all to all, 15.10) and through the server's relay on the TCP
+port's number for a player without a direct path. `yes` opens the UDP port
+with the room's Live switch off, `on` with it on, and `require` is `yes` that
+refuses to start when the UDP port can't be opened. Players switch it with
+`!live on` / `!live off` in chat; while it is on the room is Live for
+everyone, with no interval audio, and the server tells the players who has
+trouble (15.11). A pair of players with no direct path can't hear each other,
+and the advice says so. The room-wide relay fallback (everyone through the
+relay once a pair has no direct path, until `!live direct`) is a backend
+option, off by default and without a flag: `O11_LIVE_RELAY_FALLBACK=1`.
+`--live-kbps`,
 `--live-frame` and `--live-max-peers` set what the server tells the clients;
 `--live-port` announces another UDP port (a router that forwards a different
 external port); `--live-strict-address no` accepts UDP from any address of a
 player who knows the key (for players whose UDP leaves through another
-address than their TCP).
+address than their TCP). The server's thread relays every Live datagram as it
+comes, so it is a network thread (`o11proto/realtime.h`, real-time on macOS);
+the server logs `[o11server] the server's thread: real-time (time-constraint)`
+(or `latency-critical`, `its scheduling unchanged`) at start.
 
 ## Router port mapping
 
@@ -146,14 +157,23 @@ Example session:
   `stop()`. Drive `poll()` from your own loop or call `runFor()`.
   `ServerConfig::live` and `setLiveConfig()` run Live mode's UDP relay
   (PROTOCOL.md section 15) inside the same loop.
-- `o11proto/live.h`: Live mode's message `0x07` (`live::ServerLive`,
-  `encode()`/`decode()`), the datagram constants and the hello cookie. With
-  `Client::Options::live` the client sets the caps bit and hands each `0x07`
-  to `on_live`.
-- `o11proto/live_transport.h`: `live::Transport`, the client's Live UDP: a
-  socket connected to the relay, hellos and the cookie, the client's drop
-  rules, and opaque payloads in (`on_data`) and out (`send()`), all on its own
-  network thread. The engine's Live layer (ENGINE.md section 16) runs on it.
+- `o11proto/live.h`: Live mode's messages `0x07` (`live::ServerLive`),
+  `0x09`, `0x86` and `0x87` (the direct paths: `LivePaths`, `LiveLan`,
+  `PathsReport`, `pairKey()`), each with `encode()`/`decode()`, the datagram
+  and path constants and the hello cookie. With `Client::Options::live` the
+  client sets caps bit 16 (and with `live_direct` bit 17) and hands each
+  `0x07` to `on_live`.
+- `o11proto/live_room.h`: the room's one mode: `0x85` (`LiveReport`), `0x08`
+  (`LiveRoom`) and the server's `RoomAdvice`.
+- `o11proto/live_transport.h`: `live::Transport`, the client's Live UDP: one
+  socket for the relay and the direct paths (not connected), hellos and the
+  cookie, the probes and the paths' states, where each payload goes, the
+  client's drop rules, and opaque payloads in (`on_data`) and out (`send()`),
+  all on its own network thread, which `wake()` wakes. The engine's Live
+  layer (ENGINE.md section 16) runs on it.
+- `o11proto/realtime.h`: a thread's scheduling, where the system lets a
+  program choose it: `thread::makeAudioThread()`, `makeLatencyCritical()`,
+  `makeNetworkThread()` and `describe()` (ENGINE.md 16.1).
 
 ## Client engine
 
@@ -164,10 +184,16 @@ crossfade, pan law, meters, metronome and chat. `include/o11proto/engine/codec.h
 has the encoders, decoders, the windowed-sinc resampler and the DSP helpers on
 their own. Call `process()` from the audio callback and `run()` from a control
 loop at least every 50 ms. On a server with Live mode the engine also plays the
-room's Live players in real time (ENGINE.md section 16): `onLiveNotice` gets its
-chat lines, `liveCommand()` answers `/live` and `/live buffer N`, and
-`setLiveBufferMs()` / `setLiveHostState()` give it the jitter buffer setting and
-the host's transport.
+room's Live players in real time while the room is Live (ENGINE.md section
+16): `onLiveNotice` gets its chat lines, `liveCommand()` answers `/live` and
+`/live buffer auto|N`, `setLiveHostState()` gives it the host's transport, and
+`liveRoomLive()`, the `liveAdvice…()` and `liveUser…()` calls give a UI the
+room's mode, the server's advice and each player's delay, buffer and
+counters. The jitter buffer is automatic (10 ms, 20 ms for a player whose
+audio comes late) unless `setLiveBufferMs()` fixes it. `/live` shows the
+room's mode and the advice, the jitter buffer and the round trip to the
+server, then a line per player: live or not heard, about how late, the loss
+and the dropouts.
 
 ## o11jam
 
@@ -183,12 +209,14 @@ into local channel 0, subscribes to everyone, records what it hears and prints
 intervals. `--two` runs a sender and a listener (`NAME_l`) in one process and
 reports the listener's figures; `--say "!codec flac"` switches the room to
 FLAC. On an anonymous server use `--user anonymous:NAME`. On a Live server the
-listener hears the sender live (ENGINE.md section 16) and the figures measure
-that; the engine's Live lines are printed as `[NAME] live: ...`, `--say "/live"`
-or `--say "/live buffer 40"` goes to the engine instead of the chat, and
-`--no-live` keeps both engines on intervals. A machine that stalls the audio
-thread for tens of milliseconds makes the listener fall back to intervals for a
-few seconds, which shows in the SNR as a phase jump.
+listener hears the sender live while the room is Live (ENGINE.md section 16)
+and the figures measure that; the engine's Live lines are printed as `[NAME]
+live: ...`, `--say "/live"` or `--say "/live buffer 40"` goes to the engine
+instead of the chat, and `--no-live` keeps both engines off Live (while the
+room is Live they hear no one). Its host thread is an audio thread
+(`thread::makeAudioThread()`). A machine that stalls the audio thread for tens
+of milliseconds makes the listener's stream run dry and be concealed, which
+shows in the SNR.
 
 See `NOTES.md` for interpretation choices and what is not implemented,
 `engine/NOTES.md` for the engine and `portmap/NOTES.md` for the port mapper.
