@@ -304,7 +304,6 @@ void O11Editor::buildViews()
     if (i >= 0 && i < Settings::NUM_OPUS_KBPS) engine().setOpusKbps(Settings::OPUS_KBPS[i]);
   };
   m_modeLabel = add(m_room, makeLabel("Mode", f.label, Colors::label()));
-  m_bufferLabel = add(m_room, makeLabel("Buffer", f.label, Colors::label()));
   m_mode = add(m_room, new MenuBox(f.value));
   m_mode->addEntry("Live"); // the order of the choices
   m_mode->addEntry("Intervals");
@@ -312,11 +311,6 @@ void O11Editor::buildViews()
     Snapshot s;
     engine().getSnapshot(s);
     if (i >= 0 && s.state == ConnState::Connected && s.liveServer && s.liveSwitchOn != (i == 0)) engine().setRoomLive(i == 0);
-  };
-  m_buffer = add(m_room, new MenuBox(f.value));
-  for (int b : Settings::LIVE_BUFFER_MS) m_buffer->addEntry(uitext::msText(b));
-  m_buffer->onSelect = [this](int i) {
-    if (i >= 0 && i < Settings::NUM_LIVE_BUFFERS) engine().setLiveBuffer(Settings::LIVE_BUFFER_MS[i]);
   };
   for (auto &chip : m_chips)
   {
@@ -545,11 +539,9 @@ void O11Editor::layoutRoom(juce::Rectangle<float> pane)
   place(m_codec, x0, y, x0 + colW, y + ITEM_H);
   place(m_kbps, xb, y, x1, y + ITEM_H);
   y += ITEM_H + 5;
-  place(m_modeLabel, x0, y, x0 + colW, y + LABEL_H);
-  place(m_bufferLabel, xb, y, x1, y + LABEL_H);
+  place(m_modeLabel, x0, y, x1, y + LABEL_H);
   y += LABEL_H + 2;
-  place(m_mode, x0, y, x0 + colW, y + ITEM_H);
-  place(m_buffer, xb, y, x1, y + ITEM_H);
+  place(m_mode, x0, y, x1, y + ITEM_H);
   y += ITEM_H + 5;
   for (Chip *chip : m_chips)
     if (chip->isVisible())
@@ -946,17 +938,6 @@ void O11Editor::updateRoom(const Snapshot &s, double)
     setTooltip(m_mode, "Live is on: the room plays intervals until everyone's connection is clean, then everyone goes Live "
                        "together at an interval's start");
   else setTooltip(m_mode, "The room plays intervals: pick Live to play everyone in real time, from an interval's start");
-  m_buffer->setShown(uitext::msText(s.liveBufferMs));
-  {
-    int index = -1;
-    for (int i = 0; i < Settings::NUM_LIVE_BUFFERS; i ++)
-      if (Settings::LIVE_BUFFER_MS[i] == s.liveBufferMs) index = i;
-    m_buffer->setCurrentIndex(index);
-  }
-  setTooltip(m_buffer, "Your Live buffer: a longer one rides out a bad connection, and you hear everyone that much later" +
-                       (s.liveBufferInUseMs > s.liveBufferMs ? std::string(" (your DAW's audio blocks need ") +
-                                                                   uitext::msText(s.liveBufferInUseMs) + " now)"
-                                                             : std::string()));
 
   // what the room changes to at the next interval, and who voted for it (when the server says)
   int shown = 0;

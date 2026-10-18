@@ -203,7 +203,7 @@ struct Settings
   bool transmit = true;
   int opusKbps = DEFAULT_OPUS_KBPS; // what we send in Opus rooms; FLAC is lossless and ignores it
   bool followHostTempo = true; // Sync: follow the host's tempo (and line up with its bars)
-  int liveBufferMs = DEFAULT_LIVE_BUFFER_MS; // Live's jitter buffer, one of LIVE_BUFFER_MS
+  int liveBufferMs = DEFAULT_LIVE_BUFFER_MS; // Live's jitter buffer, one of LIVE_BUFFER_MS; not saved: only the `live buffer` command and O11_LIVE_BUFFER_MS (tests) change it
   int editorWidth = 0, editorHeight = 0; // the editor's size, 0 for the default
 
   struct Remote

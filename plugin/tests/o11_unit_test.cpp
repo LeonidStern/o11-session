@@ -136,24 +136,18 @@ static void test_state()
   CHECK(!offLoaded.followHostTempo);
   CHECK(e.followHostTempo);
 
-  // Live's jitter buffer: 20 ms by default and in older states, one of the choices when loaded
+  // Live's jitter buffer: not saved (Live picks it), and older states' setting is ignored
   CHECK_EQ(Settings().liveBufferMs, 20);
   CHECK_EQ(old.liveBufferMs, 20);
-  struct { const char *saved; int ms; } buffers[] = {
-    { "10", 10 }, { "40", 40 }, { "100", 100 }, { "33", 30 }, { "5", 10 }, { "200", 100 }, { "999", 100 },
-    { "abc", 20 }, { "", 20 }, { "30ms", 20 }, { "-40", 10 },
-  };
-  for (auto &b : buffers)
+  for (const char *saved : { "10", "40", "100", "abc", "" })
   {
     Settings k;
-    CHECK(k.deserialize(std::string("O11-SESSION-STATE 1\nlive_buffer_ms=") + b.saved + "\n"));
-    CHECK_EQ(k.liveBufferMs, b.ms);
+    CHECK(k.deserialize(std::string("O11-SESSION-STATE 1\nlive_buffer_ms=") + saved + "\n"));
+    CHECK_EQ(k.liveBufferMs, 20);
   }
   Settings longer;
   longer.liveBufferMs = 60;
-  Settings longerLoaded;
-  CHECK(longerLoaded.deserialize(longer.serialize()));
-  CHECK_EQ(longerLoaded.liveBufferMs, 60);
+  CHECK(longer.serialize().find("live_buffer_ms") == std::string::npos);
   CHECK_EQ(Settings::nearestLiveBufferMs(25), 20);
   CHECK_EQ(Settings::nearestLiveBufferMs(70), 60);
 }

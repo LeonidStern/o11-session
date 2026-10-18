@@ -354,7 +354,7 @@ int main()
     CHECK(heardMs > 0 && heardMs < 150);
   }
   CHECK(room.guest.command("chatlog").find("The room is Live now") != std::string::npos);
-  // the buffer is the guest's own, and saved with its set
+  // the buffer is the guest's own (a test setting now: not saved, no menu)
   CHECK(room.guest.command("live buffer 40") == "ok");
   CHECK(room.waitForLive(room.guest, "buffer", "40", 5));
   CHECK(room.guest.getSettings().liveBufferMs == 40);

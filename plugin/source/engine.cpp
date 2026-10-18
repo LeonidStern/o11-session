@@ -161,7 +161,6 @@ std::string Settings::serialize() const
   s += std::string("transmit=") + (transmit ? "1" : "0") + "\n";
   s += "opus_kbps=" + std::to_string(opusKbps) + "\n";
   s += std::string("follow_host_tempo=") + (followHostTempo ? "1" : "0") + "\n";
-  s += "live_buffer_ms=" + std::to_string(liveBufferMs) + "\n";
   if (editorWidth > 0 && editorHeight > 0) s += "editor_window=" + std::to_string(editorWidth) + "x" + std::to_string(editorHeight) + "\n";
   for (auto &r : remote)
     s += "remote=" + escape(r.first) + "\t" + num(r.second.volume) + "\t" + num(r.second.pan) + "\t" + (r.second.mute ? "1" : "0") + "\n";
@@ -191,11 +190,7 @@ bool Settings::deserialize(const std::string &data)
     else if (key == "monitor") s.monitor = value == "1";
     else if (key == "transmit") s.transmit = value == "1";
     else if (key == "follow_host_tempo") s.followHostTempo = value == "1";
-    else if (key == "live_buffer_ms")
-    {
-      int ms = 0;
-      if (o11proto::engine::Engine::parseLiveBufferSetting(value, &ms)) s.liveBufferMs = nearestLiveBufferMs(ms);
-    }
+    else if (key == "live_buffer_ms") {} // older states: Live picks its buffer itself now
     else if (key == "opus_kbps")
     {
       char *end = nullptr;
