@@ -1391,15 +1391,16 @@ void Engine::publish()
       snap.liveServer = m_client->liveServerHas();
       snap.liveSwitchOn = snap.liveServer && m_client->liveRoomSwitchOn();
       snap.liveRoom = m_client->liveRoomLive();
-      switch (m_client->liveRoomReason())
+      // the server's advice while Live: the worst trouble now, and how many have trouble
+      switch (m_client->liveAdviceReason())
       {
-        case o11proto::engine::Engine::LiveReason::Dropouts: snap.liveReason = Snapshot::LiveDropouts; break;
-        case o11proto::engine::Engine::LiveReason::CantLive: snap.liveReason = Snapshot::LiveCantLive; break;
-        case o11proto::engine::Engine::LiveReason::Joining: snap.liveReason = Snapshot::LiveJoining; break;
+        case o11proto::engine::Engine::LiveAdvice::Dropouts: snap.liveReason = Snapshot::LiveDropouts; break;
+        case o11proto::engine::Engine::LiveAdvice::CantLive: snap.liveReason = Snapshot::LiveCantLive; break;
         default: snap.liveReason = Snapshot::LiveNoReason; break;
       }
-      const std::string who = m_client->liveRoomReasonUser();
+      const std::string who = m_client->liveAdviceUser();
       snap.liveReasonWho = who.empty() ? std::string() : who == m_client->username() ? std::string("You") : displayName(who);
+      snap.liveReasonOthers = snap.liveReason == Snapshot::LiveNoReason ? 0 : std::max(0, m_client->liveAdviceCount() - 1);
       snap.liveHeardMs = snap.liveRoom ? m_client->liveHeardMs() : -1;
     }
     updateUsers(snap);
@@ -1617,11 +1618,11 @@ std::string Engine::command(const std::string &lineIn)
     if (!arg.empty()) return "error: live on|off, live buffer N, or live";
     Snapshot s;
     getSnapshot(s);
-    static const char *reasons[] = { "none", "dropouts", "cantlive", "joining" };
+    static const char *reasons[] = { "none", "dropouts", "cantlive" };
     char buf[256];
-    snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s heard=%d buffer=%d inuse=%d\n",
+    snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s others=%d heard=%d buffer=%d inuse=%d\n",
              s.liveServer ? 1 : 0, s.liveSwitchOn ? 1 : 0, s.liveRoom ? "live" : "intervals", reasons[(int)s.liveReason],
-             s.liveReasonWho.c_str(), s.liveHeardMs, s.liveBufferMs, s.liveBufferInUseMs);
+             s.liveReasonWho.c_str(), s.liveReasonOthers, s.liveHeardMs, s.liveBufferMs, s.liveBufferInUseMs);
     return buf;
   }
   if (verb == "vote")

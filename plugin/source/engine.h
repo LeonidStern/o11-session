@@ -121,7 +121,7 @@ struct Snapshot
 
   // Live: real-time audio, on servers that have it. The whole room plays one way: Live, or
   // intervals while someone's connection isn't good enough (or someone can't play Live).
-  enum LiveReason { LiveNoReason, LiveDropouts, LiveCantLive, LiveJoining };
+  enum LiveReason { LiveNoReason, LiveDropouts, LiveCantLive };
   bool liveServer = false;   // the server has Live (its UDP port is open)
   bool liveSwitchOn = false; // the room's Live switch (!live on)
   bool liveRoom = false;     // the room plays Live now

@@ -261,8 +261,13 @@ int main()
   CHECK(room.waitFor(room.host, "roomkbps", "128", 10));
 
   // Link: the host, first in the room, leads it; the guest, in the same process, can't
-  const bool haveLink = field(room.host.command("status"), "link") != "unavailable";
+  const std::string linkStatus = room.host.command("status");
+  const bool haveLink = field(linkStatus, "link") != "unavailable";
+  // other Link apps on this machine (a DAW, a benchmark's players) take the lead or contest it
+  const int otherLinkApps = atoi(field(linkStatus, "peers").c_str());
   if (!haveLink) printf("  Link couldn't start here: its checks are skipped\n");
+  else if (otherLinkApps > 0)
+    printf("  %d other Link apps on this machine (link=%s): the Link checks are skipped\n", otherLinkApps, field(linkStatus, "link").c_str());
   else
   {
     CHECK(room.waitFor(room.host, "link", "leading", 5));
