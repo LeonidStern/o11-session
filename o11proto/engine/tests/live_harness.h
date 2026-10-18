@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "o11proto/engine.h"
+#include "o11proto/realtime.h"
 #include "o11proto/server.h"
 
 namespace harness {
@@ -37,6 +38,7 @@ struct Side {
     std::unique_ptr<std::uint8_t[]> live;        // userLive(0) after each block
     std::unique_ptr<std::uint8_t[]> room;        // liveRoomLive() after each block
     std::unique_ptr<int[]> pos;                  // the interval position after each block
+    std::atomic<long> clock_from{-1};            // the frame its interval clock started at, -1 before
     std::atomic<int> stall{0};                   // blocks the host doesn't call process() for
     std::mutex m;
     std::vector<std::string> notices;
@@ -79,12 +81,14 @@ struct Room {
     // The machine's own hiccups: a wake more than 10 ms late. After one the
     // host catches up, which plays the listeners' buffers faster than the
     // audio can arrive; the checks that need a steady stream skip them.
-    // The audio thread's wakes don't show every hiccup (it may also run at a
-    // real-time priority the others lack), so a plain thread watches too:
-    // when it wakes that late, the network threads may have been as late,
-    // and a listener's buffer ran dry.
+    // The audio thread's wakes don't show every hiccup (it runs as an audio
+    // thread, o11proto/realtime.h, as a host's does), so a thread scheduled
+    // as the Live network threads are (thread::makeLatencyCritical()) watches
+    // too: when it wakes that late, they may have been as late, and a
+    // listener's buffer ran dry.
     std::atomic<long> late_us{0}, late_blocks{0}, slow_us{0}, sum_us{0}, calls{0}, slow_calls{0};
     std::atomic<long> plain_late_us{0}, plain_late_count{0};
+    std::atomic<int> host_audio_thread{-1};      // whether the host thread became an audio thread
     std::mutex hm;
     std::vector<long> hiccups;                   // the frames they came at
     std::thread audio, watch;
@@ -102,8 +106,18 @@ struct Room {
         cfg.bpm = static_cast<std::uint16_t>(opt.bpm);
         cfg.bpi = static_cast<std::uint16_t>(opt.bpi);
         cfg.live.mode = !opt.live_server ? LiveMode::No : opt.live_on ? LiveMode::On : LiveMode::Yes;
-        if (!server.start(cfg)) std::printf("    the server didn't start\n");
+        bool ok = server.start(cfg);
+        // Live's UDP port has the TCP port's number, which another program on
+        // the machine may hold: then another port.
+        for (int i = 0; ok && opt.live_server && !server.liveUdpOpen() && i < 5; ++i) {
+            std::printf("    UDP port %u is taken: the server moves\n", server.port());
+            server.stop();
+            ok = server.start(cfg);
+        }
+        if (!ok) std::printf("    the server didn't start\n");
+        describeTiming(opt.rate);
         server_thread = std::thread([this] {
+            thread::makeLatencyCritical();
             while (!server_stop.load()) server.poll(1);
         });
         for (int i = 0; i < opt.sides; ++i) {
@@ -127,12 +141,36 @@ struct Room {
             };
         }
     }
+    // Once a process, how this machine schedules the threads (realtime.h):
+    // the main thread, and threads made as the host's and the network's are.
+    static void describeTiming(int rate) {
+        static bool done = false;
+        if (done) return;
+        done = true;
+        std::printf("    timing, the main thread: %s\n", thread::describe().c_str());
+        std::thread([rate] {
+            const bool ok = thread::makeAudioThread(static_cast<double>(kBlock) / rate);
+            std::printf("    timing, an audio thread (%s): %s\n", ok ? "made" : "not made",
+                        thread::describe().c_str());
+        }).join();
+        std::thread([] {
+            const bool ok = thread::makeLatencyCritical();
+            std::printf("    timing, a latency-critical thread (%s): %s\n", ok ? "made" : "not made",
+                        thread::describe().c_str());
+        }).join();
+    }
+
     ~Room() {
-        std::printf("    the host: woke at most %.1f ms late (%ld blocks over 10 ms), the longest process() %.1f ms, "
-                    "the mean %.3f ms, %ld over 2 ms; a plain thread woke at most %.1f ms late (%ld times over 10 ms)\n",
-                    late_us.load() / 1000.0, late_blocks.load(), slow_us.load() / 1000.0,
-                    calls.load() ? sum_us.load() / 1000.0 / calls.load() : 0.0, slow_calls.load(),
-                    plain_late_us.load() / 1000.0, plain_late_count.load());
+        std::printf("    the host: woke at most %.1f ms late (%ld blocks over 10 ms; %s), the longest process() "
+                    "%.1f ms, the mean %.3f ms, %ld over 2 ms; a network-like thread woke at most %.1f ms late (%ld "
+                    "times over 10 ms)\n",
+                    late_us.load() / 1000.0, late_blocks.load(),
+                    host_audio_thread.load() == 1   ? "an audio thread"
+                    : host_audio_thread.load() == 0 ? "not an audio thread"
+                                                    : "not started",
+                    slow_us.load() / 1000.0, calls.load() ? sum_us.load() / 1000.0 / calls.load() : 0.0,
+                    slow_calls.load(), plain_late_us.load() / 1000.0, plain_late_count.load());
+        if (!side.empty()) std::printf("    %s: %s\n", side[0]->name.c_str(), side[0]->e.liveTestTiming().c_str());
         audio_stop.store(true);
         if (audio.joinable()) audio.join();
         if (watch.joinable()) watch.join();
@@ -148,6 +186,7 @@ struct Room {
     }
 
     void watchLoop() {
+        thread::makeLatencyCritical();
         while (!audio_stop.load()) {
             const auto t = Clock::now() + std::chrono::milliseconds(1);
             std::this_thread::sleep_until(t);
@@ -169,6 +208,7 @@ struct Room {
         std::vector<float> in(kBlock);
         std::vector<std::vector<float>> out(static_cast<std::size_t>(2 * n), std::vector<float>(kBlock, 0.0f));
         const auto period = std::chrono::nanoseconds(1000000000LL * kBlock / opt.rate);
+        host_audio_thread.store(thread::makeAudioThread(static_cast<double>(kBlock) / opt.rate) ? 1 : 0);
         auto next = Clock::now();
         while (!audio_stop.load()) {
             std::this_thread::sleep_until(next);
@@ -212,6 +252,8 @@ struct Room {
                 int p = 0, len = 0;
                 sd.e.position(&p, &len);
                 sd.pos[b] = p;
+                if (p > 0 && sd.clock_from.load(std::memory_order_relaxed) < 0)
+                    sd.clock_from.store(f, std::memory_order_release);   // running starts with a block (ENGINE.md 4.2)
             }
             frames.store(f + kBlock);
         }

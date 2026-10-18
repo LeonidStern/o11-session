@@ -102,6 +102,7 @@ struct LiveLayer {
         transport_.setTestReceiveLoss(f);
     }
     void setTestSendGap(int ms) { transport_.setTestSendGap(ms); }
+    live::Transport::Timing networkTiming() const { return transport_.timing(); }
 
     o11proto::live::ServerLive msg;
     bool has_msg = false;

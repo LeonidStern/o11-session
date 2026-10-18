@@ -123,6 +123,18 @@ void Engine::setLiveTestLoss(double fraction) { live_->setTestLoss(fraction); }
 
 void Engine::setLiveTestSendGap(int ms) { live_->setTestSendGap(ms); }
 
+std::string Engine::liveTestTiming() const {
+    const live::Transport::Timing t = live_->networkTiming();
+    char b[256];
+    std::snprintf(b, sizeof(b),
+                  "the Live network thread: %s; %llu timed waits of 1 ms ran out, the longest %.1f ms, %llu over 5 ms; "
+                  "woken %llu times",
+                  t.latency_critical ? "user-interactive QoS" : "its QoS unchanged",
+                  static_cast<unsigned long long>(t.timeouts), t.longest_ms,
+                  static_cast<unsigned long long>(t.over_5ms), static_cast<unsigned long long>(t.wakes));
+    return b;
+}
+
 long Engine::liveTestConcealedFrom(int user) const {
     std::lock_guard<std::mutex> lock(remote_mutex_);
     RemoteUser* u = userAt(user);

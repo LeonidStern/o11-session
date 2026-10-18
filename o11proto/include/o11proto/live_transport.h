@@ -5,7 +5,11 @@
 //
 // The transport runs its own network thread. Every callback runs on that
 // thread, and send() may only be called from inside one: the thread owns the
-// socket, so nothing else can send while it is being closed.
+// socket, so nothing else can send while it is being closed. The thread
+// wakes for a datagram, for wake(), and at least every millisecond; on macOS
+// it asks for the user-interactive QoS class (o11proto/realtime.h), and
+// wake() keeps its sends to the audio's time where the system stretches its
+// timed waits.
 #ifndef O11PROTO_LIVE_TRANSPORT_H
 #define O11PROTO_LIVE_TRANSPORT_H
 
@@ -37,7 +41,8 @@ public:
     // A data datagram that passed the client's checks: `from` is the
     // sender's peer id (never 0), the payload is 1..1452 bytes.
     std::function<void(std::uint32_t from, const std::uint8_t* payload, std::size_t len)> on_data;
-    // After each pass over the socket: at least every millisecond.
+    // After each pass over the socket: at least every millisecond, and
+    // soon after each wake().
     std::function<void()> on_tick;
     // Once, from stop(), while the socket is still open: the last chance
     // to send (the source's /stop messages).
@@ -61,6 +66,21 @@ public:
     // `ms` milliseconds are dropped (send() still returns true), as a gap
     // on the way to the relay would. Hellos still go out.
     void setTestSendGap(int ms);
+    // Any thread, the audio thread too (it doesn't block: one write to a
+    // pipe at most, until the network thread has woken): runs a pass soon,
+    // for what was just queued for on_tick. Does nothing on Windows, whose
+    // passes come every millisecond.
+    void wake();
+
+    // For diagnostics, any thread: whether the network thread got its QoS
+    // class, its timed waits of 1 ms that ended without a datagram or a
+    // wake and the longest of them, how many took over 5 ms, and the wakes.
+    struct Timing {
+        bool latency_critical = false;
+        std::uint64_t timeouts = 0, over_5ms = 0, wakes = 0;
+        double longest_ms = 0;
+    };
+    Timing timing() const;
 
     // Network thread only. One data datagram to `dest` (0 = the room's
     // other senders); false when the payload is empty or too long, or the

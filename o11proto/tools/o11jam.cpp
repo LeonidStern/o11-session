@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "o11proto/engine.h"
+#include "o11proto/realtime.h"
 
 using namespace o11proto;
 using namespace o11proto::engine;
@@ -256,6 +257,9 @@ int main(int argc, char** argv) {
     recording.reserve(static_cast<std::size_t>((a.seconds + 1.0) * a.srate) * 2);
     std::thread audio([&] {
         const int n = a.block;
+        // A device's own audio thread is not held back by the system's timer
+        // coalescing (macOS); this one sleeps between blocks, so it asks.
+        o11proto::thread::makeAudioThread(static_cast<double>(n) / a.srate);
         std::vector<float> inbuf(static_cast<std::size_t>(n)), l(static_cast<std::size_t>(n)), r(static_cast<std::size_t>(n));
         std::vector<float> sl(static_cast<std::size_t>(n)), sr(static_cast<std::size_t>(n));
         const float* in[1] = {inbuf.data()};

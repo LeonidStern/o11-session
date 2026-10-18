@@ -3,9 +3,14 @@
 #define O11PROTO_TESTS_CHECK_H
 
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 namespace testing {
 
@@ -31,7 +36,24 @@ struct Registrar {
     Registrar(const char* name, std::function<void()> fn) { cases().push_back({name, std::move(fn)}); }
 };
 
+// O11_TEST_TIMER_SLACK_US=n (Linux): every thread's timed waits may end up
+// to n us late, as macOS's timer coalescing makes them on a loaded machine
+// (a CI runner). runAll() sets it on the main thread before the tests
+// start, so every thread they make inherits it; a thread made an audio or
+// latency-critical thread (o11proto/realtime.h) takes the least slack
+// again, as it is exempt there.
+inline void emulateTimerCoalescing() {
+#if defined(__linux__)
+    if (const char* v = std::getenv("O11_TEST_TIMER_SLACK_US")) {
+        const long us = std::atol(v);
+        if (us > 0 && prctl(PR_SET_TIMERSLACK, static_cast<unsigned long>(us) * 1000UL, 0UL, 0UL, 0UL) == 0)
+            std::printf("(timed waits may end up to %ld us late: O11_TEST_TIMER_SLACK_US)\n", us);
+    }
+#endif
+}
+
 inline int runAll() {
+    emulateTimerCoalescing();
     int ran = 0;
     for (auto& c : cases()) {
         currentCase() = c.name;

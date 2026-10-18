@@ -16,6 +16,7 @@
 #include "check.h"
 #include "o11proto/client.h"
 #include "o11proto/live.h"
+#include "o11proto/realtime.h"
 #include "o11proto/server.h"
 #include "socket_compat.h"
 #include "udp_compat.h"
@@ -173,6 +174,14 @@ struct Harness {
         cfg.log = [this](const std::string& s) { log.push_back(s); };
         if (tweak) tweak(cfg);
         bool ok = server.start(cfg);
+        // Live's UDP port has the TCP port's number, which another program on
+        // the machine may hold: then another port.
+        for (int i = 0; ok && cfg.live.mode != LiveMode::No && !server.liveUdpOpen() && i < 5; ++i) {
+            std::printf("    UDP port %u is taken: the server moves\n", server.port());
+            server.stop();
+            log.clear();
+            ok = server.start(cfg);
+        }
         CHECK(ok);
     }
     std::uint16_t port() const { return server.port(); }
@@ -871,31 +880,51 @@ TEST(forwarding_latency) {                          // 22
     REQUIRE(h.bind(ua, a));
     REQUIRE(h.bind(ub, b));
     // The server runs on its own thread now, as it would in production; the
-    // clients' TCP is left alone for these 2 s.
+    // clients' TCP is left alone meanwhile. One datagram every 2 ms for 1000
+    // of them, from a thread whose timed waits the system doesn't stretch
+    // (o11proto/realtime.h: macOS's timer coalescing can make a 2 ms wait 20
+    // on a loaded machine), and for 4 s at the most, well inside the
+    // binding's 20 s without a hello.
     std::atomic<bool> stop{false};
     std::thread server([&] {
+        thread::makeLatencyCritical();
         while (!stop.load()) h.server.poll(5);
     });
     std::vector<double> lat;
-    Bytes d = data(a.id(), a.key(), b.id(), payloadOf(100, 1)), r;
-    for (int i = 0; i < 1000; ++i) {
-        TimePoint t0 = Clock::now();
-        ua.send(d);
-        pollfd pfd{};
-        pfd.fd = ub.fd;
-        pfd.events = POLLIN;
-        while (Clock::now() - t0 < std::chrono::milliseconds(50)) {
-            compat::poll(&pfd, 1, 5);
-            if (ub.tryRecv(r)) {
-                lat.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-                break;
+    int sent = 0;
+    double took = 0;
+    bool audio_thread = false;
+    std::thread client([&] {
+        audio_thread = thread::makeAudioThread(0.002);
+        Bytes d = data(a.id(), a.key(), b.id(), payloadOf(100, 1)), r;
+        const TimePoint start = Clock::now();
+        for (int i = 0; i < 1000 && Clock::now() - start < std::chrono::seconds(4); ++i) {
+            TimePoint t0 = Clock::now();
+            ua.send(d);
+            ++sent;
+            pollfd pfd{};
+            pfd.fd = ub.fd;
+            pfd.events = POLLIN;
+            while (Clock::now() - t0 < std::chrono::milliseconds(50)) {
+                compat::poll(&pfd, 1, 5);
+                if (ub.tryRecv(r)) {
+                    lat.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    break;
+                }
             }
+            std::this_thread::sleep_until(t0 + std::chrono::milliseconds(2));
         }
-        std::this_thread::sleep_until(t0 + std::chrono::milliseconds(2));
-    }
+        took = std::chrono::duration<double>(Clock::now() - start).count();
+    });
+    client.join();
     stop.store(true);
     server.join();
-    REQUIRE(lat.size() >= 990);
+    std::printf("    %zu of %d arrived within 50 ms, in %.2f s (the sending thread %s an audio thread)\n", lat.size(),
+                sent, took, audio_thread ? "was" : "wasn't");
+    if (sent < 1000 || lat.size() * 100 < static_cast<std::size_t>(sent) * 99)
+        std::printf("    timing: %s\n", thread::describe().c_str());
+    CHECK(sent >= 250);                          // enough for a 99th percentile
+    REQUIRE(lat.size() * 100 >= static_cast<std::size_t>(sent) * 99);
     std::sort(lat.begin(), lat.end());
     double p99 = lat[lat.size() * 99 / 100];
 #ifdef __linux__
