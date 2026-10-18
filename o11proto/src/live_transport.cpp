@@ -3,6 +3,7 @@
 #include "o11proto/live_transport.h"
 
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -19,7 +20,7 @@ struct Transport::Impl {
     socket_t fd = kInvalidSocket;
     std::thread thread;
     std::atomic<bool> stopping{false};
-    bool running = false;
+    std::atomic<bool> running{false};
     std::uint8_t buf[2048];
     std::uint64_t stamps[kHelloTimestamps] = {};   // the last hellos' timestamps
     int next_stamp = 0;
@@ -27,7 +28,8 @@ struct Transport::Impl {
     std::atomic<double> loss{0};                   // the test hook
     std::uint32_t rng = 0x9e3779b9u;              // and its generator
     std::atomic<std::int64_t> gap_until_ns{0};     // the send gap's end (steady clock)
-    std::atomic<std::int64_t> hold_until_ns{0};    // the send hold's end, and what it holds (network thread)
+    std::atomic<std::int64_t> hold_until_ns{0};    // the send hold's end
+    std::mutex held_mutex;                         // what it holds: send() and stop()
     std::vector<std::vector<std::uint8_t>> held;
     // wake(): a non-blocking pipe, open for the transport's life (the audio
     // thread may write while the network thread stops), and a flag so that
@@ -105,7 +107,7 @@ Transport::Timing Transport::timing() const {
     return t;
 }
 
-bool Transport::running() const { return impl_->running; }
+bool Transport::running() const { return impl_->running.load(); }
 void Transport::setTestReceiveLoss(double fraction) { impl_->loss.store(fraction); }
 void Transport::setTestSendGap(int ms) {
     const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
@@ -159,19 +161,25 @@ bool Transport::start(const Options& o, std::string& error) {
     received_.store(0);
     dropped_.store(0);
     sendHello();                               // the first one at once
-    m.running = true;
+    m.running.store(true);
     m.thread = std::thread([this] { loop(); });
     return true;
 }
 
 void Transport::stop() {
     Impl& m = *impl_;
-    if (!m.running) return;
+    if (!m.running.load()) return;
     m.stopping.store(true);
     if (m.thread.joinable()) m.thread.join();
     compat::closeSocket(m.fd);
     m.fd = kInvalidSocket;
-    m.running = false;
+    {
+        // What the test's hold kept goes with the socket: it carries this
+        // session's peer ID and key.
+        std::lock_guard<std::mutex> lock(m.held_mutex);
+        m.held.clear();
+    }
+    m.running.store(false);
 }
 
 bool Transport::send(std::uint32_t dest, const std::uint8_t* payload, std::size_t len) {
@@ -192,13 +200,16 @@ bool Transport::send(std::uint32_t dest, const std::uint8_t* payload, std::size_
         const std::int64_t now =
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
         if (now < gap) return true;            // the test's gap
-        if (now < hold) {                      // the test's hold
-            if (m.held.size() < 1024) m.held.emplace_back(d, d + kClientHeader + len);
-            return true;
+        if (hold != 0) {                       // the test's hold
+            std::lock_guard<std::mutex> lock(m.held_mutex);
+            if (now < hold) {
+                if (m.held.size() < 1024) m.held.emplace_back(d, d + kClientHeader + len);
+                return true;
+            }
+            for (const auto& h : m.held)
+                if (compat::send(m.fd, h.data(), h.size(), 0) >= 0) sent_.fetch_add(1);
+            m.held.clear();
         }
-        for (const auto& h : m.held)
-            if (compat::send(m.fd, h.data(), h.size(), 0) >= 0) sent_.fetch_add(1);
-        m.held.clear();
     }
     if (compat::send(m.fd, d, kClientHeader + len, 0) < 0) return false;
     sent_.fetch_add(1);

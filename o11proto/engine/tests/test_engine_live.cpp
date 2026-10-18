@@ -37,7 +37,7 @@ namespace {
 
 constexpr int kRate = 48000;
 constexpr int kBlock = 270;                      // not a divisor of the interval (spec test 35)
-constexpr long kMaxFrames = 120L * kRate;        // the most one room records
+constexpr long kMaxFrames = 160L * kRate;        // the most one room records
 constexpr long kMaxOwn = kMaxFrames + kRate;     // a side's own frames: its clock may run ahead (Side::ppm)
 constexpr long kBurst = kRate * 30 / 1000;
 constexpr long kWindow = kRate * 300 / 1000;     // a burst is looked for this long after it is sent
@@ -383,7 +383,13 @@ struct LiveRoom {
     // Whether an interval boundary fell into block `b` (the position after it is at most a block).
     bool boundaryIn(int listener, long b) const { return side[listener].pos[b] <= kBlock; }
     // The first block from `from_block` on where `listener` goes from `was` to the other state, or -1.
+    // userLive() changes inside process(), before the audio thread records the block it is in and
+    // counts it in `frames`, so a switch the main thread has just seen is looked for two blocks on.
     long switchFrom(int listener, long from_block, bool was) {
+        const long recorded = frames.load() + 2 * kBlock;
+        const TimePoint deadline = Clock::now() + std::chrono::milliseconds(500);
+        while (frames.load() < recorded && Clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         const Side& s = side[listener];
         const long done = frames.load() / kBlock;
         for (long b = std::max(1L, from_block); b < done; ++b)
@@ -733,15 +739,44 @@ TEST(long_run_stalls_and_outages_on_clocks_200_ppm_apart) {
     r.side[0].ppm.store(200);
     REQUIRE(r.connect());
     REQUIRE(r.liveAndCalm(20));
-    r.wait(20);
     const long t0 = r.frames.load();
     const char* who[2] = {"alice hears bob", "bob hears alice"};
+    // The drift control takes up the clocks' 200 ppm with an offset of the
+    // buffer's fill, which it builds again after each fresh buffering (a
+    // machine's hiccup can run a buffer dry), while the delay moves by up to
+    // the 0.2 ms a second the clocks part by. What the events check is that
+    // a stall leaves the delay where it was, so they start once both delays
+    // have held still (the medians of the last two 2.5 s within 0.25 ms of
+    // each other), and an event before which the delay was still moving
+    // (over 0.2 ms in its 2.5 s) is reported but not held to that.
+    auto still = [&] {
+        const long now = r.frames.load();
+        for (int l = 0; l < 2; ++l) {
+            std::vector<double> half[2];
+            for (int h = 0; h < 2; ++h)
+                for (const auto& x : r.roomDelays(l, now - (2 - h) * 5 * kRate / 2, now - (1 - h) * 5 * kRate / 2))
+                    if (x.second >= 0) half[h].push_back(x.second);
+            if (half[0].empty() || half[1].empty()) return false;
+            for (auto& v : half) std::sort(v.begin(), v.end());
+            if (std::fabs(median(half[0]) - median(half[1])) > 0.25) return false;
+        }
+        return true;
+    };
+    r.wait(10);
+    bool settled = still();
+    for (int i = 0; i < 50 && !settled; ++i) {
+        r.wait(1);
+        settled = still();
+    }
+    std::printf("    the delays held still %.1f s after the start\n", r.secondsOf((r.frames.load() - t0) / kBlock));
+    CHECK(settled);
     struct Event {
         int host;                                 // 0 alice, 1 bob, 2 both
         int ms;
         int net;                                  // 0 a host stall, 1 an outage that loses, 2 one that holds
     };
     const Event events[] = {{0, 20, 0}, {1, 50, 0}, {0, 80, 0}, {2, 120, 0}, {1, 170, 0}, {2, 300, 1}, {2, 300, 2}};
+    int held = 0, looked = 0;
     for (const Event& ev : events) {
         const long at = r.frames.load();
         for (int s = 0; s < 2; ++s) {
@@ -774,14 +809,21 @@ TEST(long_run_stalls_and_outages_on_clocks_200_ppm_apart) {
                 hi = std::max(hi, x.second);
                 ++n;
             }
-            std::printf("    %s: %s %.2f ms before, %.2f to %.2f ms from %.1f s on (%d bursts; the buffer %.2f ms)%s\n",
-                        what, who[l], pre, lo, hi, back, n, r.side[l].e.liveUserBufferMs(0), calm ? "" : " (not calm)");
+            const bool moving = before.size() >= 2 && before.back() - before.front() > 0.2;
+            std::printf("    %s: %s %.2f ms before, %.2f to %.2f ms from %.1f s on (%d bursts; the buffer %.2f ms)"
+                        "%s%s\n",
+                        what, who[l], pre, lo, hi, back, n, r.side[l].e.liveUserBufferMs(0), calm ? "" : " (not calm)",
+                        moving ? " (the delay was moving)" : "");
             CHECK(before.size() >= 3);
             CHECK(n >= 2);
-            if (!calm) continue;
+            ++looked;
+            if (!calm || moving) continue;
+            ++held;
             CHECK(lo >= pre - 1.0 && hi <= pre + 1.0);
         }
     }
+    std::printf("    %d of %d held to the delay before\n", held, looked);
+    CHECK(r.frames.load() + kBlock <= kMaxFrames);   // the room recorded it all
     // Never earlier than the buffer, from the start of the run on.
     for (int l = 0; l < 2; ++l) {
         double lowest = 1e9;

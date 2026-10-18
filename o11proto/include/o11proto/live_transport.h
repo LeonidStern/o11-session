@@ -10,6 +10,13 @@
 // it asks for the user-interactive QoS class (o11proto/realtime.h), and
 // wake() keeps its sends to the audio's time where the system stretches its
 // timed waits.
+//
+// The callbacks may run until stop() returns. ~Transport() stops too, but
+// only once an owner's later members, or the locals declared after the
+// transport, are gone: whatever owns a transport whose callbacks use those
+// stops it first, in its own destructor, as the engine's Live layer does.
+// wake() may be called from any thread while the transport exists, through
+// its stops and restarts.
 #ifndef O11PROTO_LIVE_TRANSPORT_H
 #define O11PROTO_LIVE_TRANSPORT_H
 
@@ -59,7 +66,7 @@ public:
     // "can't connect the UDP socket to the server (error <n>)".
     bool start(const Options& o, std::string& error);
     void stop();                               // joins the thread; a no-op when stopped
-    bool running() const;
+    bool running() const;                      // any thread
     // Any thread: changes Options::test_receive_loss while running.
     void setTestReceiveLoss(double fraction);
     // Test hook, any thread: the data datagrams send() is given in the next
@@ -69,6 +76,7 @@ public:
     // Test hook, any thread: the data datagrams send() is given in the next
     // `ms` milliseconds are held back, then sent all at once, in order, with
     // the first one after that time: a link that queues through an outage.
+    // stop() drops what is held.
     void setTestSendHold(int ms);
     // Any thread, the audio thread too (it doesn't block: one write to a
     // pipe at most, until the network thread has woken): runs a pass soon,
