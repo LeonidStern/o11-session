@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 
+#include "o11proto/realtime.h"
 #include "o11proto/server.h"
 #include "socket_compat.h"
 #ifdef O11PROTO_HAVE_PORTMAP
@@ -222,6 +223,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, ".\n");
     }
 #endif
+    // This thread relays Live's datagrams as they come: it is a network
+    // thread, as the players' Live threads are (realtime.h). An ordinary one
+    // on a loaded Mac ran 30-40 ms late, and every listener's 10-20 ms
+    // buffer ran dry each time.
+    const thread::NetworkScheduling sched = thread::makeNetworkThread();
+    if (!quiet)
+        std::fprintf(stderr, "[o11server] the server's thread: %s\n",
+                     sched == thread::NetworkScheduling::Realtime          ? "real-time (time-constraint)"
+                     : sched == thread::NetworkScheduling::LatencyCritical ? "latency-critical"
+                                                                            : "its scheduling unchanged");
     while (!g_stop) server.poll(200);
 #ifdef O11PROTO_HAVE_PORTMAP
     mapper.stop();
