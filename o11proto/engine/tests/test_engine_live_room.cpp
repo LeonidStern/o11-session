@@ -190,6 +190,12 @@ bool noAdvice(Side& s) {
     return s.e.liveAdviceReason() == Engine::LiveAdvice::None && s.e.liveAdviceUser().empty() &&
            s.e.liveAdviceCount() == 0;
 }
+// The advice names `who` as a player who can't play Live, whoever else
+// has trouble too (after a hiccup of the machine's, every player may).
+bool cantLiveNamed(Side& s, const std::string& who) {
+    return s.e.liveAdviceReason() == Engine::LiveAdvice::CantLive && s.e.liveAdviceUser().find(who) == 0 &&
+           s.e.liveAdviceCount() >= 1;
+}
 // Whether any side in `which` has advice within `seconds`.
 bool anyAdvice(Room& r, const std::vector<int>& which, double seconds) {
     return r.until(
@@ -305,22 +311,39 @@ void transitions(int rate, std::uint32_t codec, const std::string& label) {
     }
 
     // 4. An older client joins: it can't play Live. The room stays Live, and
-    // everyone is advised who.
+    // everyone is advised who. A player's dropouts count for 10 s (16.7):
+    // after a hiccup of the machine's within them, alice and bob may have
+    // trouble too, and the advice counts them, so carol is the only one only
+    // on a calm machine.
     Plain carol;
     const long b3 = r.block();
     const std::size_t seen[2] = {r[0].noticeCount(), r[1].noticeCount()};
     REQUIRE(carol.join(r, "carol"));
     for (int i = 0; i < 2; ++i) {
         CHECK(r.until([&] { return !findAdvice(r[i], cantText("carol"), seen[i]).empty(); }, 3));
-        CHECK(advised(r[i], Engine::LiveAdvice::CantLive, "carol"));
+        CHECK(cantLiveNamed(r[i], "carol"));
+        const bool calm = r.calm(b3 * kBlock - 11L * rate, r.frames.load());
+        if (calm) CHECK(advised(r[i], Engine::LiveAdvice::CantLive, "carol"));
+        if (!advised(r[i], Engine::LiveAdvice::CantLive, "carol"))
+            std::printf("    %s's advice names carol and counts %d players with trouble%s\n", sideName(r, i).c_str(),
+                        r[i].e.liveAdviceCount(), calm ? "" : " (the machine had a hiccup)");
     }
     r.wait(3);
     for (int i = 0; i < 2; ++i) CHECK(r.roomSwitch(i, b3, true) < 0 && r[i].e.liveRoomLive());
 
     // 5. It leaves: the advice clears, without a notice (it isn't here).
+    // carol's at once; after a hiccup of the machine's, the others'
+    // dropouts may hold advice of their own for up to 10 s more.
     carol.leave(r);
     for (int i = 0; i < 2; ++i) {
-        CHECK(r.until([&] { return noAdvice(r[i]); }, 3));
+        CHECK(r.until([&] { return !cantLiveNamed(r[i], "carol") && r[i].e.liveAdviceUser().find("carol") != 0; }, 3));
+        const bool none = r.until([&] { return noAdvice(r[i]); }, 3);
+        const bool calm = r.calm(b3 * kBlock - 11L * rate, r.frames.load());
+        if (calm) CHECK(none);
+        if (!none)
+            std::printf("    %s's advice 3 s after carol left: %s, %d players%s\n", sideName(r, i).c_str(),
+                        r[i].e.liveAdviceUser().c_str(), r[i].e.liveAdviceCount(),
+                        calm ? "" : " (the machine had a hiccup)");
         CHECK(r[i].findNotice("carol can play Live now.").empty());
         CHECK(r.roomSwitch(i, b3, true) < 0);
     }
