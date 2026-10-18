@@ -32,6 +32,10 @@ constexpr int kMaxSeconds = 100;                 // the most one room records
 struct Side {
     Engine e;
     std::string name;
+    // A fixed 20 ms jitter buffer, the default before the automatic one:
+    // these checks are made for it (the automatic buffer's are in
+    // test_engine_live_units and test_engine_live_tone).
+    Side() { e.setLiveBufferMs(20); }
     // What it plays on its channel 0: sample `n` of its own clock at `rate`.
     std::function<float(long n, int rate)> signal;
     std::unique_ptr<float[]> heard;              // output 0

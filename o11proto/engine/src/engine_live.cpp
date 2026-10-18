@@ -39,6 +39,13 @@ std::string lowered(std::string s) {
     return s;
 }
 
+// The buffer setting in words (6.8): "40 ms", or the automatic buffer.
+std::string bufferSettingText(int setting_ms) {
+    if (setting_ms != Engine::kLiveBufferAutomatic) return std::to_string(setting_ms) + " ms";
+    return "automatic: " + std::to_string(kLiveAutoBufferMs) + " ms, or " + std::to_string(kLiveFallbackBufferMs) +
+           " ms for a player whose audio comes late";
+}
+
 std::string longBlockText(int host_block, int rate) {
     return "Your DAW's audio buffer (" + std::to_string(host_block) + " samples) needs at least " +
            std::to_string(liveBufferNeed(host_block, rate)) +
@@ -98,17 +105,25 @@ void Engine::liveRawMessage(const RawMessage& m) {
 void Engine::liveReset() { live_->forget(); }
 
 void Engine::setLiveBufferMs(int ms) {
-    live_setting_ms_.store(std::max(kLiveMinBufferMs, std::min(kLiveMaxBufferMs, ms)));
+    live_setting_ms_.store(ms == kLiveBufferAutomatic ? kLiveBufferAutomatic
+                                                      : std::max(kLiveMinBufferMs, std::min(kLiveMaxBufferMs, ms)));
 }
 
 int Engine::liveBufferInUseMs() const {
-    return liveBufferInUse(live_setting_ms_.load(), live_->host_block.load(), live_->host_rate.load());
+    const int s = live_setting_ms_.load();
+    return liveBufferInUse(s == kLiveBufferAutomatic ? kLiveAutoBufferMs : s, live_->host_block.load(),
+                           live_->host_rate.load());
 }
 
 bool Engine::parseLiveBufferSetting(const std::string& value, int* ms) {
+    if (value == "auto") {
+        *ms = kLiveBufferAutomatic;
+        return true;
+    }
     long v = 0;
     if (!parseWholeNumber(value, &v)) return false;
-    *ms = static_cast<int>(std::max<long>(kLiveMinBufferMs, std::min<long>(kLiveMaxBufferMs, v)));
+    *ms = v == 0 ? kLiveBufferAutomatic
+                 : static_cast<int>(std::max<long>(kLiveMinBufferMs, std::min<long>(kLiveMaxBufferMs, v)));
     return true;
 }
 
@@ -272,6 +287,7 @@ const char* liveEventName(LiveEventKind kind) {
     case LiveEventKind::SpeedOn: return "speed on";
     case LiveEventKind::SpeedOff: return "speed off";
     case LiveEventKind::End: return "end";
+    case LiveEventKind::Fallback: return "fallback";
     }
     return "none";
 }
@@ -307,9 +323,22 @@ bool Engine::liveUserCounters(int user, LiveCounters* out) const {
     c.speed_ppm = st.speed_ppm.load();
     const std::int32_t fill = st.active.load() ? st.fill_us.load() : -1;
     c.fill_ms = fill < 0 ? -1 : fill / 1000.0;
+    const std::int32_t b = st.buffer_ms.load();
+    c.buffer_ms = b > 0 ? b : -1;
+    c.fell_back = st.fell_back.load();
     if (st.gen.load() != g) return false;        // cleared meanwhile
     *out = c;
     return true;
+}
+
+int Engine::liveUserBufferInUseMs(int user) const {
+    LiveCounters c;
+    return liveUserCounters(user, &c) ? c.buffer_ms : -1;
+}
+
+bool Engine::liveUserBufferFellBack(int user) const {
+    LiveCounters c;
+    return liveUserCounters(user, &c) && c.fell_back;
 }
 
 std::vector<LiveEvent> Engine::liveUserEvents(int user, std::size_t max) const {
@@ -344,6 +373,33 @@ void Engine::liveControl() {
     LiveLayer& L = *live_;
     const TimePoint now = Clock::now();
 
+    // 6.8: the buffer in use, B, and the automatic buffer's fallback (0
+    // for a fixed one), each raised for long host blocks. A change
+    // restarts the buffering of the sinks it changes; one while Live runs
+    // is what /live counts dropouts since (before the Live
+    // client starts below, so that its first buffers aren't a change).
+    {
+        const int S = live_setting_ms_.load(), H = L.host_block.load(), sr = L.host_rate.load();
+        const bool automatic = S == kLiveBufferAutomatic;
+        const int B = liveBufferInUse(automatic ? kLiveAutoBufferMs : S, H, sr);
+        int F = automatic ? liveBufferInUse(kLiveFallbackBufferMs, H, sr) : 0;
+        if (F <= B) F = 0;
+        const std::uint32_t bufs = static_cast<std::uint32_t>(B) | (static_cast<std::uint32_t>(F) << 16);
+        if (bufs != L.buffers.load(std::memory_order_relaxed)) {
+            L.latency_ms.store(B);
+            L.buffers.store(bufs, std::memory_order_release);
+            if (L.running.load()) {
+                L.buffer_changed = true;
+                L.buffer_changed_at = now;
+                for (int s = 0; s < kLiveSlots; ++s) {
+                    const SinkStats& st = L.sinks[s]->stats;
+                    L.changed_gen[s] = st.gen.load();
+                    L.changed_drops[s] = st.underruns.load() + st.overruns.load() + st.lost.load();
+                }
+            }
+        }
+    }
+
     // 6.1: the Live client runs while connected and the message has UDP open.
     if (client_.loggedIn() && L.has_msg && L.msg.udpOpen()) {
         const std::string addr = client_.serverAddress();
@@ -368,19 +424,6 @@ void Engine::liveControl() {
         L.stop();
         L.addr.clear();
         L.port = 0;
-    }
-
-    // 6.8: the buffer in use; a change restarts the sinks' buffering.
-    const int B = liveBufferInUse(live_setting_ms_.load(), L.host_block.load(), L.host_rate.load());
-    if (B != L.latency_ms.load()) {
-        L.latency_ms.store(B);
-        L.buffer_changed = true;
-        L.buffer_changed_at = now;
-        for (int s = 0; s < kLiveSlots; ++s) {
-            const SinkStats& st = L.sinks[s]->stats;
-            L.changed_gen[s] = st.gen.load();
-            L.changed_drops[s] = st.underruns.load() + st.overruns.load() + st.lost.load();
-        }
     }
 
     // 6.4: health. Then each user's slot, and a mixer for each user's
@@ -501,27 +544,42 @@ bool Engine::liveCommand(const std::string& text) {
     if (rest.compare(0, 6, "buffer") == 0) {
         const std::string n = trimmed(rest.substr(6));   // "buffer30" reads as "buffer 30" (quirk 12)
         const int old = live_setting_ms_.load();
+        const std::string was = old == kLiveBufferAutomatic ? std::string("automatic") : std::to_string(old) + " ms";
         if (n.empty()) {
-            liveNotice("Live's jitter buffer is " + std::to_string(old) +
-                           " ms. Type /live buffer 30 to change it (5 to 200).",
+            liveNotice(old == kLiveBufferAutomatic
+                           ? "Live's jitter buffer is " + bufferSettingText(old) +
+                                 ". Type /live buffer 30 to fix it (5 to 200)."
+                           : "Live's jitter buffer is " + std::to_string(old) +
+                                 " ms. Type /live buffer 30 to change it (5 to 200), or /live buffer auto.",
                        false);
             return true;
         }
         long v = 0;
-        if (!parseWholeNumber(n, &v) || v < kLiveMinBufferMs || v > kLiveMaxBufferMs) {
-            liveNotice("/live buffer takes a number of ms from 5 to 200, such as /live buffer 30.", true);
+        if (n == "auto") {
+            v = kLiveBufferAutomatic;
+        } else if (!parseWholeNumber(n, &v) || v < kLiveMinBufferMs || v > kLiveMaxBufferMs) {
+            liveNotice("/live buffer takes a number of ms from 5 to 200, such as /live buffer 30, or auto.", true);
             return true;
         }
         setLiveBufferMs(static_cast<int>(v));
         const int H = live_->host_block.load(), sr = live_->host_rate.load();
-        const int B = liveBufferInUse(static_cast<int>(v), H, sr);
-        std::string s = "Live's jitter buffer is " + std::to_string(v) + " ms now (it was " + std::to_string(old) +
-                        "). Less is less late, more has fewer dropouts: type /live to see them.";
+        const int least = v == kLiveBufferAutomatic ? kLiveAutoBufferMs : static_cast<int>(v);
+        const int B = liveBufferInUse(least, H, sr);
+        std::string s = v == kLiveBufferAutomatic
+                            ? "Live's jitter buffer is automatic now (it was " + was + "): " +
+                                  std::to_string(kLiveAutoBufferMs) + " ms, or " +
+                                  std::to_string(kLiveFallbackBufferMs) + " ms for a player whose audio comes late."
+                            : "Live's jitter buffer is " + std::to_string(v) + " ms now (it was " +
+                                  (old == kLiveBufferAutomatic ? was : std::to_string(old)) +
+                                  "). Less is less late, more has fewer dropouts: type /live to see them.";
         if (liveBufferNeed(H, sr) > kLiveMaxBufferMs)
             s += " " + longBlockText(H, sr);
-        else if (B > v)
+        else if (B > least)
             s += " Your DAW's audio buffer (" + std::to_string(H) + " samples) needs at least " + std::to_string(B) +
-                 " ms, so Live uses " + std::to_string(B) + " ms.";
+                 (v != kLiveBufferAutomatic                 ? " ms, so Live uses " + std::to_string(B) + " ms."
+                  : B < liveBufferInUse(kLiveFallbackBufferMs, H, sr) ? " ms, so Live starts at " + std::to_string(B) + " ms."
+                                                                    : " ms, so Live uses " + std::to_string(B) +
+                                                                          " ms for everyone.");
         liveNotice(s, false);
         return true;
     }
@@ -534,7 +592,8 @@ void Engine::liveStatus() {
     const int S = live_setting_ms_.load();
     if (status_.load() != Status::Ok || !client_.loggedIn()) {
         liveNotice("Not connected. In a room with Live mode, /live shows how late you hear each O11 Session player. "
-                   "Live's jitter buffer is " + std::to_string(S) + " ms (/live buffer N to change it).",
+                   "Live's jitter buffer is " + bufferSettingText(S) +
+                       (S == kLiveBufferAutomatic ? " (/live buffer N to fix it)." : " (/live buffer N to change it)."),
                    false);
         return;
     }
@@ -552,15 +611,22 @@ void Engine::liveStatus() {
 
     // The head line.
     const int H = L.host_block.load(), sr = L.host_rate.load() > 0 ? L.host_rate.load() : 48000;
-    const int B = liveBufferInUse(S, H, sr);
+    const bool automatic = S == kLiveBufferAutomatic;
+    const int least = automatic ? kLiveAutoBufferMs : S;
+    const int B = liveBufferInUse(least, H, sr), F = liveBufferInUse(kLiveFallbackBufferMs, H, sr);
     std::string head = "Live is on. Jitter buffer " + std::to_string(B) + " ms";
+    if (automatic && F > B)
+        head = "Live is on. Jitter buffer automatic: " + std::to_string(B) + " ms, or " + std::to_string(F) +
+               " ms for a player whose audio comes late";
     if (liveBufferNeed(H, sr) > B)
         head += ". " + longBlockText(H, sr) + " ";
-    else if (B > S)
-        head += ": your DAW's audio buffer (" + std::to_string(H) + " samples) needs that much, more than the " +
-                std::to_string(S) + " ms you set. ";
+    else if (B > least)
+        head += automatic ? std::string(" (your DAW's audio buffer, ") + std::to_string(H) + " samples, needs " +
+                                std::to_string(B) + " ms at least). "
+                          : ": your DAW's audio buffer (" + std::to_string(H) + " samples) needs that much, more "
+                            "than the " + std::to_string(S) + " ms you set. ";
     else
-        head += " (/live buffer N to change it). ";
+        head += automatic ? " (/live buffer N to fix it). " : " (/live buffer N to change it). ";
     head += L.serverAnswered() ? "Round trip to the server " + num(L.serverRoundTripMs(), 1) + " ms."
                                : std::string("The server doesn't answer over UDP yet.");
     bool transmit = false;
@@ -648,6 +714,8 @@ void Engine::liveStatus() {
             }
             line += ", about " + num(oneway) + " ms late (buffer " + num(buffer) + " ms, network " + num(network) +
                     " ms, codec " + num(codec) + " ms), " + num(loss, 1) + "% of the packets lost";
+            if (st.fell_back.load())
+                line += "; their audio came late, so their buffer is " + std::to_string(st.buffer_ms.load()) + " ms";
         }
         const std::uint32_t u = counts ? st.underruns.load() : 0, o = counts ? st.overruns.load() : 0,
                             d = counts ? st.lost.load() : 0;
@@ -849,7 +917,8 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
     const bool any_solo = any_solo_.load();
     const int offset = remote_offset_.load();
     const float step = static_cast<float>(1000.0 / (kLiveFadeMs * sampleRate));
-    const int hold = static_cast<int>(kLiveConcealBuffers * L.latency_ms.load() * sampleRate / 1000.0);
+    const auto holdFor = [&](int ms) { return static_cast<int>(kLiveConcealBuffers * ms * sampleRate / 1000.0); };
+    const int hold_b = holdFor(L.latency_ms.load());
     const int spare = static_cast<int>(kLiveConcealSpareMs * sampleRate / 1000.0);
     constexpr int R = LiveMix::kRing - 1;
     constexpr float kPi = 3.14159265359f, kHalfPi = 1.57079632679f;
@@ -900,8 +969,11 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
             }
             // The hold counts from the frame where the slot's concealment
             // began, and the live path is heard m.delay[1] frames after it
-            // is written: so every gap is held for the same time.
-            const int keep = hold + std::min(m.delay[1], spare);
+            // is written: so every gap is held for the same time. It is
+            // kLiveConcealBuffers x the buffer the slot's stream plays with
+            // (its fallback, if it fell back), as its sink conceals.
+            const int slot_ms = slot_ok ? L.sinks[u.live_slot]->stats.buffer_ms.load(std::memory_order_relaxed) : 0;
+            const int keep = (slot_ms > 0 ? holdFor(slot_ms) : hold_b) + std::min(m.delay[1], spare);
             const int quiet0 = std::min(m.quiet, 1 << 29);
             const auto quietAt = [&](int i) {
                 return slot_ok ? L.quietAt(u.live_slot, at + done + i) : quiet0 + i + 1;

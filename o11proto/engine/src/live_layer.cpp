@@ -882,7 +882,8 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
     gate_open_ = gate;
 
     // The sinks (5.9).
-    const int latency = latency_ms.load();
+    const std::uint32_t bufs = buffers.load(std::memory_order_acquire);
+    const int latency = static_cast<int>(bufs & 0xFFFF), fallback = static_cast<int>(bufs >> 16);
     for (int s = 0; s < kLiveSlots; ++s) {
         LiveSink& k = *sinks[s];
         const std::uint32_t g = gen[s].load();
@@ -901,7 +902,7 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
             if (it->gen == g) k.apply(*it, now);
             queue[s]->pop();
         }
-        k.configure(latency, longest_, rate);
+        k.configure(latency, longest_, rate, fallback);
         avail_[s] = false;
         quiet0_[s] = std::min(quiet_run_[s], 1 << 29);
         first_real_[s] = -1;

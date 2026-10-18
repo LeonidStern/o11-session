@@ -116,6 +116,7 @@ if(O11PROTO_BUILD_ENGINE)
   # The tone test's loopback probe sends with udp_compat.h.
   target_include_directories(test_engine_live_tone PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   set_tests_properties(test_engine_live_room PROPERTIES TIMEOUT 900)
+  set_tests_properties(test_engine_live_tone PROPERTIES TIMEOUT 480)   # 7 runs of 12-20 s
 endif()
 
 # --------------------------------------------------------------- portmap
