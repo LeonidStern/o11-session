@@ -9,7 +9,6 @@
 
 #include <math.h>
 #include <algorithm>
-#include <chrono>
 #include <vector>
 
 #include "processor.h"
@@ -35,14 +34,6 @@ static const float FOOTER_H = 12;               // the mixer's bottom line
 static const float ROOM_X = 6, ROOM_Y = 5;      // the room panel's margins
 static const float LABEL_H = 11, CHIP_H = 17;   // the room panel's labels, its notes of changes to come
 static const double SILENT_SECONDS = 10;        // a row says "silent" after this long without sound (or two intervals)
-
-static double now_seconds()
-{
-  using namespace std::chrono;
-  return duration<double>(steady_clock::now().time_since_epoch()).count();
-}
-
-static juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
 
 static void setLabel(juce::Label *label, const std::string &text, bool tooltip = false)
 {
@@ -325,7 +316,7 @@ void O11Editor::buildViews()
   m_host->setTooltip("Host a room in this plug-in, and join it");
   m_host->onChange = [this]() {
     m_hostPending = true;
-    m_hostPendingSince = now_seconds();
+    m_hostPendingSince = nowSeconds();
     engine().setHosting(m_host->value());
   };
   m_hostCount = add(m_hostBar, makeLabel("", f.value, Colors::value()));
@@ -599,7 +590,7 @@ void O11Editor::update()
   if (!m_root) return;
   Snapshot s;
   engine().getSnapshot(s);
-  const double now = now_seconds();
+  const double now = nowSeconds();
 
   if (s.settingsRevision != m_settingsRevision) syncSettings();
   m_settingsRevision = s.settingsRevision;
@@ -1214,7 +1205,7 @@ void O11Editor::updateHostBar(const Snapshot &s, const uitext::HostBar &bar)
 {
   if (m_hostPending)
   {
-    const bool done = !s.hostBusy && (s.hosting == m_host->value() || now_seconds() - m_hostPendingSince > 3.0);
+    const bool done = !s.hostBusy && (s.hosting == m_host->value() || nowSeconds() - m_hostPendingSince > 3.0);
     if (done) m_hostPending = false;
   }
   if (!m_hostPending) m_host->setValue(s.hosting);
@@ -1359,7 +1350,7 @@ void O11Editor::copyAddress(AddressBox *box)
   setTooltip(box, "Copied " + box->address());
   if (m_copied && m_copied != box) m_copied->setCopyTitle("Copy");
   m_copied = box;
-  m_copiedUntil = now_seconds() + 1.5;
+  m_copiedUntil = nowSeconds() + 1.5;
 }
 
 } // namespace o11

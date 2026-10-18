@@ -45,6 +45,9 @@
 namespace o11 {
 namespace ui {
 
+// a UTF-8 std::string as a juce::String
+inline juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
+
 struct Colors
 {
   static juce::Colour window() { return juce::Colour(0xff242424); }
