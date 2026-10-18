@@ -886,6 +886,9 @@ static void test_uitext()
   CHECK_EQ(liveModeText(true, 28), std::string("Live 28 ms"));
   CHECK_EQ(liveModeText(true, -1), std::string("Live"));
   CHECK_EQ(liveModeText(false, 28), std::string("Intervals"));
+  CHECK_EQ(intervalsModeText(4, true), std::string("Intervals \xc2\xb7 4 beats"));
+  CHECK_EQ(intervalsModeText(16, false), std::string("Intervals \xc2\xb7 16"));
+  CHECK_EQ(intervalsModeText(0, false), std::string("Intervals"));
   CHECK_EQ(liveAdviceText(1, "Anna", 0), std::string("Anna drops out: try Intervals"));
   CHECK_EQ(liveAdviceText(1, "You", 0), std::string("Your connection drops out: try Intervals"));
   CHECK_EQ(liveAdviceText(1, "Anna", 2), std::string("Anna and 2 more drop out: try Intervals"));

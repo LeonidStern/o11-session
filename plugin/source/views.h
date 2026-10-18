@@ -183,7 +183,8 @@ class MenuBox : public juce::Component, public juce::SettableTooltipClient
 {
 public:
   explicit MenuBox(const juce::Font &font);
-  void addEntry(const std::string &text) { m_entries.push_back(text); }
+  void addEntry(const std::string &text) { m_entries.push_back(text); m_entryEnabled.push_back(true); }
+  void setEntryEnabled(int index, bool enabled); // a greyed entry can't be picked
   void setShown(const std::string &text); // what the box says (the room's value may not be one of the choices)
   void setCurrentIndex(int index) { m_current = index; } // the checked entry, -1 for none
   int currentIndex() const { return m_current; }
@@ -196,6 +197,7 @@ private:
   std::string m_shown;
   juce::Font m_font;
   std::vector<std::string> m_entries;
+  std::vector<bool> m_entryEnabled;
   int m_current = -1;
 };
 
