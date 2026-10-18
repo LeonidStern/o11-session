@@ -28,6 +28,7 @@
 #include <chrono>
 
 #include "o11proto/portmap.h"
+#include "o11proto/realtime.h"
 #include "o11proto/server.h"
 
 namespace o11 {
@@ -153,6 +154,9 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
 
 void HostServer::threadProc()
 {
+  // it relays Live's datagrams too: on macOS an ordinary thread's waits run up to 24 ms late,
+  // and every late relay is a dropout for the players it forwards to
+  o11proto::thread::makeNetworkThread();
   while (!m_quit)
   {
     m_server->poll(20);
