@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "engine.h"
+#include "o11proto/realtime.h"
 
 static constexpr double kPi = 3.14159265358979323846; // kPi is not in MSVC's <math.h> by default
 
@@ -186,6 +187,10 @@ struct Room
 
 int main()
 {
+  // this thread calls process() and sleeps between blocks, as a DAW's audio thread: on macOS an
+  // ordinary thread's waits are stretched by timer coalescing (tens of ms on a CI runner)
+  const bool audioThread = o11proto::thread::makeAudioThread((double)Room::BLOCK / Room::RATE);
+  printf("  test thread: audio thread %s; %s\n", audioThread ? "yes" : "no", o11proto::thread::describe().c_str());
   Room room;
   // the host: a room on this computer (120 BPM, 4 BPI), joined at once
   CHECK(room.host.command("name Host") == "ok");
