@@ -36,9 +36,15 @@ double Click::sample(bool accent, int n, double sampleRate)
 void Click::setSampleRate(double sampleRate)
 {
   if (sampleRate <= 0) return;
+  m_n = -1;
+  if (sampleRate == m_sampleRate && m_samples[0].size() == (size_t)m_length) return; // made already
   m_sampleRate = sampleRate;
   m_length = length(sampleRate);
-  m_n = -1;
+  for (int accent = 0; accent < 2; accent ++)
+  {
+    m_samples[accent].resize((size_t)m_length);
+    for (int n = 0; n < m_length; n ++) m_samples[accent][(size_t)n] = sample(accent != 0, n, sampleRate);
+  }
 }
 
 void Click::reset()
@@ -80,7 +86,9 @@ void Click::render(float *left, float *right, int frames, int start, int len, in
     if (m_n < 0) continue;
     if (volume > 0)
     {
-      const float v = (float)(sample(m_accent, m_n, m_sampleRate) * volume);
+      const std::vector<double> &made = m_samples[m_accent ? 1 : 0];
+      const double s = (size_t)m_n < made.size() ? made[(size_t)m_n] : sample(m_accent, m_n, m_sampleRate);
+      const float v = (float)(s * volume);
       left[i] += v;
       if (right) right[i] += v;
     }
