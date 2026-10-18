@@ -489,12 +489,12 @@ std::int64_t frameNs(const Side& l, long f) {
 }
 
 // The output frame of the listener's that an event at steady time `ns`
-// came with, of blocks [0, n): the one nearest `near`. A sink stamps an
+// came with, of blocks [0, n): the one nearest `aim`. A sink stamps an
 // event with its block's time, or the time of its frame in the block
 // (frameNs()), so any block that began within a block's length before `ns`
 // may be the one. While a host catches up its blocks begin a fraction of
 // that apart, and the stamp alone doesn't say which.
-long outputFrame(const Side& l, std::int64_t ns, long n, long near) {
+long outputFrame(const Side& l, std::int64_t ns, long n, long aim) {
     const std::int64_t len = 1000000000LL * kBlock / kRate;
     long lo = 0, hi = n;                          // the last block that began by `ns` (block_ns only grows)
     while (hi - lo > 1) {
@@ -504,7 +504,7 @@ long outputFrame(const Side& l, std::int64_t ns, long n, long near) {
     long best = lo * kBlock;
     for (long k = lo; k >= 0 && l.block_ns[k] > ns - len; --k) {
         const long f = k * kBlock + static_cast<long>((ns - l.block_ns[k]) * kRate / 1000000000LL);
-        if (std::labs(f - near) < std::labs(best - near)) best = f;
+        if (std::labs(f - aim) < std::labs(best - aim)) best = f;
     }
     return best;
 }
