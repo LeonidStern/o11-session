@@ -962,7 +962,7 @@ void O11Editor::updateRoom(const Snapshot &s, double)
                                ? uitext::liveAdviceText((int)s.liveReason, s.liveReasonWho, s.liveReasonOthers) : "";
   if (!advice.empty())
     chip(true, advice, std::string(s.liveReason == Snapshot::LiveCantLive
-                                     ? "A player's client can't play Live, so the others hear them an interval late"
+                                     ? "A player can't reach the others directly, so they don't hear each other in Live"
                                      : "Live audio has dropouts that intervals wouldn't have")
                          + ". Click to switch the room to intervals for everyone", nobody, -1,
          [this]() { engine().setRoomLive(false); });
