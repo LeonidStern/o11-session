@@ -7,31 +7,6 @@
 
 namespace o11proto {
 
-bool setNonBlocking(socket_t fd) { return compat::setNonBlocking(fd); }
-
-bool setNoDelay(socket_t fd) {
-    int one = 1;
-    return compat::setOpt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
-}
-
-std::string peerAddressOf(socket_t fd) {
-    sockaddr_storage ss;
-    socklen_t len = sizeof(ss);
-    if (getpeername(fd, reinterpret_cast<sockaddr*>(&ss), &len) != 0) return "";
-    char buf[INET6_ADDRSTRLEN] = {0};
-    if (ss.ss_family == AF_INET) {
-        auto* a = reinterpret_cast<sockaddr_in*>(&ss);
-        inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf));
-    } else if (ss.ss_family == AF_INET6) {
-        auto* a = reinterpret_cast<sockaddr_in6*>(&ss);
-        inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof(buf));
-        // Present IPv4-mapped addresses (::ffff:1.2.3.4) as plain IPv4.
-        std::string s(buf);
-        if (s.rfind("::ffff:", 0) == 0 && s.find('.') != std::string::npos) return s.substr(7);
-    }
-    return buf;
-}
-
 std::string maskAddress(const std::string& ip) {
     std::size_t dot = ip.rfind('.');
     if (dot == std::string::npos) return ip;

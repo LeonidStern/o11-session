@@ -94,10 +94,6 @@ private:
     std::string peer_;
 };
 
-// Small socket helpers used by both sides.
-bool setNonBlocking(socket_t fd);
-bool setNoDelay(socket_t fd);
-std::string peerAddressOf(socket_t fd);
 // Replaces the last octet of a dotted IPv4 address with 'x' (section 4.2).
 std::string maskAddress(const std::string& ip);
 
