@@ -787,7 +787,7 @@ void Engine::setRoomCodec(const std::string &codec)
 int Engine::sendKbps()
 {
   const int room = m_state == ConnState::Connected ? m_client->roomOpusKbps() : 0;
-  return room > 0 ? room : getSettings().opusKbps;
+  return room > 0 ? room : setting(&Settings::opusKbps);
 }
 
 void Engine::applySendKbps()
@@ -978,7 +978,7 @@ void Engine::applyLocalSettings()
 
 void Engine::applyBroadcast()
 {
-  const bool want = getSettings().transmit && !m_hostStopped.load(std::memory_order_relaxed);
+  const bool want = setting(&Settings::transmit) && !m_hostStopped.load(std::memory_order_relaxed);
   LocalChannel lc;
   // from the next interval (the channel stays, so the others keep their settings for it)
   if (m_client->localChannel(0, &lc) && lc.broadcast != want)
@@ -1108,7 +1108,7 @@ void Engine::checkCanSend(bool canSend)
 // votes the room to the host's tempo when it changes (see TempoFollower)
 void Engine::followHostTempo()
 {
-  if (!getSettings().followHostTempo) return;
+  if (!setting(&Settings::followHostTempo)) return;
   const double t = now_seconds();
   // the host's tempo, while it runs the audio
   const double tempo = t - m_lastAudio < 1.0 ? m_hostTempo.load(std::memory_order_relaxed) : 0.0;
@@ -1144,7 +1144,7 @@ void Engine::updateLink()
   if (t - m_lastLinkPoll < LINK_POLL) return;
   m_lastLinkPoll = t;
 
-  const bool sync = getSettings().followHostTempo;
+  const bool sync = setting(&Settings::followHostTempo);
   const bool inRoom = m_state == ConnState::Connected;
   if (!sync || !inRoom) releaseLink();
   m_link->use(sync && inRoom);
@@ -1416,8 +1416,8 @@ void Engine::publish()
   snap.state = m_state;
   snap.status = m_statusText.empty() ? "Not connected" : m_statusText;
   snap.server = m_server;
-  snap.opusKbps = getSettings().opusKbps;
-  snap.liveBufferMs = getSettings().liveBufferMs;
+  snap.opusKbps = setting(&Settings::opusKbps);
+  snap.liveBufferMs = setting(&Settings::liveBufferMs);
   snap.liveBufferInUseMs = m_client->liveBufferInUseMs();
   snap.liveRoute = o11proto::engine::liveRouteName(m_client->liveRoomRoute().route);
   snap.sendKbps = sendKbps();
@@ -1475,7 +1475,7 @@ void Engine::publish()
   snap.audioRunning = t - m_lastAudio < 1.0;
   snap.localPeak[0] = m_client->localPeak(0, 0);
   snap.localPeak[1] = m_client->localPeak(0, 1);
-  snap.sendPaused = snap.audioRunning && m_hostStopped.load(std::memory_order_relaxed) && getSettings().transmit;
+  snap.sendPaused = snap.audioRunning && m_hostStopped.load(std::memory_order_relaxed) && setting(&Settings::transmit);
 
   // following the host, and its tempo against the room's
   std::string hostName;

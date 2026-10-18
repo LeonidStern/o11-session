@@ -304,6 +304,13 @@ public:
   static std::string firstName(const std::string &fullName); // "Leo Stern" is "Leo"
 
 private:
+  // one setting, without a copy of the rest (the network thread reads some at each wake)
+  template <typename T> T setting(T Settings::*field) const
+  {
+    std::lock_guard<std::mutex> lock(m_settingsMutex);
+    return m_settings.*field;
+  }
+
   void threadProc();
   void post(std::function<void()> fn);
   void runCommands();
