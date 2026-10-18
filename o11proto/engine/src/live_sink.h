@@ -99,6 +99,10 @@ struct SinkStats {
     std::atomic<std::uint32_t> skips{0}, host_gaps{0}, speed_changes{0};
     std::atomic<std::int64_t> skipped48{0}, host_gap48{0}, speed_moved_ns{0};
     std::atomic<std::int32_t> speed_ppm{0};
+    // The jitter buffer in use now (ms, rounded), and whether the stream
+    // fell back to the larger one (the automatic buffer, 6.8).
+    std::atomic<std::int32_t> buffer_ms{0};
+    std::atomic<bool> fell_back{false};
     // The latest events, a ring that `events_n` counts. Each entry is
     // marked with its number + 1, 0 while it is written: a reader takes an
     // entry whose mark is the same before and after it read it (readEvent()).
@@ -248,8 +252,14 @@ public:
     LiveSink& operator=(const LiveSink&) = delete;
 
     // The buffer in use and the host's blocks. A new latency restarts the
-    // buffering (6.8).
-    void configure(double latency_ms, int host_block, int host_rate);
+    // buffering (6.8). With a `fallback_ms` above `latency_ms`, the buffer
+    // is automatic: each stream starts at `latency_ms`, and falls back to
+    // `fallback_ms` at its second late dropout within kFallbackWindowNs (a
+    // block, not one asked for again, that comes after its turn; one per
+    // concealment). It grows while the audio is concealing, and stays
+    // there for the stream's life.
+    void configure(double latency_ms, int host_block, int host_rate, double fallback_ms = 0);
+    static constexpr std::int64_t kFallbackWindowNs = 10000000000LL;   // 10 s
     void reset();                               // no stream
     // The stream was dropped (its slot's generation changed): what it holds
     // plays out, then the concealment, for the mixer to fade out (16.8).
@@ -292,6 +302,7 @@ private:
         std::int32_t seq = -1;
         State state = Empty;
         bool requested = false;
+        std::uint32_t episode = 0;              // Passed: the concealment it was concealed in
         std::uint16_t len = 0;
         std::int64_t asked_ns = 0;
         std::uint8_t data[aoo::kMaxBlockBytes];
@@ -310,6 +321,22 @@ private:
     }
     void decodeNext(std::int64_t now_ns);       // one block into the 48 kHz queue
     void conceal();
+    // Concealment heard in place of the stream's audio: a new concealment
+    // (a dropout) when the block before was the stream's own.
+    void concealHeard();
+    // A block that came after its turn: a late dropout of concealment
+    // `episode`, unless it was asked for again (then it was lost) or that
+    // concealment already counted. The second within kFallbackWindowNs
+    // falls back.
+    void lateDropout(std::uint32_t episode, bool asked, std::int64_t now_ns);
+    void fallBack(std::int64_t now_ns);
+    // What the fallback still owes the delay, as whole blocks of the
+    // concealment playing now: in Playing, one block more before the next
+    // (true: concealed); while dry or buffering on its delay, the turns
+    // move back.
+    bool growNow();
+    void growAlign();
+    void grown(int samples48);                  // the delay grew by that much: the fill and its figure
     void event(std::int64_t ns, LiveEventKind kind, std::int64_t value) {
         stats.event(ns, static_cast<std::uint8_t>(kind), value);
     }
@@ -331,6 +358,7 @@ private:
     int lookahead_ = 120;
     float prime_[2 * kMaxPrime];
     bool fresh_ = false;                        // the decoder is in the state the stream began in
+    bool concealed_last_ = false;               // the block played last was concealment heard in the stream's place
     std::unique_ptr<Concealer> concealer_;
     Phase phase_ = Idle;
     bool stopping_ = false;                     // /stop came: play out, then end
@@ -343,7 +371,14 @@ private:
     bool far_ = false;
     std::int64_t far_seq_ = 0;
     int waited_ = 0;                            // 48 kHz samples of concealment while buffering
-    double latency_ms_ = 20;
+    double latency_ms_ = 20;                    // in use
+    double base_ms_ = 20, fallback_ms_ = 0;     // configured: automatic when fallback_ms_ > base_ms_
+    bool fell_back_ = false;
+    double owed48_ = 0;                         // what the fallback has yet to add to the delay
+    std::uint32_t episode_ = 0;                 // concealments heard, counted
+    std::uint32_t counted_ = 0;                 // the last that counted as a late dropout
+    bool has_dropout_ = false;
+    std::int64_t dropout_ns_ = 0;               // when the last late dropout counted
     int host_block_ = 0, host_rate_ = 48000;
     SinkSizes sizes_;
     float fifo_[2 * 480];                       // decoded 48 kHz frames

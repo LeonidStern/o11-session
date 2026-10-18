@@ -406,6 +406,171 @@ TEST(sink_counters_and_log) {
     CHECK(std::string(liveEventName(LiveEventKind::SpeedOff)) == "speed off");
 }
 
+// A stream in real time to one sink: a block of a 440 Hz tone each 5 ms,
+// each sent as it is made (unless it is lost, or the sender's link holds it
+// with the blocks after it until they all come at once), and one block
+// rendered after each.
+struct Feed {
+    OpusEncoder* enc = nullptr;
+    std::vector<float> pcm = std::vector<float>(2 * 240);
+    std::vector<float> out = std::vector<float>(2 * 240);
+    long n = 0;
+    double base = 10, fallback = 20;
+    LiveSink k;
+    std::int64_t now = 1000;
+    std::int32_t seq = 0;
+    std::vector<SinkItem> held;
+    Feed(double base_ms, double fallback_ms) : base(base_ms), fallback(fallback_ms) {
+        int err = 0;
+        enc = opus_encoder_create(48000, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+        k.configure(base, 240, 48000, fallback);
+        k.apply(item(SinkItem::Start, 0), now);
+    }
+    ~Feed() {
+        if (enc) opus_encoder_destroy(enc);
+    }
+    Feed(const Feed&) = delete;
+    Feed& operator=(const Feed&) = delete;
+    SinkItem block(std::int32_t s) {
+        for (int i = 0; i < 240; ++i, ++n) pcm[2 * i] = pcm[2 * i + 1] = 0.3f * std::sin(2 * M_PI * 440.0 * n / 48000);
+        SinkItem it = item(SinkItem::Data, s);
+        it.len = static_cast<std::uint16_t>(opus_encode_float(enc, pcm.data(), 240, it.data, 1275));
+        return it;
+    }
+    // `blocks` blocks: the first `hold` of them held, then each `lose`th lost.
+    void run(int blocks, int hold = 0, int lose = 0) {
+        for (int i = 0; i < blocks; ++i) {
+            const SinkItem it = block(seq++);
+            if (i < hold) {
+                held.push_back(it);
+            } else {
+                for (const SinkItem& h : held) k.apply(h, now);
+                held.clear();
+                if (!(lose > 0 && it.seq % lose == 0)) k.apply(it, now);
+            }
+            k.configure(base, 240, 48000, fallback);   // as each audio block does
+            k.render(out.data(), 240, 48000, now);
+            now += 5000000;
+        }
+    }
+    void seconds(double s, int lose = 0) { run(static_cast<int>(s * 200), 0, lose); }
+    int count(LiveEventKind kind) const {
+        int c = 0;
+        for (std::uint32_t i = 0; i < k.stats.events_n.load(); ++i) {
+            std::int64_t ns = 0, value = 0;
+            std::uint8_t kd = 0;
+            if (k.stats.readEvent(i, &ns, &kd, &value) && kd == static_cast<std::uint8_t>(kind)) ++c;
+        }
+        return c;
+    }
+    std::uint64_t concealed() const { return k.stats.concealed48.load() / 240; }   // blocks
+};
+
+// The automatic buffer (6.8): 10 ms, and 20 ms from a stream's second late
+// dropout within 10 s, grown while that dropout conceals: the concealment is
+// that much longer, the delay that much more, and nothing else is heard.
+// Loss alone, or a block asked for again that comes late, never falls back;
+// nor does a fixed buffer; and a new stream starts at 10 ms again.
+TEST(sink_buffer_falls_back_on_late_audio) {
+    {
+        Feed f(10, 20);
+        f.seconds(2);
+        REQUIRE(f.k.playing());
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 10);
+        const int held10 = f.k.heldBlocks();
+        // The sender's link holds 4 blocks (20 ms): they come late.
+        std::uint64_t c0 = f.concealed();
+        f.run(8, 4);
+        const std::uint64_t first = f.concealed() - c0;
+        CHECK(first > 0 && f.k.stats.late.load() > 0);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 0);
+        f.seconds(3);
+        CHECK(f.k.playing());
+        // The second, 3 s later: it falls back, and its concealment is 10 ms longer.
+        c0 = f.concealed();
+        f.run(8, 4);
+        const std::uint64_t second = f.concealed() - c0;
+        f.seconds(2);
+        const std::uint64_t after = f.concealed() - c0 - second;
+        const int held20 = f.k.heldBlocks();
+        std::printf("    concealed %llu blocks at the first late dropout, %llu at the second (it fell back), %llu "
+                    "after; %d blocks held at 10 ms, %d at 20 ms; fill %.2f ms\n",
+                    static_cast<unsigned long long>(first), static_cast<unsigned long long>(second),
+                    static_cast<unsigned long long>(after), held10, held20, f.k.stats.fill_us.load() / 1000.0);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 1);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 20);
+        CHECK(f.k.stats.fell_back.load());
+        CHECK_EQ(second, first + 2);             // 10 ms more of the same concealment
+        CHECK_EQ(after, 0u);                     // and no second one for it
+        CHECK_EQ(held20, held10 + 2);            // the delay is 10 ms more
+        // At 20 ms the same hold costs less; a third doesn't fall back again.
+        c0 = f.concealed();
+        f.run(8, 4);
+        f.seconds(1);
+        CHECK(f.concealed() - c0 < first);
+        f.run(8, 2);                             // 10 ms: in time now
+        f.seconds(1);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 1);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 20);
+        // A new stream starts at 10 ms.
+        f.k.apply(item(SinkItem::Start, f.seq), f.now);
+        f.k.configure(10, 240, 48000, 20);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 10);
+        CHECK(!f.k.stats.fell_back.load());
+    }
+    {   // Two late dropouts more than 10 s apart: no fallback; a third within 10 s of the second: one.
+        Feed f(10, 20);
+        f.seconds(2);
+        f.run(8, 4);
+        f.seconds(11);
+        f.run(8, 4);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 0);
+        f.seconds(9);
+        f.run(8, 4);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 1);
+    }
+    {   // Loss alone: a block in 20 lost for 20 s, and runs of 3.
+        Feed f(10, 20);
+        f.seconds(2);
+        f.seconds(20, 20);
+        for (int i = 0; i < 10; ++i) {
+            f.run(3, 0, 1);                      // 3 in a row lost: it runs dry
+            f.seconds(1);
+        }
+        std::printf("    loss alone: %u lost, %u underruns, %u late\n", f.k.stats.lost.load(),
+                    f.k.stats.underruns.load(), f.k.stats.late.load());
+        CHECK(f.k.stats.lost.load() >= 100);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 0);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 10);
+        // A block missing at its turn, asked for again, that comes after its
+        // turn: late, but lost as far as the buffer goes.
+        for (int r = 0; r < 3; ++r) {
+            const SinkItem missing = f.block(f.seq++);
+            f.run(1);                            // the one after it comes
+            std::int32_t seqs[16];
+            CHECK(f.k.dueRequests(f.now, seqs, 16) >= 1);   // it is asked for
+            f.run(2);                            // its turn passes
+            f.k.apply(missing, f.now);           // the answer, late
+            f.seconds(1);
+        }
+        CHECK(f.k.stats.late.load() >= 3);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 0);
+    }
+    {   // A fixed buffer never falls back.
+        Feed f(10, 0);
+        f.seconds(2);
+        for (int i = 0; i < 4; ++i) {
+            f.run(8, 4);
+            f.seconds(1);
+        }
+        CHECK(f.k.stats.late.load() >= 4);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 0);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 10);
+        CHECK(!f.k.stats.fell_back.load());
+        CHECK(std::string(liveEventName(LiveEventKind::Fallback)) == "fallback");
+    }
+}
+
 TEST(sink_keeps_its_delay_after_a_gap) {        // 16.6: back in time with the other players
     // A sender in real time, 256-frame host blocks against 240-frame
     // blocks, and a gap in its packets: lost (the sink hears nothing more
@@ -656,7 +821,11 @@ TEST(buffer_setting_parsing) {                   // 6.8, test 38's state part
     CHECK(Engine::parseLiveBufferSetting("+30", &ms) && ms == 30);
     CHECK(Engine::parseLiveBufferSetting("030", &ms) && ms == 30);
     CHECK(Engine::parseLiveBufferSetting("-5", &ms) && ms == 5);
+    CHECK(Engine::parseLiveBufferSetting("auto", &ms) && ms == Engine::kLiveBufferAutomatic);
     ms = 7;
+    CHECK(Engine::parseLiveBufferSetting("0", &ms) && ms == Engine::kLiveBufferAutomatic);
+    ms = 7;
+    CHECK(!Engine::parseLiveBufferSetting("Auto", &ms) && ms == 7);
     CHECK(!Engine::parseLiveBufferSetting("30.0", &ms) && ms == 7);
     CHECK(!Engine::parseLiveBufferSetting("", &ms));
     CHECK(!Engine::parseLiveBufferSetting("abc", &ms));
@@ -671,24 +840,51 @@ TEST(live_command_without_connection) {          // 6.11
     REQUIRE(e.liveCommand("/live"));
     CHECK_EQ(lines.back().first,
              "Not connected. In a room with Live mode, /live shows how late you hear each O11 Session player. "
-             "Live's jitter buffer is 20 ms (/live buffer N to change it).");
+             "Live's jitter buffer is automatic: 10 ms, or 20 ms for a player whose audio comes late (/live buffer N "
+             "to fix it).");
     REQUIRE(e.liveCommand("/LIVE On"));
     CHECK(lines.back().first == "Not connected: Live mode is the room's, so join a room first." && lines.back().second);
+    CHECK(e.liveBufferAutomatic());
+    CHECK_EQ(e.liveBufferMs(), Engine::kLiveBufferAutomatic);
+    CHECK_EQ(e.liveBufferInUseMs(), 10);
     REQUIRE(e.liveCommand("/live buffer"));
-    CHECK_EQ(lines.back().first, "Live's jitter buffer is 20 ms. Type /live buffer 30 to change it (5 to 200).");
+    CHECK_EQ(lines.back().first, "Live's jitter buffer is automatic: 10 ms, or 20 ms for a player whose audio comes "
+                                 "late. Type /live buffer 30 to fix it (5 to 200).");
     REQUIRE(e.liveCommand("/live buffer 40"));
-    CHECK_EQ(lines.back().first, "Live's jitter buffer is 40 ms now (it was 20). Less is less late, more has fewer "
-                                 "dropouts: type /live to see them.");
+    CHECK_EQ(lines.back().first, "Live's jitter buffer is 40 ms now (it was automatic). Less is less late, more has "
+                                 "fewer dropouts: type /live to see them.");
     CHECK_EQ(e.liveBufferMs(), 40);
+    CHECK(!e.liveBufferAutomatic());
+    REQUIRE(e.liveCommand("/live buffer"));
+    CHECK_EQ(lines.back().first, "Live's jitter buffer is 40 ms. Type /live buffer 30 to change it (5 to 200), or "
+                                 "/live buffer auto.");
+    REQUIRE(e.liveCommand("/live"));
+    CHECK_EQ(lines.back().first,
+             "Not connected. In a room with Live mode, /live shows how late you hear each O11 Session player. "
+             "Live's jitter buffer is 40 ms (/live buffer N to change it).");
     REQUIRE(e.liveCommand("/live buffer30"));    // quirk 12
     CHECK_EQ(e.liveBufferMs(), 30);
+    CHECK_EQ(lines.back().first, "Live's jitter buffer is 30 ms now (it was 40). Less is less late, more has fewer "
+                                 "dropouts: type /live to see them.");
     REQUIRE(e.liveCommand("/live buffer 30.0"));
-    CHECK(lines.back().first == "/live buffer takes a number of ms from 5 to 200, such as /live buffer 30." &&
+    CHECK(lines.back().first == "/live buffer takes a number of ms from 5 to 200, such as /live buffer 30, or auto." &&
           lines.back().second);
     REQUIRE(e.liveCommand("/live buffers"));
     CHECK(lines.back().second);
     REQUIRE(e.liveCommand("/live buffer 201"));
     CHECK_EQ(e.liveBufferMs(), 30);
+    REQUIRE(e.liveCommand("/live buffer 0"));    // automatic is "auto"
+    CHECK(lines.back().second);
+    CHECK_EQ(e.liveBufferMs(), 30);
+    REQUIRE(e.liveCommand("/live buffer auto"));
+    CHECK_EQ(lines.back().first, "Live's jitter buffer is automatic now (it was 30 ms): 10 ms, or 20 ms for a player "
+                                 "whose audio comes late.");
+    CHECK(e.liveBufferAutomatic());
+    e.setLiveBufferMs(3);
+    CHECK_EQ(e.liveBufferMs(), 5);
+    e.setLiveBufferAutomatic();
+    CHECK(e.liveBufferAutomatic());
+    CHECK_EQ(e.liveBufferInUseMs(), 10);
     REQUIRE(e.liveCommand("/live what"));
     CHECK(lines.back().first ==
               "Type /live to see how the Live players sound, or /live buffer 30 to set Live's jitter buffer (ms)." &&
@@ -704,9 +900,22 @@ TEST(long_host_blocks) {                         // the buffer texts with a 2048
     e.process(nullptr, 0, outs, 2, 2048, 48000);
     CHECK_EQ(e.liveBufferInUseMs(), 91);
     REQUIRE(e.liveCommand("/live buffer 30"));
-    CHECK_EQ(lines.back(), "Live's jitter buffer is 30 ms now (it was 20). Less is less late, more has fewer dropouts: "
-                           "type /live to see them. Your DAW's audio buffer (2048 samples) needs at least 91 ms, so "
-                           "Live uses 91 ms.");
+    CHECK_EQ(lines.back(), "Live's jitter buffer is 30 ms now (it was automatic). Less is less late, more has fewer "
+                           "dropouts: type /live to see them. Your DAW's audio buffer (2048 samples) needs at least 91 "
+                           "ms, so Live uses 91 ms.");
+    REQUIRE(e.liveCommand("/live buffer auto"));
+    CHECK_EQ(lines.back(), "Live's jitter buffer is automatic now (it was 30 ms): 10 ms, or 20 ms for a player whose "
+                           "audio comes late. Your DAW's audio buffer (2048 samples) needs at least 91 ms, so Live uses "
+                           "91 ms for everyone.");
+    {   // 256 samples: the automatic buffer starts higher, and still falls back to 20 ms
+        Engine e2;
+        e2.onLiveNotice = [&](const std::string& t, bool) { lines.push_back(t); };
+        e2.process(nullptr, 0, outs, 2, 256, 48000);
+        CHECK_EQ(e2.liveBufferInUseMs(), 16);
+        REQUIRE(e2.liveCommand("/live buffer auto"));
+        CHECK(lines.back().find(" Your DAW's audio buffer (256 samples) needs at least 16 ms, so Live starts at 16 "
+                                "ms.") != std::string::npos);
+    }
     e.process(nullptr, 0, outs, 2, 8192, 48000);
     REQUIRE(e.liveCommand("/live buffer 30"));
     CHECK(lines.back().find("Your DAW's audio buffer (8192 samples) needs at least 347 ms, more than Live can use "

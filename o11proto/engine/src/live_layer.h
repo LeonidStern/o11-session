@@ -38,7 +38,8 @@ namespace engine {
 
 constexpr int kLiveSlots = 8;
 constexpr int kLiveListed = 64;
-constexpr int kLiveDefaultBufferMs = 20;
+constexpr int kLiveAutoBufferMs = 10;        // the automatic buffer (the default): where each stream starts,
+constexpr int kLiveFallbackBufferMs = 20;    // and where it falls back to on late audio
 constexpr int kLiveMinBufferMs = 5;
 constexpr int kLiveMaxBufferMs = 200;
 constexpr int kLiveMaxHostBlock = 16384;     // longer host blocks play intervals only
@@ -153,7 +154,10 @@ struct LiveLayer {
     std::atomic<bool> room_on{false}, may_send{false}, running{false};
     std::atomic<bool> host_playing{true}, host_offline{false};
     std::atomic<std::uint32_t> gen[kLiveSlots]{};   // bumped by control: a slot's new peer or a dropped source
-    std::atomic<int> latency_ms{kLiveDefaultBufferMs};   // B, control -> audio
+    std::atomic<int> latency_ms{kLiveAutoBufferMs};   // B, control -> audio
+    // B and the automatic buffer's fallback (0: a fixed buffer), as one
+    // word (B | fallback << 16) so the audio context reads them together.
+    std::atomic<std::uint32_t> buffers{kLiveAutoBufferMs | (kLiveFallbackBufferMs << 16)};
     std::atomic<int> host_block{0}, host_rate{0};        // H and sr, audio -> control
     // The host frame (from the first block) where each slot's audio last
     // went into concealment, -1 for never: audio -> a test.

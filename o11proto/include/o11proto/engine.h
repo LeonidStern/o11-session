@@ -80,6 +80,10 @@ struct LiveCounters {
     double speed_moved_ms = 0;
     double speed_ppm = 0;
     double fill_ms = -1;                         // as liveUserBufferMs()
+    // The jitter buffer the stream plays with now, in ms, and whether it
+    // fell back to the larger automatic one (Engine::setLiveBufferMs()).
+    int buffer_ms = -1;
+    bool fell_back = false;
 };
 enum class LiveEventKind : std::uint8_t {
     None = 0,
@@ -97,6 +101,7 @@ enum class LiveEventKind : std::uint8_t {
     SpeedOn,                                     // the speed left the clock's own (value: the fill's error, µs)
     SpeedOff,                                    // and has been back for 1 s (value: the furthest it went, ppm)
     End,                                         // the stream ended or went
+    Fallback,                                    // the automatic buffer fell back (value: the buffer now, ms)
 };
 const char* liveEventName(LiveEventKind kind);   // "late", "lost", ...
 struct LiveEvent {
@@ -232,10 +237,24 @@ public:
     std::function<void(const std::string& text, bool error)> onLiveNotice;
     void setLiveEnabled(bool v) { live_enabled_.store(v); }   // announce Live at the next connect() (default on)
     bool liveEnabled() const { return live_enabled_.load(); }
-    void setLiveBufferMs(int ms);               // the jitter buffer setting, 5..200 (default 20)
+    // The jitter buffer (6.8), per sender. Automatic, the default: each
+    // stream starts at 10 ms and falls back to 20 ms at its second late
+    // dropout within 10 s (it ran dry and its audio came late, or a block
+    // came too late to play; a block lost doesn't count), for as long as
+    // that stream lasts. setLiveBufferMs(ms) fixes every stream at `ms`
+    // (5..200), without a fallback; setLiveBufferAutomatic() (or
+    // setLiveBufferMs(kLiveBufferAutomatic)) goes back. Either is raised for
+    // long host blocks. liveBufferMs() is the fixed setting, or
+    // kLiveBufferAutomatic; liveBufferInUseMs() is B: the fixed setting, or
+    // what an automatic stream starts at, each raised for long host blocks.
+    static constexpr int kLiveBufferAutomatic = 0;
+    void setLiveBufferMs(int ms);
+    void setLiveBufferAutomatic() { setLiveBufferMs(kLiveBufferAutomatic); }
+    bool liveBufferAutomatic() const { return live_setting_ms_.load() == kLiveBufferAutomatic; }
     int liveBufferMs() const { return live_setting_ms_.load(); }
-    int liveBufferInUseMs() const;              // B: the setting, raised for long host blocks
-    // The saved `live_buffer_ms=` value: false unless a whole number; clamped to 5..200.
+    int liveBufferInUseMs() const;
+    // The saved `live_buffer_ms=` value: "auto" or 0 for automatic, else a
+    // whole number clamped to 5..200; false for anything else.
     static bool parseLiveBufferSetting(const std::string& value, int* ms);
     bool liveCommand(const std::string& text);  // "/live ...": answered here (true), never sent
     void setLiveHostState(bool playing, bool offline);   // the host's transport and offline rendering
@@ -282,6 +301,11 @@ public:
     // oldest first, at most `max`). Any context, lock-free with the audio.
     bool liveUserCounters(int user, LiveCounters* out) const;
     std::vector<LiveEvent> liveUserEvents(int user, std::size_t max = 64) const;
+    // The jitter buffer this user's stream plays with now (ms; -1 without
+    // a stream), and whether it fell back (automatic only; it stays fallen
+    // back until the user's stream starts again). Any context.
+    int liveUserBufferInUseMs(int user) const;
+    bool liveUserBufferFellBack(int user) const;
     void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
     void setLiveTestSendGap(int ms);            // test hook: the Live data sent in the next `ms` is lost
     void setLiveTestSendHold(int ms);           // test hook: ... is held back, then sent all at once
@@ -478,7 +502,7 @@ private:
     void mixLive(float* const* out, int numOut, int len, int at, int sampleRate);   // channel 0 of Live users
     void liveIntervalAudio(RemoteUser& u, int len, int sampleRate, float* dst);
     std::atomic<bool> live_enabled_{true};
-    std::atomic<int> live_setting_ms_{20};
+    std::atomic<int> live_setting_ms_{kLiveBufferAutomatic};
     std::unique_ptr<LiveLayer, LiveDeleter> live_;   // last: its network thread stops first
 };
 

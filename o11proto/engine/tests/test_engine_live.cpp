@@ -61,6 +61,10 @@ std::vector<long> burstStarts() {
 struct Side {
     Engine e;
     std::string name;
+    // A fixed 20 ms jitter buffer, the default before the automatic one:
+    // these checks are made for it (the automatic buffer's are in
+    // test_engine_live_units and test_engine_live_tone).
+    Side() { e.setLiveBufferMs(20); }
     std::unique_ptr<float[]> heard{new float[kMaxOwn]()};             // output 0, at the side's own frames
     std::unique_ptr<std::uint8_t[]> live{new std::uint8_t[kMaxFrames / kBlock + 1]()};   // userLive(0) after each block
     std::unique_ptr<int[]> pos{new int[kMaxFrames / kBlock + 1]()};  // the interval position after each block
@@ -665,10 +669,11 @@ TEST(jitter_buffer_setting_takes_effect) {
     // `/live buffer` without a number, and a bad one.
     seen = r.side[1].noticeCount();
     r.side[1].e.liveCommand("/live buffer");
-    CHECK(!r.side[1].findNotice("Live's jitter buffer is 60 ms. Type /live buffer 30 to change it (5 to 200).", seen)
+    CHECK(!r.side[1].findNotice("Live's jitter buffer is 60 ms. Type /live buffer 30 to change it (5 to 200), or /live "
+                                "buffer auto.", seen)
                .empty());
     r.side[1].e.liveCommand("/live buffer 30.0");
-    CHECK(!r.side[1].findNotice("/live buffer takes a number of ms from 5 to 200, such as /live buffer 30.", seen)
+    CHECK(!r.side[1].findNotice("/live buffer takes a number of ms from 5 to 200, such as /live buffer 30, or auto.", seen)
                .empty());
     CHECK_EQ(r.side[1].e.liveBufferMs(), 60);
 }

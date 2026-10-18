@@ -91,15 +91,18 @@ struct Side {
     std::atomic<long> blocks{0};
     std::atomic<bool> stop{false};
     std::thread audio;
-    // The listener's Live log of the other, as the main thread collects it.
-    std::vector<LiveEvent> events;
+    // The listener's Live log of the other, as the main thread collects it:
+    // since the recording began, and since the connection.
+    std::vector<LiveEvent> events, all;
     std::set<std::tuple<std::int64_t, int, std::int64_t>> seen;
     double fill_lo = 1e9, fill_hi = -1;
 
     void collect() {
         for (const LiveEvent& ev : e.liveUserEvents(0))
-            if (seen.insert(std::make_tuple(ev.steady_ns, static_cast<int>(ev.kind), ev.value)).second)
+            if (seen.insert(std::make_tuple(ev.steady_ns, static_cast<int>(ev.kind), ev.value)).second) {
                 events.push_back(ev);
+                all.push_back(ev);
+            }
         const double f = e.liveUserBufferMs(0);
         if (f >= 0) {
             fill_lo = std::min(fill_lo, f);
@@ -152,8 +155,17 @@ struct ToneRoom {
     std::vector<std::pair<std::int64_t, double>> plain_late;   // a network-like thread's late wakes (ns, ms)
     std::vector<std::pair<std::int64_t, double>> loop_late;    // its loopback datagrams that came late (ns, ms)
     std::vector<std::pair<std::int64_t, double>> server_slow;  // the server's late polls (end ns, ms past its 1 ms)
+    // A jittery link (the test's): side `spiky`'s link holds its datagrams
+    // for spike_lo..spike_hi ms every 0.5 to 1.5 s (at random), then sends
+    // them at once (Engine::setLiveTestSendHold()): when each hold began, and
+    // its length.
+    std::thread spike;
+    std::atomic<bool> spike_stop{false};
+    std::vector<std::pair<std::int64_t, int>> spikes;
 
-    ToneRoom(double ppm, double seconds) {
+    // Each side's jitter buffer setting: 20 ms fixed, or automatic
+    // (Engine::kLiveBufferAutomatic).
+    ToneRoom(double ppm, double seconds, const int buffer_ms[2]) {
         ServerConfig cfg;
         cfg.port = 0;
         cfg.allow_anonymous = true;
@@ -241,6 +253,7 @@ struct ToneRoom {
             s.late_ms.reset(new float[static_cast<std::size_t>(s.max_blocks)]());
             s.live.reset(new std::uint8_t[static_cast<std::size_t>(s.max_blocks)]());
             s.e.setMetronome(0, 0, true, 0);
+            s.e.setLiveBufferMs(buffer_ms[i]);
             LocalChannel lc;
             lc.name = "tone";
             lc.broadcast = true;
@@ -249,7 +262,29 @@ struct ToneRoom {
         }
         for (Side& s : side) s.audio = std::thread([&s] { s.audioLoop(); });
     }
+    void startSpikes(int spiky, int spike_lo, int spike_hi) {
+        spike = std::thread([this, spiky, spike_lo, spike_hi] {
+            std::uint32_t rnd = 2463534242u;
+            const auto next = [&rnd] {
+                rnd ^= rnd << 13;
+                rnd ^= rnd >> 17;
+                rnd ^= rnd << 5;
+                return (rnd & 0xFFFFFF) / 16777216.0;
+            };
+            while (!spike_stop.load()) {
+                const TimePoint until = Clock::now() + std::chrono::milliseconds(static_cast<long>(500 + 1000 * next()));
+                while (!spike_stop.load() && Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                if (spike_stop.load()) break;
+                const int ms = spike_lo + static_cast<int>(std::lround((spike_hi - spike_lo) * next()));
+                side[spiky].e.setLiveTestSendHold(ms);
+                std::lock_guard<std::mutex> lock(hm);
+                spikes.push_back({nowNs(), ms});
+            }
+        });
+    }
     ~ToneRoom() {
+        spike_stop.store(true);
+        if (spike.joinable()) spike.join();
         for (Side& s : side) s.stop.store(true);
         for (Side& s : side) s.audio.join();
         watch_stop.store(true);
@@ -457,42 +492,147 @@ struct RunCounts {
     int concealments = 0, concealments_unexplained = 0;   // one without the machine stalling before it
 };
 
+// What a run does to the room.
+struct RunSetup {
+    double ppm = 0;                              // bob's clock against alice's
+    double seconds = 20;                         // recorded once both have heard each other live for 3 s
+    int buffer_ms[2] = {20, 20};                 // each side's jitter buffer setting (20 ms: as before the automatic one)
+    // What the test does at so many seconds into the recording.
+    std::vector<std::pair<double, std::function<void(ToneRoom&)>>> steps;
+    // A listener whose stream the test disturbs: its concealments are the
+    // test's, not the machine's (its dips must still have one there).
+    bool disturbed[2] = {false, false};
+};
+
+// What one listener heard.
+struct Concealment {
+    std::int64_t ns;
+    LiveEventKind kind;
+    bool machine;                                // the machine stalled before it, or both listeners concealed at once
+};
+struct Heard {
+    RunCounts n;
+    std::int64_t from_ns = 0, to_ns = 0;         // the recording
+    std::vector<std::int64_t> dip_ns;            // where each dip began
+    std::vector<LiveEvent> log;                  // its log of the other, since the connection
+    std::vector<Concealment> conceal;            // each concealment in it
+    std::vector<std::pair<std::int64_t, int>> spikes;   // the test's holds of the other's link (ns, ms)
+    LiveCounters c;
+    int buffer_ms = -1;                          // at the end: the buffer the stream plays with,
+    bool fell_back = false;                      // whether it fell back,
+    int start_ms = -1;                           // and what this side's streams start at (B)
+    int count(LiveEventKind k) const {
+        int c = 0;
+        for (const LiveEvent& ev : log) c += ev.kind == k ? 1 : 0;
+        return c;
+    }
+    std::int64_t first(LiveEventKind k) const {
+        for (const LiveEvent& ev : log)
+            if (ev.kind == k) return ev.steady_ns;
+        return -1;
+    }
+    // The concealments in [from, to] the machine didn't stall before.
+    int unexcused(std::int64_t from, std::int64_t to) const {
+        int u = 0;
+        for (const Concealment& k : conceal) u += k.ns >= from && k.ns <= to && !k.machine ? 1 : 0;
+        return u;
+    }
+    // The test's spikes that began in [from, to], and how many of them a
+    // late block followed (in the spike's length and 40 ms more).
+    void spikesLate(std::int64_t from, std::int64_t to, int* n, int* late) const {
+        *n = *late = 0;
+        for (const auto& sp : spikes) {
+            if (sp.first < from || sp.first > to) continue;
+            ++*n;
+            bool l = false;
+            for (const LiveEvent& ev : log)
+                l |= ev.kind == LiveEventKind::Late && ev.steady_ns >= sp.first &&
+                     ev.steady_ns <= sp.first + (sp.second + 40) * 1000000LL;
+            *late += l ? 1 : 0;
+        }
+    }
+    int excused(std::int64_t from, std::int64_t to) const {
+        int u = 0;
+        for (const Concealment& k : conceal) u += k.ns >= from && k.ns <= to && k.machine ? 1 : 0;
+        return u;
+    }
+};
+struct RunResult {
+    RunCounts n;                                 // the dips of both, the concealments of the undisturbed
+    Heard heard[2];                              // alice's of bob, bob's of alice
+};
+
+// An automatic buffer's fallback the machine caused: two of the
+// concealments in the 11 s before it followed stalls of the machine's (it
+// takes two late dropouts within 10 s). A listener without one plays with
+// the buffer it started with.
+bool fallbackIsTheMachines(const Heard& h) {
+    if (!h.fell_back && h.count(LiveEventKind::Fallback) == 0) return h.buffer_ms == h.start_ms;
+    const std::int64_t tf = h.first(LiveEventKind::Fallback);
+    return tf >= 0 && h.excused(tf - 11000000000LL, tf) >= 2;
+}
+
 // One run: the clocks `ppm` apart, `seconds` recorded once both have heard
 // each other live for 3 s. A dip must come with a concealment in the
 // listener's log (from 150 ms before it to 20 ms into it), and every
-// concealment must follow a stall of the machine's (kExcuseMs before it).
-RunCounts toneRun(double ppm, double seconds) {
-    RunCounts n;
-    std::printf("  the clocks %.1f ppm apart, %.0f s:\n", ppm, seconds);
-    ToneRoom r(ppm, seconds);
+// concealment must follow a stall of the machine's (kExcuseMs before it),
+// unless the test disturbs that listener's stream.
+RunResult toneRun(const RunSetup& setup) {
+    RunResult res;
+    RunCounts& n = res.n;
+    const double ppm = setup.ppm, seconds = setup.seconds;
+    std::printf("  the clocks %.1f ppm apart, %.0f s, buffers %s and %s:\n", ppm, seconds,
+                setup.buffer_ms[0] ? (std::to_string(setup.buffer_ms[0]) + " ms").c_str() : "automatic",
+                setup.buffer_ms[1] ? (std::to_string(setup.buffer_ms[1]) + " ms").c_str() : "automatic");
+    ToneRoom r(ppm, seconds, setup.buffer_ms);
     if (!r.connect() || !r.bothLive(20)) {
         CHECK(!"both connected and live");
         n.dips_unexplained = -1;
-        return n;
+        return res;
     }
     r.wait(3.0);
     long from[2], to[2];
     for (int i = 0; i < 2; ++i) from[i] = r.side[i].blocks.load() * kBlock;
     for (Side& s : r.side) s.events.clear(), s.fill_lo = 1e9, s.fill_hi = -1;
-    r.wait(seconds);
+    double at = 0;
+    for (const auto& step : setup.steps) {
+        if (step.first > at) r.wait(step.first - at), at = step.first;
+        step.second(r);
+    }
+    if (seconds > at) r.wait(seconds - at);
     for (int i = 0; i < 2; ++i) to[i] = r.side[i].blocks.load() * kBlock;
     for (int i = 0; i < 2; ++i) {
         Side& l = r.side[i];
         const Side& o = r.side[1 - i];
+        Heard& h = res.heard[i];
         bool all_live = true;
         for (long k = from[i] / kBlock; k < to[i] / kBlock; ++k) all_live = all_live && l.live[k];
         CHECK(all_live);
         const std::int64_t t_from = frameNs(l, from[i]), t_to = frameNs(l, to[i] - 1);
-        const Result res = findDips(l, o.hz, from[i], to[i]);
-        for (const Dip& d : res.dips) {
+        h.from_ns = t_from;
+        h.to_ns = t_to;
+        h.log = l.all;
+        {
+            std::lock_guard<std::mutex> lock(r.hm);
+            if (i == 1) h.spikes = r.spikes;     // alice's link is the spiky one
+        }
+        h.buffer_ms = l.e.liveUserBufferInUseMs(0);
+        h.fell_back = l.e.liveUserBufferFellBack(0);
+        h.start_ms = l.e.liveBufferInUseMs();
+        const bool counted = l.e.liveUserCounters(0, &h.c);
+        CHECK(counted);
+        CHECK(!counted || (h.c.buffer_ms == h.buffer_ms && h.c.fell_back == h.fell_back));
+        const Result res_d = findDips(l, o.hz, from[i], to[i]);
+        for (const Dip& d : res_d.dips) {
             const std::int64_t t = frameNs(l, d.at);
+            h.dip_ns.push_back(t);
             bool explained = false;
             for (const LiveEvent& ev : l.events) {
                 const double ms = (ev.steady_ns - t) / 1e6;
                 if (ms >= -150 && ms <= 20 && (concealing(ev.kind) || ev.kind == LiveEventKind::Rejoin)) explained = true;
             }
-            ++n.dips;
-            n.dips_unexplained += explained ? 0 : 1;
+            ++h.n.dips;
+            h.n.dips_unexplained += explained ? 0 : 1;
             std::printf("    %s hears a dip at %.3f s, %.1f ms: level %.2f-%.2f, bend %.2f rad%s; the log:", l.name.c_str(),
                         (t - t_from) / 1e9, (d.end - d.at) * 1000.0 / kRate, d.low, d.high, d.bend,
                         explained ? "" : " (NO CONCEALMENT THERE)");
@@ -506,30 +646,36 @@ RunCounts toneRun(double ppm, double seconds) {
             std::printf("%s\n", shown ? "" : " nothing");
         }
         std::printf("    %s: the tone at %.3f, steady within %.3f of it and bending at most %.3f rad (99.9%%: %.3f); %d dips\n",
-                    l.name.c_str(), res.median, res.steady_level, res.steady_bend, res.bend_p999,
-                    static_cast<int>(res.dips.size()));
-        for (const LiveEvent& ev : l.events) {
-            if (!concealing(ev.kind) || ev.steady_ns < t_from || ev.steady_ns > t_to) continue;
+                    l.name.c_str(), res_d.median, res_d.steady_level, res_d.steady_bend, res_d.bend_p999,
+                    static_cast<int>(res_d.dips.size()));
+        int quiet_shown = 0;
+        for (const LiveEvent& ev : l.all) {
+            if (!concealing(ev.kind)) continue;
             double worst[4];
             r.stallsBefore(ev.steady_ns, kExcuseMs, worst);
             // Both listeners concealing at once (their sinks share nothing):
             // the way between them stalled, though no thread watched did.
             bool both = false;
-            for (const LiveEvent& e2 : o.events)
+            for (const LiveEvent& e2 : o.all)
                 both |= concealing(e2.kind) && std::llabs(e2.steady_ns - ev.steady_ns) <= kBothNs;
             const bool machine =
                 worst[0] > kLateMs || worst[1] > kLateMs || worst[2] > kLateMs || worst[3] > kLateMs || both;
-            ++n.concealments;
-            n.concealments_unexplained += machine ? 0 : 1;
+            h.conceal.push_back({ev.steady_ns, ev.kind, machine});
+            if (ev.steady_ns < t_from || ev.steady_ns > t_to) continue;
+            ++h.n.concealments;
+            h.n.concealments_unexplained += machine ? 0 : 1;
+            // A disturbed stream's concealments are many: the first few are shown.
+            if (setup.disturbed[i] && ++quiet_shown > 12) continue;
             std::printf("    %s conceals at %.3f s (%s %lld) after alice's host woke %.1f ms late, bob's %.1f, a network-like "
                         "thread or its loopback %.1f, the server %.1f%s%s; then:",
                         l.name.c_str(), (ev.steady_ns - t_from) / 1e9, liveEventName(ev.kind),
                         static_cast<long long>(ev.value), worst[0], worst[1], worst[2], worst[3],
-                        both ? ", and so did the other listener" : "", machine ? "" : " (NO STALL BEFORE IT)");
-            for (const LiveEvent& e2 : l.events) {
+                        both ? ", and so did the other listener" : "",
+                        machine ? "" : setup.disturbed[i] ? " (the test's)" : " (NO STALL BEFORE IT)");
+            for (const LiveEvent& e2 : l.all) {
                 const double ms = (e2.steady_ns - ev.steady_ns) / 1e6;
                 if (ms > 0 && ms <= 100 && (e2.kind == LiveEventKind::Late || e2.kind == LiveEventKind::Rejoin ||
-                                            concealing(e2.kind)))
+                                            e2.kind == LiveEventKind::Fallback || concealing(e2.kind)))
                     printEvent(e2, ev.steady_ns);
             }
             std::printf("\n");
@@ -540,8 +686,20 @@ RunCounts toneRun(double ppm, double seconds) {
         for (int k = 1; k < 16; ++k)
             if (kinds[k]) std::printf(" %d %s;", kinds[k], liveEventName(static_cast<LiveEventKind>(k)));
         std::printf("\n");
+        for (const LiveEvent& ev : l.all)
+            if (ev.kind == LiveEventKind::Fallback)
+                std::printf("    %s's buffer fell back to %lld ms at %.3f s\n", l.name.c_str(),
+                            static_cast<long long>(ev.value), (ev.steady_ns - t_from) / 1e9);
+        std::printf("    %s plays the stream with a %d ms buffer%s (its streams start at %d ms)\n", l.name.c_str(),
+                    h.buffer_ms, h.fell_back ? ", fallen back" : "", h.start_ms);
         printCounters(l);
-        CHECK(res.median > 0.8 * kAmp && res.median < 1.2 * kAmp);
+        CHECK(res_d.median > 0.8 * kAmp && res_d.median < 1.2 * kAmp);
+        n.dips += h.n.dips;
+        n.dips_unexplained += h.n.dips_unexplained;
+        if (!setup.disturbed[i]) {
+            n.concealments += h.n.concealments;
+            n.concealments_unexplained += h.n.concealments_unexplained;
+        }
     }
     float worst[2] = {0, 0};
     for (int i = 0; i < 2; ++i)
@@ -563,20 +721,157 @@ RunCounts toneRun(double ppm, double seconds) {
                 "concealment), %d concealments (%d without a stall)\n",
                 worst[0], worst[1], static_cast<int>(r.plain_late.size()), kLateMs, loop_n, loop, srv_n, srv, n.dips,
                 n.dips_unexplained, n.concealments, n.concealments_unexplained);
-    return n;
+    return res;
 }
 
 }  // namespace
 
-// The clocks as one, 50 ppm and 200 ppm apart: a steady tone without a dip.
+// The clocks as one, 50 ppm and 200 ppm apart: a steady tone without a dip
+// (a fixed 20 ms buffer).
 TEST(steady_tone_without_dips) {
     std::vector<double> ppms = {0.0, 50.0, 200.0};
     if (const char* v = std::getenv("O11_TONE_PPM")) ppms = {std::atof(v)};
     for (double ppm : ppms) {
-        const RunCounts n = toneRun(ppm, g_seconds);
+        RunSetup setup;
+        setup.ppm = ppm;
+        setup.seconds = g_seconds;
+        const RunCounts n = toneRun(setup).n;
         CHECK(n.dips_unexplained == 0);
         CHECK(n.concealments_unexplained == 0);
     }
+}
+
+// The automatic buffer (6.8) on a clean stream: each stream stays at what
+// it started with (10 ms, or what this host's blocks need: 11 ms for 128
+// samples), and plays as steadily. A fallback here is the machine's only
+// if two of the concealments before it followed its stalls.
+TEST(automatic_buffer_stays_on_a_clean_stream) {
+    RunSetup setup;
+    setup.ppm = 50;
+    setup.seconds = 15;
+    setup.buffer_ms[0] = setup.buffer_ms[1] = Engine::kLiveBufferAutomatic;
+    const RunResult res = toneRun(setup);
+    CHECK(res.n.dips_unexplained == 0);
+    CHECK(res.n.concealments_unexplained == 0);
+    for (const Heard& h : res.heard) {
+        CHECK_EQ(h.start_ms, 11);                // 10 ms, raised for the host's 128-sample blocks
+        CHECK(fallbackIsTheMachines(h));
+        CHECK(h.count(LiveEventKind::Fallback) <= 1);
+    }
+}
+
+// bob's stream of alice falls back to 20 ms once, at its second late
+// dropout, while that dropout conceals: no dip begins in the second after
+// the audio is back (unless the machine stalled), and the dips before it
+// are its concealments. alice's of bob, clean, stays at its start.
+void checkOneFallback(const RunResult& res) {
+    const Heard& alice = res.heard[0];
+    const Heard& bob = res.heard[1];
+    CHECK(res.n.dips_unexplained == 0);
+    CHECK(res.n.concealments_unexplained == 0);  // alice's
+    CHECK(fallbackIsTheMachines(alice));
+    CHECK_EQ(bob.count(LiveEventKind::Fallback), 1);
+    CHECK_EQ(bob.buffer_ms, 20);
+    CHECK(bob.fell_back);
+    const std::int64_t tf = bob.first(LiveEventKind::Fallback);
+    // The fallback's own concealment ends where the stream's audio comes
+    // back (its rejoin): no new dip after that in the next second.
+    std::int64_t back = tf;
+    for (const LiveEvent& ev : bob.log)
+        if (ev.steady_ns >= tf && ev.kind == LiveEventKind::Rejoin) {
+            back = ev.steady_ns;
+            break;
+        }
+    int dips_after = 0;
+    for (std::int64_t t : bob.dip_ns) dips_after += t > back + 30000000LL && t <= back + 1000000000LL ? 1 : 0;
+    int n_before = 0, late_before = 0, n_after = 0, late_after = 0;
+    bob.spikesLate(bob.from_ns, tf, &n_before, &late_before);
+    bob.spikesLate(tf + 1, bob.to_ns, &n_after, &late_after);
+    std::printf("    bob: fell back %.3f s into the recording, its audio back %.1f ms later, %d dips in the second "
+                "after; before it %d of %d spikes came late, after it %d of %d\n",
+                (tf - bob.from_ns) / 1e9, (back - tf) / 1e6, dips_after, late_before, n_before, late_after, n_after);
+    CHECK(back - tf <= 100000000LL);
+    CHECK(dips_after == 0 || bob.excused(back, back + 1000000000LL) > 0);
+    CHECK(late_after * 4 <= n_after);            // and at 20 ms the spikes come in time
+}
+
+// A jittery stream: from the start of the recording, alice's link holds
+// her datagrams for 10 to 20 ms (15 +- 5) every 0.5 to 1.5 s, then sends
+// them at once.
+TEST(automatic_buffer_falls_back_on_jitter) {
+    RunSetup setup;
+    setup.seconds = 15;
+    setup.buffer_ms[0] = setup.buffer_ms[1] = Engine::kLiveBufferAutomatic;
+    setup.steps.push_back({0.0, [](ToneRoom& r) { r.startSpikes(0, 10, 20); }});
+    setup.disturbed[1] = true;
+    const RunResult res = toneRun(setup);
+    checkOneFallback(res);
+    const std::int64_t tf = res.heard[1].first(LiveEventKind::Fallback);
+    CHECK(tf >= res.heard[1].from_ns);
+}
+
+// Loss alone: bob loses 5% of the datagrams he receives (alice's stream
+// among them) for the whole recording. Most of the lost blocks are asked
+// for again and come in time; the others conceal, or come after their turn
+// (an answer a round trip late). A buffer doesn't fall back for any of
+// them.
+TEST(automatic_buffer_ignores_loss) {
+    RunSetup setup;
+    setup.seconds = 12;
+    setup.buffer_ms[0] = setup.buffer_ms[1] = Engine::kLiveBufferAutomatic;
+    setup.steps.push_back({0.0, [](ToneRoom& r) { r.side[1].e.setLiveTestLoss(0.05); }});
+    setup.disturbed[1] = true;
+    const RunResult res = toneRun(setup);
+    const Heard& bob = res.heard[1];
+    CHECK(res.n.dips_unexplained == 0);
+    CHECK(res.n.concealments_unexplained == 0);
+    CHECK(fallbackIsTheMachines(res.heard[0]));
+    std::printf("    bob: %u blocks came when asked for again, %u lost for good, %u late\n", bob.c.resent, bob.c.lost,
+                bob.c.late);
+    CHECK(bob.c.resent + bob.c.lost >= 40);      // about 120 of alice's blocks lost on the way in 12 s
+    CHECK(fallbackIsTheMachines(bob));
+}
+
+// A fixed buffer never falls back: bob's is 10 ms (11 for these blocks)
+// while alice's link is jittery (as above), so its stream of her has late
+// dropouts. Then bob goes automatic, and it falls back once.
+TEST(fixed_buffer_never_falls_back) {
+    RunSetup setup;
+    setup.seconds = 16;
+    setup.buffer_ms[0] = Engine::kLiveBufferAutomatic;
+    setup.buffer_ms[1] = 10;
+    setup.disturbed[1] = true;
+    LiveCounters fixed;
+    int fixed_buffer = -1, fixed_falls = -1;
+    bool fixed_fell = true, counted = false;
+    setup.steps.push_back({0.0, [](ToneRoom& r) { r.startSpikes(0, 10, 20); }});
+    setup.steps.push_back({8.0, [&](ToneRoom& r) {
+                               Side& b = r.side[1];
+                               b.collect();
+                               counted = b.e.liveUserCounters(0, &fixed);
+                               fixed_buffer = b.e.liveUserBufferInUseMs(0);
+                               fixed_fell = b.e.liveUserBufferFellBack(0);
+                               fixed_falls = 0;
+                               for (const LiveEvent& ev : b.all) fixed_falls += ev.kind == LiveEventKind::Fallback ? 1 : 0;
+                               CHECK(!b.e.liveBufferAutomatic());
+                               b.e.setLiveBufferAutomatic();
+                           }});
+    const RunResult res = toneRun(setup);
+    const Heard& bob = res.heard[1];
+    std::printf("    bob, fixed at 10 ms for 8 s: %u late, %.1f ms concealed, buffer %d ms, %d fallbacks; then "
+                "automatic: buffer %d ms, %d fallbacks\n",
+                fixed.late, fixed.concealed_frames / 48.0, fixed_buffer, fixed_falls, bob.buffer_ms,
+                bob.count(LiveEventKind::Fallback));
+    CHECK(res.n.dips_unexplained == 0);
+    CHECK(res.n.concealments_unexplained == 0);
+    CHECK(fallbackIsTheMachines(res.heard[0]));
+    CHECK(counted);
+    CHECK(fixed.late >= 2);                      // what would have fallen back
+    CHECK_EQ(fixed_buffer, 11);
+    CHECK(!fixed_fell);
+    CHECK_EQ(fixed_falls, 0);
+    checkOneFallback(res);
+    CHECK(bob.first(LiveEventKind::Fallback) > bob.from_ns + 8000000000LL);
 }
 
 int main(int argc, char** argv) {
