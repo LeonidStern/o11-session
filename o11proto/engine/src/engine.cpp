@@ -16,6 +16,10 @@ namespace engine {
 
 namespace {
 constexpr int kDownloadTimeoutSeconds = 8;
+// What the vectors the audio context pushes to hold from the start (decoders
+// to free, blocks to upload): they keep their capacity after that.
+constexpr std::size_t kGarbageReserve = 64;
+constexpr std::size_t kUploadReserve = 64;
 
 float clip1(float v) { return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v); }
 }  // namespace
@@ -41,6 +45,8 @@ void PlaybackResampler::advance(int srcRate, int dstRate, int len, int consumed)
 // ------------------------------------------------------------- lifecycle
 
 Engine::Engine() {
+    garbage_.reserve(kGarbageReserve);
+    garbage_spare_.reserve(kGarbageReserve);
     wireClient();
     liveInit();
 }
@@ -234,12 +240,15 @@ bool Engine::run() {
 }
 
 void Engine::collectGarbage() {
-    std::vector<std::unique_ptr<Decoder>> g;
+    // garbage_ and garbage_spare_ take turns. The one handed back to the
+    // audio context is empty but keeps its capacity, so its push_back there
+    // does not allocate; the decoders are freed here, outside the lock.
     {
         std::lock_guard<std::mutex> lock(remote_mutex_);
-        g.swap(garbage_);
+        if (garbage_.empty()) return;
+        garbage_.swap(garbage_spare_);
     }
-    g.clear();
+    garbage_spare_.clear();
 }
 
 // ------------------------------------------------------- local channels
@@ -252,6 +261,8 @@ void Engine::setLocalChannel(int index, const LocalChannel& settings) {
         auto it = locals_.find(index);
         if (it == locals_.end()) {
             it = locals_.emplace(index, std::make_unique<LocalState>()).first;
+            it->second->queue.reserve(kUploadReserve);
+            it->second->drained.reserve(kUploadReserve);
             announce = true;
         } else if (it->second->s.name != settings.name) {
             announce = true;
@@ -334,7 +345,6 @@ int Engine::uploadKbps(int index) const {
 
 bool Engine::uploadLoop() {
     bool any = false;
-    std::vector<UploadBlock> items;
     std::vector<std::pair<int, LocalState*>> chans;
     {
         std::lock_guard<std::mutex> lock(local_mutex_);
@@ -343,7 +353,10 @@ bool Engine::uploadLoop() {
     // Encoding happens without local_mutex_ held; a channel removed meanwhile
     // is only destroyed by removeLocalChannel in this same (control) context.
     for (auto& [index, ls] : chans) {
-        items.clear();
+        // queue and drained take turns: the queue gets back an empty vector
+        // that keeps its capacity, so the audio context's push_back does
+        // not allocate.
+        std::vector<UploadBlock>& items = ls->drained;
         {
             std::lock_guard<std::mutex> ql(ls->qm);
             items.swap(ls->queue);
@@ -351,9 +364,12 @@ bool Engine::uploadLoop() {
         if (items.empty()) continue;
         any = true;
         for (auto& b : items) processUploadItem(*ls, index, b);
-        std::lock_guard<std::mutex> ql(ls->qm);
-        for (auto& b : items)
-            if (!b.data.empty() && ls->spare.size() < kUploadQueueLimit) ls->spare.push_back(std::move(b.data));
+        {
+            std::lock_guard<std::mutex> ql(ls->qm);
+            for (auto& b : items)
+                if (!b.data.empty() && ls->spare.size() < kUploadQueueLimit) ls->spare.push_back(std::move(b.data));
+        }
+        items.clear();
     }
     return any;
 }
