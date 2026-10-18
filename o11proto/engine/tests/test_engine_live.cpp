@@ -27,6 +27,7 @@
 
 #include "check.h"
 #include "o11proto/engine.h"
+#include "o11proto/realtime.h"
 #include "o11proto/server.h"
 
 using namespace o11proto;
@@ -92,6 +93,7 @@ struct LiveRoom {
     // stream are made only when there was none.
     std::atomic<long> late_us{0}, late_blocks{0}, slow_us{0};
     std::atomic<long> hiccup_frame{-1};
+    std::atomic<int> host_audio_thread{-1};      // whether the host thread became an audio thread (realtime.h)
     std::thread audio;
 
     LiveRoom() {
@@ -104,8 +106,27 @@ struct LiveRoom {
         cfg.bpm = 120;
         cfg.bpi = 4;                             // 2 s intervals
         cfg.live.mode = LiveMode::On;
-        CHECK(server.start(cfg));
+        bool ok = server.start(cfg);
+        // Live's UDP port has the TCP port's number, which another program on
+        // the machine may hold: then another port.
+        for (int i = 0; ok && !server.liveUdpOpen() && i < 5; ++i) {
+            std::printf("    UDP port %u is taken: the server moves\n", server.port());
+            server.stop();
+            ok = server.start(cfg);
+        }
+        CHECK(ok);
+        static bool described = false;           // once a process: how this machine schedules threads
+        if (!described) {
+            described = true;
+            std::printf("    timing, the main thread: %s\n", thread::describe().c_str());
+            std::thread([] {
+                const bool ok = thread::makeAudioThread(static_cast<double>(kBlock) / kRate);
+                std::printf("    timing, an audio thread (%s): %s\n", ok ? "made" : "not made",
+                            thread::describe().c_str());
+            }).join();
+        }
         server_thread = std::thread([this] {
+            thread::makeLatencyCritical();
             while (!server_stop.load()) server.poll(1);
         });
         side[0].name = "alice";
@@ -126,8 +147,14 @@ struct LiveRoom {
         audio = std::thread([this] { audioLoop(); });
     }
     ~LiveRoom() {
-        std::printf("    the host: woke at most %.1f ms late (%ld blocks over 10 ms), the longest process() %.1f ms\n",
-                    late_us.load() / 1000.0, late_blocks.load(), slow_us.load() / 1000.0);
+        std::printf("    the host: woke at most %.1f ms late (%ld blocks over 10 ms; %s), the longest process() "
+                    "%.1f ms\n",
+                    late_us.load() / 1000.0, late_blocks.load(),
+                    host_audio_thread.load() == 1   ? "an audio thread"
+                    : host_audio_thread.load() == 0 ? "not an audio thread"
+                                                    : "not started",
+                    slow_us.load() / 1000.0);
+        for (Side& s : side) std::printf("    %s: %s\n", s.name.c_str(), s.e.liveTestTiming().c_str());
         audio_stop.store(true);
         audio.join();
         for (Side& s : side) s.e.disconnect();
@@ -143,6 +170,7 @@ struct LiveRoom {
         std::vector<float> in(kBlock), out[2][2];
         for (auto& o : out) o[0].assign(kBlock, 0.0f), o[1].assign(kBlock, 0.0f);
         const auto period = std::chrono::nanoseconds(1000000000LL * kBlock / kRate);
+        host_audio_thread.store(thread::makeAudioThread(static_cast<double>(kBlock) / kRate) ? 1 : 0);
         auto next = Clock::now();
         std::size_t burst = 0;
         while (!audio_stop.load()) {
@@ -373,8 +401,31 @@ TEST(live_off_falls_back_at_once) {
     const long b = r.switchFrom(1, block, true);
     REQUIRE(b > 0);
     CHECK(!r.boundaryIn(1, b));                  // in the middle of the interval
-    r.wait(2.5);
-    CHECK(r.peak(1, b * kBlock, 2.5) > 0.3f);    // the intervals play
+    // No interval audio was uploaded while the room was Live, nor in the
+    // interval the switch fell in (it began Live), so bob hears the intervals
+    // from the second boundary after the switch on: the players' first
+    // interval after Live.
+    auto boundaryAfter = [&](long from) {        // the first block after `from` with a boundary, or -1
+        for (long k = from + 1; k < r.frames.load() / kBlock; ++k)
+            if (r.boundaryIn(1, k)) return k;
+        return -1L;
+    };
+    long b2 = -1;
+    REQUIRE(r.until(
+        [&] {
+            const long b1 = boundaryAfter(b);
+            b2 = b1 < 0 ? -1 : boundaryAfter(b1);
+            return b2 > 0 && r.frames.load() >= b2 * kBlock + kRate / 2;
+        },
+        6));
+    const long from2 = b2 * kBlock + kBlock - r.side[1].pos[b2];   // the boundary's frame
+    long first = -1;                             // the first loud sample 100 ms on (after Live's fade-out)
+    for (long m = b * kBlock + kRate / 10; m < r.frames.load() && first < 0; ++m)
+        if (std::fabs(r.side[1].heard[m]) > 0.3f) first = m;
+    std::printf("    bob hears the intervals %.0f ms after the switch (%.0f ms into an interval), the second boundary "
+                "after it %.0f ms after it\n", first < 0 ? -1.0 : (first - b * kBlock) * 1000.0 / kRate,
+                r.side[1].pos[b] * 1000.0 / kRate, (from2 - b * kBlock) * 1000.0 / kRate);
+    CHECK(r.peak(1, from2, 0.5) > 0.3f);         // the intervals play
     CHECK(r.side[1].findNotice("Intervals may sound better", seen).empty());   // no advice when the room went off
     CHECK(!r.side[1].e.userLive(0) && !r.side[0].e.userLive(0));
     std::printf("    %s\n", r.side[1].findNotice("Live", seen).c_str());

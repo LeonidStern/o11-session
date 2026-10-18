@@ -817,6 +817,7 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
     const bool on = room_on.load() && running.load();
     const bool gate = on && may_send.load() && transmit && host_playing.load() && !host_offline.load() && l;
     sending.store(gate);
+    bool queued = false;                        // something for the network thread: wake it
     if (gap > 0 && gate_open_ && gate) {
         if (CaptureItem* c = capture.back()) {
             c->kind = CaptureItem::Gap;
@@ -824,12 +825,14 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
             c->gap = gap;
             c->frames = 0;
             capture.push();
+            queued = true;
         }
     }
     if (gate_open_ && !gate) {
         if (CaptureItem* c = capture.back()) {
             c->kind = CaptureItem::Stop;
             capture.push();
+            queued = true;
         }
     }
     if (gate) {
@@ -846,6 +849,7 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
                 c->data[2 * i + 1] = r[at + i];
             }
             capture.push();
+            queued = true;
         }
     }
     gate_open_ = gate;
@@ -894,9 +898,11 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
             q->gen = g;
             q->seq = seqs[i];
             requests.push();
+            queued = true;
         }
     }
     last_block_end_ns.store(now + dur);
+    if (queued) transport_.wake();
 }
 
 }  // namespace engine

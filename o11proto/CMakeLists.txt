@@ -30,6 +30,7 @@ add_library(o11proto STATIC
   src/live.cpp
   src/live_room.cpp
   src/live_transport.cpp
+  src/realtime.cpp
 )
 target_include_directories(o11proto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)                 # live::Transport's network thread

@@ -210,6 +210,24 @@ std::string dropoutsText(const std::string& who) {
     return (who.empty() ? std::string("Your connection") : who + "'s connection") +
            " has dropouts: Intervals may sound better (switch with /live off).";
 }
+// The first notice from `from` on that gives the advice `text` (one of the
+// above), also when it says that more players have trouble (", and 1 more
+// player has trouble" before the colon), as after one of the machine's
+// hiccups, when every player may have had dropouts; or "".
+std::string findAdvice(Side& s, const std::string& text, std::size_t from = 0) {
+    const std::size_t colon = text.find(": Intervals");
+    const std::string head = text.substr(0, colon), tail = text.substr(colon);
+    std::lock_guard<std::mutex> lock(s.m);
+    for (std::size_t i = from; i < s.notices.size(); ++i) {
+        const std::string& n = s.notices[i];
+        if (n.size() < head.size() + tail.size() || n.compare(0, head.size(), head) != 0 ||
+            n.compare(n.size() - tail.size(), tail.size(), tail) != 0)
+            continue;
+        const std::string mid = n.substr(head.size(), n.size() - head.size() - tail.size());
+        if (mid.empty() || mid.compare(0, 6, ", and ") == 0) return n;
+    }
+    return std::string();
+}
 
 std::string num3(double v) {
     char b[32];
@@ -293,7 +311,7 @@ void transitions(int rate, std::uint32_t codec, const std::string& label) {
     const std::size_t seen[2] = {r[0].noticeCount(), r[1].noticeCount()};
     REQUIRE(carol.join(r, "carol"));
     for (int i = 0; i < 2; ++i) {
-        CHECK(r.until([&] { return !r[i].findNotice(cantText("carol"), seen[i]).empty(); }, 3));
+        CHECK(r.until([&] { return !findAdvice(r[i], cantText("carol"), seen[i]).empty(); }, 3));
         CHECK(advised(r[i], Engine::LiveAdvice::CantLive, "carol"));
     }
     r.wait(3);
@@ -307,7 +325,7 @@ void transitions(int rate, std::uint32_t codec, const std::string& label) {
         CHECK(r.roomSwitch(i, b3, true) < 0);
     }
     std::printf("    the room stayed Live while carol was here; the advice: \"%s\"\n",
-                r[0].findNotice(cantText("carol")).c_str());
+                findAdvice(r[0], cantText("carol")).c_str());
     t.print(label.c_str());
     for (double l : levels) {
         std::printf("    %s: the same player live against through intervals: %+.2f dB\n", label.c_str(), l);
@@ -469,7 +487,7 @@ TEST(client_without_live_in_a_live_room) {
     REQUIRE(r.roomIs(true, 30, {0, 1}));
     CHECK(!r[2].e.liveRoomLive());
     for (int i = 0; i < 2; ++i) {
-        CHECK(r.until([&] { return !r[i].findNotice(cantText("carol")).empty(); }, 3));
+        CHECK(r.until([&] { return !findAdvice(r[i], cantText("carol")).empty(); }, 3));
         CHECK(advised(r[i], Engine::LiveAdvice::CantLive, "carol"));
     }
     std::printf("    %s: %s\n", r[0].name.c_str(), r[0].findNotice("carol").c_str());
@@ -603,10 +621,10 @@ TEST(gaps_give_advice_and_the_room_stays_live) {
         r[0].e.setLiveTestSendGap(150);
         r.wait(0.6);
     }
-    REQUIRE(r.until([&] { return !r[1].findNotice(dropoutsText("alice"), seen[1]).empty(); }, 6));
+    REQUIRE(r.until([&] { return !findAdvice(r[1], dropoutsText("alice"), seen[1]).empty(); }, 6));
     std::printf("    three gaps within 2 s: advice %.2f s after the first; bob: \"%s\"\n", r.ms(r.frames.load() - g3) / 1000,
-                r[1].findNotice(dropoutsText("alice"), seen[1]).c_str());
-    CHECK(r.until([&] { return !r[0].findNotice(dropoutsText(""), seen[0]).empty(); }, 2));
+                findAdvice(r[1], dropoutsText("alice"), seen[1]).c_str());
+    CHECK(r.until([&] { return !findAdvice(r[0], dropoutsText(""), seen[0]).empty(); }, 2));
     CHECK(advised(r[1], Engine::LiveAdvice::Dropouts, "alice"));
     CHECK(advised(r[0], Engine::LiveAdvice::Dropouts, "alice"));
 
@@ -625,7 +643,7 @@ TEST(gaps_give_advice_and_the_room_stays_live) {
     const std::size_t seen5 = r[1].noticeCount();
     const long g5 = r.frames.load();
     r[0].e.setLiveTestSendGap(1500);
-    REQUIRE(r.until([&] { return !r[1].findNotice(dropoutsText("alice"), seen5).empty(); }, 6));
+    REQUIRE(r.until([&] { return !findAdvice(r[1], dropoutsText("alice"), seen5).empty(); }, 6));
     std::printf("    a 1.5 s gap: advice %.2f s after it began\n", r.ms(r.frames.load() - g5) / 1000);
     r.until([&] { return r.frames.load() > g5 + 4L * o.rate; }, 5);
     const double before = toneAmplitude(x, g5 - 1100 * ms, g5 - 100 * ms, 500, o.rate);
@@ -697,7 +715,17 @@ TEST(slot_lost_mid_interval) {
                 r.ms(down - g), r.ms(quiet - g), r.ms(faded - g), loud, r.ms(loud_at - g), r.ms(back - g - gap),
                 back_step / std::max(1e-9, live.step), level, calm ? "" : " (the machine had a hiccup)");
     for (int i = 0; i < 2; ++i) CHECK(r.roomSwitch(i, g / kBlock, true) < 0);   // the room stays Live
-    CHECK(!r[1].findNotice(dropoutsText("alice"), seen).empty());
+    // The advice names alice; after a hiccup of the machine's (whose
+    // dropouts count for 10 s, 16.7) it may name another player.
+    const std::string named = findAdvice(r[1], dropoutsText("alice"), seen);
+    const bool calm_advice = r.calm(g - 11L * o.rate, r.frames.load());
+    if (named.empty()) {
+        std::printf("    no advice named alice%s; bob's notices since the gap:\n",
+                    calm_advice ? "" : " (the machine had a hiccup)");
+        std::lock_guard<std::mutex> lock(r[1].m);
+        for (std::size_t i = seen; i < r[1].notices.size(); ++i) std::printf("      %s\n", r[1].notices[i].c_str());
+    }
+    if (calm_advice) CHECK(!named.empty());
     if (calm) {
         CHECK(down > g && quiet > down);
         CHECK(r.ms(quiet - g) <= 250);          // the buffer, 80 ms of concealment, the 20 ms fade
@@ -905,10 +933,13 @@ TEST(listening_file) {
     o.live_on = false;                           // the room plays intervals first
     const char* which = std::getenv("O11PROTO_LISTENING");
     const bool tones = which && std::string(which) == "tones";
-    // The engines' interval clocks start after the first host block, so the
-    // pattern starts there: each bar is an interval, and its first kick
-    // falls on the boundary. (With the tones the drums only place the gaps.)
-    const Drums drums(o.rate, o.bpm, kBlock);
+    // The drums' pattern starts where the engines' interval clocks start
+    // (the first block after they connected, which is later on a slow
+    // machine): each bar is an interval, and its first kick falls on the
+    // boundary. Until then the players send silence. (With the tones the
+    // drums only place the gaps.) Both outlive the room, whose host reads them.
+    std::unique_ptr<const Drums> drums_made;
+    std::atomic<const Drums*> playing{nullptr};
     const Tones tone{o.rate};
     Room r(o, {"alice", "bob", "carl"});
     if (tones) {
@@ -919,10 +950,11 @@ TEST(listening_file) {
         r[0].signal = [&tone](long n, int) { return tone.player(0, n); };
         r[1].signal = [&tone](long n, int) { return tone.player(1, n); };
     } else {
-        std::printf("    the drums peak at %.1f dBFS\n", 20 * std::log10(drums.peak));
-        CHECK(drums.peak < 0.5f);                // under -6 dBFS
-        r[0].signal = [&drums](long n, int) { return drums.player(0, n); };
-        r[1].signal = [&drums](long n, int) { return drums.player(1, n); };
+        for (int p = 0; p < 2; ++p)
+            r[p].signal = [&playing, p](long n, int) {
+                const Drums* d = playing.load(std::memory_order_acquire);
+                return d ? d->player(p, n) : 0.0f;
+            };
     }
     LocalChannel lc;                             // carl listens: he sends nothing
     lc.name = "listen";
@@ -930,6 +962,18 @@ TEST(listening_file) {
     r[2].e.setLocalChannel(0, lc);
     r.startHost();
     REQUIRE(r.connect());
+    REQUIRE(r.until([&] { return r[0].clock_from >= 0 && r[1].clock_from >= 0 && r[2].clock_from >= 0; }, 3));
+    if (r[0].clock_from != r[2].clock_from || r[1].clock_from != r[2].clock_from)
+        std::printf("    the interval clocks started apart: alice at %ld, bob at %ld, carl at %ld (the drums at "
+                    "carl's)\n",
+                    r[0].clock_from.load(), r[1].clock_from.load(), r[2].clock_from.load());
+    drums_made.reset(new Drums(o.rate, o.bpm, r[2].clock_from.load()));
+    const Drums& drums = *drums_made;
+    playing.store(&drums, std::memory_order_release);
+    if (!tones) {
+        std::printf("    the drums peak at %.1f dBFS\n", 20 * std::log10(drums.peak));
+        CHECK(drums.peak < 0.5f);                // under -6 dBFS
+    }
     // The room's switch is off: it plays intervals. Once they have the
     // players' audio, alice types !live on, in the middle of an interval,
     // and the room goes Live at the boundary after.
@@ -998,7 +1042,9 @@ TEST(listening_file) {
         ev.push_back({r.frames.load(), "carl is advised: " + r[2].findNotice("dave can't play Live")});
     // (Others may have trouble too, after a hiccup of the machine's.)
     CHECK(r[2].e.liveAdviceReason() == Engine::LiveAdvice::CantLive && r[2].e.liveAdviceUser().find("dave") == 0);
-    waitUntil(live_at + 14L * o.rate - 30 * ms);   // before a boundary, so that the players upload from it
+    // Before a boundary, so that the players upload from it: 200 ms, for the
+    // switch to reach them in time on a slow machine too.
+    waitUntil(live_at + 14L * o.rate - 200 * ms);
     const long bo = r.block();
     ev.push_back({r.frames.load(), "alice types !live off"});
     CHECK(r[0].e.liveCommand("/live off"));
