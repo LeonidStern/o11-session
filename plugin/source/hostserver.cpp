@@ -86,9 +86,10 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
   cfg.log = [this](const std::string &line) { onLog(line); };
 
   // Live (real-time audio over UDP, on the TCP port's number): first a port whose UDP is free
-  // too, then any port without Live. The room starts with Live on; the whole room still plays
-  // intervals while anyone's connection or client isn't good enough for it.
+  // too, then any port without Live. The room starts with Live on.
   cfg.live.mode = env_is_off("O11_LIVE") ? o11proto::LiveMode::No : o11proto::LiveMode::Require;
+  // benchmarks: the room's Live Opus frame in samples at 48 kHz (120, 240 or 480; others: the default)
+  if (const char *v = getenv("O11_HOST_FRAME")) cfg.live.frame = atoi(v);
   std::unique_ptr<o11proto::Server> server(new o11proto::Server);
   int port = 0;
   const char *fixedPort = getenv("O11_HOST_PORT"); // the tests: 0 for any free port
