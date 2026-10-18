@@ -21,6 +21,7 @@ constexpr double kMaxSpeedChange = 0.005;
 constexpr double kFillSmoothing = 0.5;                // seconds
 constexpr double kFillSettle = 1.0;                   // seconds of playing before the level is taken
 constexpr double kFillDeadBand = 0.002;               // seconds around it
+constexpr double kSpeedEpisodeGap = 1.0;              // seconds at the clock's own speed that end a correction (the log)
 
 int ceilDiv(double a, double b) { return static_cast<int>(std::ceil(a / b - 1e-9)); }
 
@@ -39,6 +40,18 @@ void SinkStats::clear(std::uint32_t g) {
     buffer_us.store(-1);
     fill_us.store(-1);
     block.store(0);
+    late.store(0);
+    late_missed.store(0);
+    concealed48.store(0);
+    skips.store(0);
+    host_gaps.store(0);
+    speed_changes.store(0);
+    skipped48.store(0);
+    host_gap48.store(0);
+    speed_moved_ns.store(0);
+    speed_ppm.store(0);
+    for (Event& e : events) e.mark.store(0);
+    events_n.store(0);
     gen.store(g);
 }
 
@@ -334,7 +347,12 @@ void LiveSink::reset() {
     // After a stream, what was decoded plays out, then the concealment
     // goes on from there, so that the mixer can fade it out without a step.
     const bool tail = phase_ != Idle || tail48_ > 0;
-    if (phase_ != Idle) startTail();
+    if (phase_ != Idle) {
+        startTail();
+        event(last_ns_, LiveEventKind::End, 0);
+    }
+    started_ = false;
+    speed_on_ = false;
     phase_ = Idle;
     stopping_ = false;
     for (int i = 0; i < kRing; ++i) ring_[i].state = Empty;
@@ -397,6 +415,7 @@ void LiveSink::take(std::int32_t seq, const SinkItem& it, std::int64_t now_ns) {
 }
 
 void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
+    last_ns_ = now_ns;
     switch (it.kind) {
     case SinkItem::Start:
         block_ = it.block;
@@ -404,7 +423,12 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         opus_decoder_ctl(dec_, OPUS_RESET_STATE);
         fresh_ = it.seq == 0;                    // as its encoder began, unless it began before
         concealer_->clear();                     // a new stream: nothing to go on from
+        for (int i = 0; i < kRing; ++i) ring_[i].state = Empty;
         emptyFrom(it.seq);
+        event(now_ns, LiveEventKind::Stream, it.seq);
+        if (phase_ != Idle && started_) event(now_ns, LiveEventKind::End, 0);
+        started_ = false;
+        speed_on_ = false;
         phase_ = Buffering;
         stopping_ = false;
         waited_ = 0;
@@ -420,6 +444,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         stopping_ = true;
         if (phase_ == Dry || (phase_ == Buffering && heldBlocks() == 0)) {
             phase_ = Idle;                       // the stream ended; not an underrun
+            event(now_ns, LiveEventKind::End, 0);
             startTail();
             stats.active.store(false);
         } else if (phase_ == Buffering) {
@@ -436,7 +461,16 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
     if (phase_ == Idle || it.len > aoo::kMaxBlockBytes) return;
     std::int32_t seq = it.seq;
     if (seq < next_) {                           // at or before the last block played
-        if (last_played_ - seq < (1LL << 30)) return;   // old
+        if (last_played_ - seq < (1LL << 30)) {  // old: late if its turn was concealed
+            Entry& e = ring_[seq & (kRing - 1)];
+            if (e.seq == seq && e.state == Passed) {
+                e.state = Empty;
+                stats.late.fetch_add(1);
+                stats.late_missed.fetch_add(1);
+                event(now_ns, LiveEventKind::Late, lateUs(seq));
+            }
+            return;
+        }
         emptyFrom(seq);                          // the stream wrapped
         has_align_ = realign_ = false;          // and its turns are counted afresh
     }
@@ -451,6 +485,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         // the rest waits for its turn. Only a stream more than the capacity
         // ahead of it buffers afresh.
         realign_ = has_align_ && seq - turn() <= room();
+        if (!realign_) event(now_ns, LiveEventKind::Rebuffer, seq);
         has_align_ = realign_;
         late48_ = 0;
     }
@@ -458,6 +493,9 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         if (it.kind == SinkItem::Xrun) {         // but it still tells of the sender's gap (6.4)
             if (played48_ - last_xrun48_ > 4800) stats.xrun_gaps.fetch_add(1);
             last_xrun48_ = played48_;
+        } else {
+            stats.late.fetch_add(1);
+            event(now_ns, LiveEventKind::Late, lateUs(seq));
         }
         dropBefore(static_cast<std::int64_t>(seq) + 1);
         return;
@@ -479,6 +517,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         return;
     }
     stats.overruns.fetch_add(1);                 // no room: only this block is kept
+    event(now_ns, LiveEventKind::Overflow, seq);
     stats.active.store(false);
     emptyFrom(seq);
     phase_ = Buffering;
@@ -487,7 +526,25 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
     take(seq, it, now_ns);
 }
 
-void LiveSink::conceal() { concealer_->next(fifo_, block_); }
+void LiveSink::conceal() {
+    concealer_->next(fifo_, block_);
+    if (started_ && phase_ != Idle) stats.concealed48.fetch_add(static_cast<std::uint64_t>(block_), std::memory_order_relaxed);
+}
+
+std::int64_t LiveSink::lateUs(std::int64_t seq) const {
+    const std::int64_t at48 = played48_ - (fifo_n_ - fifo_at_);   // where playback is now
+    return std::max<std::int64_t>(0, at48 - (align_ + seq * block_)) * 1000 / 48;
+}
+
+void LiveSink::started(std::int64_t now_ns, std::int64_t value, bool rejoin) {
+    phase_ = Playing;
+    started_ = true;
+    event(now_ns, rejoin ? LiveEventKind::Rejoin : LiveEventKind::Play, value);
+    stats.lost_at_active.store(stats.lost.load());
+    stats.resent_at_active.store(stats.resent.load());
+    stats.active_since_ns.store(now_ns);
+    stats.active.store(true);
+}
 
 // The audio comes back after concealment. The stream's encoder codes each
 // frame's energies from those of the frame before (and filters by the pitch
@@ -523,14 +580,17 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
         const int held = heldBlocks();
         if (realign_) {                          // after running dry: back on its delay
             const std::int64_t due = turn();
+            for (std::int64_t s = next_; s < due && s <= newest_ && s < next_ + kRing; ++s) {
+                const Entry& e = ring_[s & (kRing - 1)];
+                if (e.seq == s && e.state == Full) {
+                    stats.late.fetch_add(1);
+                    event(now_ns, LiveEventKind::Late, lateUs(s));
+                }
+            }
             dropBefore(std::min(due, newest_ + 1));   // what is too late for its turn goes
             if (next_ == due && next_ <= newest_) {
                 realign_ = false;
-                phase_ = Playing;                // and the fill it keeps stays the one it settled at
-                stats.lost_at_active.store(stats.lost.load());
-                stats.resent_at_active.store(stats.resent.load());
-                stats.active_since_ns.store(now_ns);
-                stats.active.store(true);
+                started(now_ns, next_, true);    // and the fill it keeps stays the one it settled at
             } else if (newest_ < due && behind48_ < block_ && (late48_ += block_) >= sizes_.latency48) {
                 // Late for good (its sender's host stopped, say): it buffers
                 // afresh, on a delay of its own. The stream has jumped back,
@@ -538,6 +598,7 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
                 // While this host catches up on a stall of its own, the
                 // turns go by faster than the stream can come: not late.
                 stats.overruns.fetch_add(1);
+                event(now_ns, LiveEventKind::Rebuffer, due);
                 realign_ = has_align_ = false;
                 waited_ = 0;
             }
@@ -552,15 +613,16 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
                 for (std::int64_t s = next_; s < next_ + skip; ++s) ring_[s & (kRing - 1)].state = Empty;
                 next_ += skip;
                 last_played_ = next_ - 1;
+                if (started_) {                  // buffering again: the position jumps
+                    stats.skips.fetch_add(1);
+                    stats.skipped48.fetch_add(skip * block_);
+                    event(now_ns, LiveEventKind::Skip, skip * block_);
+                }
             }
             const int buffered = std::min(std::max(0, heldBlocks() * block_ - behind48_), waited_);
             stats.buffer_us.store(static_cast<std::int32_t>(static_cast<std::int64_t>(buffered) * 1000000 / 48000));
-            phase_ = Playing;
             fill_ = -1;                          // a new estimate, of the fill it already keeps once it has one
-            stats.lost_at_active.store(stats.lost.load());
-            stats.resent_at_active.store(stats.resent.load());
-            stats.active_since_ns.store(now_ns);
-            stats.active.store(true);
+            started(now_ns, stats.buffer_us.load(), false);
         }
         if (phase_ == Buffering) {
             if (!realign_ && waited_ >= 4 * sizes_.latency48) {   // gives up: an underrun, and waits again
@@ -591,12 +653,14 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
             stats.active.store(false);
             if (stopping_) {
                 phase_ = Idle;
+                event(now_ns, LiveEventKind::End, 0);
                 startTail();
                 conceal();
                 tail48_ -= block_;
                 break;
             }
             phase_ = Dry;
+            event(now_ns, LiveEventKind::Dry, next_);
             conceal();
             break;
         }
@@ -618,15 +682,20 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
                 else
                     concealer_->played(fifo_, block_);
             }
+            e.state = Empty;
         } else if (e.seq == next_ && e.state == XrunBlock) {
             conceal();
             if (played48_ - last_xrun48_ > 4800) stats.xrun_gaps.fetch_add(1);   // one gap per 100 ms
             last_xrun48_ = played48_;
+            event(now_ns, LiveEventKind::Xrun, next_);
+            e.state = Empty;
         } else {
-            conceal();                           // lost for good
+            conceal();                           // lost, unless it comes after all (late)
             stats.lost.fetch_add(1);
+            event(now_ns, LiveEventKind::Lost, next_);
+            e.seq = static_cast<std::int32_t>(next_);
+            e.state = Passed;
         }
-        e.state = Empty;
         last_played_ = next_;
         ++next_;
         break;
@@ -638,7 +707,7 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
     played48_ += block_;
 }
 
-void LiveSink::hostGap(int host_frames, int host_rate) {
+void LiveSink::hostGap(int host_frames, int host_rate, std::int64_t now_ns) {
     if (phase_ == Idle || host_rate <= 0) return;
     // What is left of the block decoded last goes, and whole blocks, to
     // the nearest of the time the host missed: the delay stays, and so
@@ -653,9 +722,15 @@ void LiveSink::hostGap(int host_frames, int host_rate) {
     if (newest_ < next_ - 1) newest_ = next_ - 1;
     align_ -= n * block_;                        // the time the host missed: the delay stays
     if ((n > 0 || rest > 0) && phase_ == Playing) concealer_->cut();   // the stream jumps: joined over
+    if (started_) {
+        stats.host_gaps.fetch_add(1);
+        stats.host_gap48.fetch_add(n * block_ + rest);
+        event(now_ns, LiveEventKind::HostGap, n * block_ + rest);
+    }
 }
 
 bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
+    last_ns_ = now_ns;
     first_real_ = -1;
     quiet_from_ = 0;
     if (phase_ == Idle && tail48_ <= 0) {
@@ -663,6 +738,8 @@ bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
         return false;
     }
     double step = 48000.0 / rate;
+    double speed = 0;                            // off the clock's own speed
+    double error = 0;
     if (phase_ == Playing) {                     // the speed follows the fill (6.9)
         // While the host catches up on a stall, the stream that came
         // meanwhile isn't fill: it is what the host has yet to play. And
@@ -689,16 +766,41 @@ bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
         if (fill_ >= 0 && fill_ref_ >= 0 && fill_age_ >= kFillSmoothing) {
             const double e = fill_ - fill_ref_;  // within the dead band the fill's own jitter changes nothing
             const double off = e > kFillDeadBand ? e - kFillDeadBand : (e < -kFillDeadBand ? e + kFillDeadBand : 0.0);
-            step *= 1.0 + std::max(-kMaxSpeedChange, std::min(kMaxSpeedChange, kFillGain * off));
+            speed = std::max(-kMaxSpeedChange, std::min(kMaxSpeedChange, kFillGain * off));
+            error = e;
+            step *= 1.0 + speed;
         }
         stats.fill_us.store(fill_ >= 0 ? static_cast<std::int32_t>(std::lround(fill_ * 1e6)) : -1);
     } else {
         stats.fill_us.store(-1);
     }
+    // The log's speed corrections: one from the speed leaving the clock's
+    // own to a second after it last came back (at the dead band's edge it
+    // comes and goes).
+    if (speed != 0) {
+        speed_idle_ = 0;
+        if (!speed_on_) {
+            speed_on_ = true;
+            speed_peak_ = 0;
+            stats.speed_changes.fetch_add(1);
+            event(now_ns, LiveEventKind::SpeedOn, std::lround(error * 1e6));
+        }
+    } else if (speed_on_ && (speed_idle_ += static_cast<double>(frames) / rate) >= kSpeedEpisodeGap) {
+        speed_on_ = false;
+        event(now_ns, LiveEventKind::SpeedOff, std::lround(speed_peak_ * 1e6));
+    }
+    if (speed != 0) {
+        if (std::fabs(speed) > std::fabs(speed_peak_)) speed_peak_ = speed;
+        speed_moved_ns_ += speed * frames * 1e9 / rate;   // whole ns to the count, the rest carried
+        const double whole = std::trunc(speed_moved_ns_);
+        speed_moved_ns_ -= whole;
+        stats.speed_moved_ns.fetch_add(static_cast<std::int64_t>(whole), std::memory_order_relaxed);
+    }
+    stats.speed_ppm.store(static_cast<std::int32_t>(std::lround(speed * 1e6)), std::memory_order_relaxed);
     for (int i = 0; i < frames; ++i) {
         while (t_ >= 1.0) {
             t_ -= 1.0;
-            if (fifo_at_ >= fifo_n_) decodeNext(now_ns);
+            if (fifo_at_ >= fifo_n_) decodeNext(now_ns + static_cast<std::int64_t>(i) * 1000000000LL / rate);
             for (int c = 0; c < 2; ++c) {
                 x_[0][c] = x_[1][c];
                 x_[1][c] = x_[2][c];

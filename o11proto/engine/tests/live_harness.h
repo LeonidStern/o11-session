@@ -83,9 +83,10 @@ struct Room {
     // audio can arrive; the checks that need a steady stream skip them.
     // The audio thread's wakes don't show every hiccup (it runs as an audio
     // thread, o11proto/realtime.h, as a host's does), so a thread scheduled
-    // as the Live network threads are (thread::makeLatencyCritical()) watches
-    // too: when it wakes that late, they may have been as late, and a
-    // listener's buffer ran dry.
+    // as the server's is (thread::makeLatencyCritical(), as the Live network
+    // threads were before they became network threads, real-time on macOS)
+    // watches too: when it wakes that late, the server may have been as
+    // late, and a listener's buffer ran dry.
     std::atomic<long> late_us{0}, late_blocks{0}, slow_us{0}, sum_us{0}, calls{0}, slow_calls{0};
     std::atomic<long> plain_late_us{0}, plain_late_count{0};
     std::atomic<int> host_audio_thread{-1};      // whether the host thread became an audio thread
@@ -156,6 +157,14 @@ struct Room {
         std::thread([] {
             const bool ok = thread::makeLatencyCritical();
             std::printf("    timing, a latency-critical thread (%s): %s\n", ok ? "made" : "not made",
+                        thread::describe().c_str());
+        }).join();
+        std::thread([] {
+            const thread::NetworkScheduling n = thread::makeNetworkThread();
+            std::printf("    timing, a network thread (%s): %s\n",
+                        n == thread::NetworkScheduling::Realtime          ? "real-time"
+                        : n == thread::NetworkScheduling::LatencyCritical ? "latency-critical"
+                                                                          : "not made",
                         thread::describe().c_str());
         }).join();
     }

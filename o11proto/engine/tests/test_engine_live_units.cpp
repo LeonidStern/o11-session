@@ -2,6 +2,7 @@
 // spec 5.4-5.6), the sink's buffer rules (5.9, tests 40 and 41 at unit
 // level), the sizes and buffer figures of 6.8, names and the /live texts
 // that need no connection.
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <random>
@@ -310,6 +311,99 @@ TEST(sink_underrun_and_buffer_figure) {         // 5.9, 6.10 (test 43's bound at
     std::printf("    buffer figure after a burst %d ms\n", figure_ms);
     CHECK(figure_ms >= 20 && figure_ms <= 20 + 5 + 6);
     CHECK(p.sink.heldBlocks() <= p.sink.sizes().latency_blocks);
+}
+
+// The counts and the log a plug-in reads (Engine::liveUserCounters(),
+// liveUserEvents()): a block missing at its turn is lost, and late when it
+// comes after all; running dry, the blocks that come after their turn are
+// late, and the stream comes back on its delay; the concealment is counted
+// once the stream has played; the ring keeps the latest 64 events.
+TEST(sink_counters_and_log) {
+    int err = 0;
+    OpusEncoder* enc = opus_encoder_create(48000, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+    REQUIRE(enc != nullptr);
+    std::vector<float> pcm(2 * 240);
+    long n = 0;
+    auto block = [&](std::int32_t seq) {        // a 440 Hz tone, block `seq`
+        for (int i = 0; i < 240; ++i, ++n) pcm[2 * i] = pcm[2 * i + 1] = 0.3f * std::sin(2 * M_PI * 440.0 * n / 48000);
+        SinkItem it = item(SinkItem::Data, seq);
+        it.len = static_cast<std::uint16_t>(opus_encode_float(enc, pcm.data(), 240, it.data, 1275));
+        return it;
+    };
+    std::vector<SinkItem> blocks;
+    for (int s = 0; s < 80; ++s) blocks.push_back(block(s));
+    opus_encoder_destroy(enc);
+    auto kinds = [](const LiveSink& k, std::uint32_t from) {
+        std::vector<LiveEventKind> v;
+        for (std::uint32_t i = from; i < k.stats.events_n.load(); ++i) {
+            std::int64_t ns = 0, value = 0;
+            std::uint8_t kind = 0;
+            if (k.stats.readEvent(i, &ns, &kind, &value)) v.push_back(static_cast<LiveEventKind>(kind));
+        }
+        return v;
+    };
+    auto has = [](const std::vector<LiveEventKind>& v, LiveEventKind k) {
+        return std::find(v.begin(), v.end(), k) != v.end();
+    };
+    LiveSink k;
+    k.configure(20, 240, 48000);
+    std::vector<float> out(2 * 240);
+    std::int64_t now = 1000;
+    k.apply(item(SinkItem::Start, 0), now);
+    std::int32_t s = 0;
+    for (; s < 20; ++s, now += 5000000) {        // real time
+        k.apply(blocks[static_cast<std::size_t>(s)], now);
+        k.render(out.data(), 240, 48000, now);
+    }
+    REQUIRE(k.playing());
+    CHECK(has(kinds(k, 0), LiveEventKind::Stream) && has(kinds(k, 0), LiveEventKind::Play));
+    CHECK_EQ(k.stats.concealed48.load(), 0u);    // the buffering before it played isn't counted
+    // Block 20 doesn't come in time: lost, concealed; then it comes, late.
+    std::uint32_t e0 = k.stats.events_n.load();
+    for (int i = 0; i < 8; ++i, ++s, now += 5000000) {
+        if (s != 20) k.apply(blocks[static_cast<std::size_t>(s)], now);
+        k.render(out.data(), 240, 48000, now);
+    }
+    CHECK_EQ(k.stats.lost.load(), 1u);
+    CHECK_EQ(k.stats.concealed48.load(), 240u);
+    k.apply(blocks[20], now);
+    CHECK_EQ(k.stats.late.load(), 1u);
+    CHECK_EQ(k.stats.late_missed.load(), 1u);    // so not lost after all
+    std::vector<LiveEventKind> v = kinds(k, e0);
+    CHECK(has(v, LiveEventKind::Lost) && has(v, LiveEventKind::Late));
+    // A stall of the sender's: dry, its blocks late, back on its delay.
+    e0 = k.stats.events_n.load();
+    for (int i = 0; i < 8; ++i, now += 5000000) k.render(out.data(), 240, 48000, now);
+    CHECK(!k.playing());
+    for (int i = 0; i < 9; ++i) k.apply(blocks[static_cast<std::size_t>(s + i)], now);   // they all come at once
+    s += 9;
+    for (int i = 0; i < 6; ++i, ++s, now += 5000000) {
+        k.render(out.data(), 240, 48000, now);
+        k.apply(blocks[static_cast<std::size_t>(s)], now);
+    }
+    CHECK(k.playing());
+    v = kinds(k, e0);
+    CHECK(has(v, LiveEventKind::Dry) && has(v, LiveEventKind::Late) && has(v, LiveEventKind::Rejoin));
+    CHECK(!has(v, LiveEventKind::Rebuffer) && !has(v, LiveEventKind::Skip));
+    CHECK_EQ(k.stats.underruns.load(), 1u);
+    CHECK(k.stats.late.load() >= 1u + 4u);
+    std::printf("    %u late, %u lost (%u came late), %.1f ms concealed, %u underruns\n", k.stats.late.load(),
+                k.stats.lost.load(), k.stats.late_missed.load(), k.stats.concealed48.load() / 48.0,
+                k.stats.underruns.load());
+    // The ring: the latest 64 of them; an older one reads as gone.
+    SinkStats st;
+    for (int i = 0; i < 100; ++i) st.event(i, static_cast<std::uint8_t>(LiveEventKind::Lost), i);
+    std::int64_t ns = 0, value = 0;
+    std::uint8_t kind = 0;
+    CHECK(!st.readEvent(35, &ns, &kind, &value));
+    REQUIRE(st.readEvent(36, &ns, &kind, &value));
+    CHECK(ns == 36 && value == 36 && kind == static_cast<std::uint8_t>(LiveEventKind::Lost));
+    CHECK(st.readEvent(99, &ns, &kind, &value) && value == 99);
+    st.clear(2);
+    CHECK(!st.readEvent(99, &ns, &kind, &value));
+    CHECK_EQ(st.events_n.load(), 0u);
+    CHECK(std::string(liveEventName(LiveEventKind::Late)) == "late");
+    CHECK(std::string(liveEventName(LiveEventKind::SpeedOff)) == "speed off");
 }
 
 TEST(sink_keeps_its_delay_after_a_gap) {        // 16.6: back in time with the other players

@@ -463,6 +463,46 @@ TEST(sends_and_closing) {                      // send() from the network thread
     CHECK(d.size() == live::kClientHeader + 1 && d[20] == 0xFF && live::getLE32(&d[16]) == 0);
 }
 
+// A longer housekeeping wait: alone, a pass every `wait_ms`; with a host
+// that wakes it, a pass for each wake, and the wake-up delay measured.
+TEST(housekeeping_wait_and_wakes) {
+    FakeRelay r;
+    std::atomic<int> ticks{0};                 // before t: its callbacks use it until it stops
+    live::Transport t;
+    t.on_tick = [&] { ticks.fetch_add(1); };
+    live::Transport::Options o = fakeOptions(r);
+    o.wait_ms = 20;
+    std::string err;
+    REQUIRE(t.start(o, err));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const int t0 = ticks.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const int alone = ticks.load() - t0;
+    int woken = 0;
+    {
+        Waker host({&t});
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const int t1 = ticks.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        woken = ticks.load() - t1;
+    }
+    const live::Transport::Timing tm = t.timing();
+    t.stop();
+    std::printf("    in 200 ms: %d passes alone, %d woken every 0.5 ms; %llu wakes, the longest wake-up delay %.2f ms "
+                "(%llu over 5 ms); waits of %d ms, the longest %.1f ms\n",
+                alone, woken, static_cast<unsigned long long>(tm.wakes), tm.wake_longest_ms,
+                static_cast<unsigned long long>(tm.wake_over_5ms), tm.wait_ms, tm.longest_ms);
+#ifdef _WIN32
+    CHECK_EQ(tm.wait_ms, 1);                   // wake() does nothing here: every millisecond
+#else
+    CHECK_EQ(tm.wait_ms, 20);
+    CHECK(alone >= 3 && alone <= 20);          // about 10, the hello's reply aside
+    CHECK(woken >= 4 * alone);
+    CHECK(tm.wakes >= 20);
+    CHECK(tm.wake_longest_ms >= 0 && tm.wake_longest_ms < 1000);
+#endif
+}
+
 TEST(stop_ends_the_callbacks) {                // what an owner relies on, through restarts while data pours in
     FakeRelay r;
     std::atomic<bool> pour{true}, stopped{false};   // before t: its callbacks use them until it stops

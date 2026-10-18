@@ -55,6 +55,56 @@ inline void panGains(float pan, float* left, float* right) {
     *right = pan < 0 ? 1.0f + pan : 1.0f;
 }
 
+// Live, per user, for a UI or a log (Engine::liveUserCounters(),
+// Engine::liveUserEvents()): what the user's stream did here since the
+// user's Live slot got its stream. Blocks are the stream's frames (5 ms at
+// the default); frames are at 48 kHz.
+struct LiveCounters {
+    std::uint32_t late = 0;                      // blocks that came after their turn to play, unplayed
+    std::uint32_t lost = 0;                      // blocks missing at their turn that never came (so far)
+    std::uint64_t concealed_frames = 0;          // concealment played once the stream had played
+    std::uint32_t underruns = 0;                 // times it ran dry
+    std::uint32_t overflows = 0;                 // times it had no room, or was late for good: buffered afresh
+    std::uint32_t xrun_gaps = 0;                 // the sender's host missed time (6.4)
+    std::uint32_t resent = 0;                    // blocks that came when asked for again
+    // Corrections that moved the playback position: jumps when it buffered
+    // afresh (blocks skipped), this host's own gaps (the stream skipped by
+    // as much), and the speed leaving the clock's own to bring the fill back
+    // (how often, how far it moved the stream in all, + ahead, and the
+    // speed now, + faster).
+    std::uint32_t skips = 0;
+    std::int64_t skipped_frames = 0;
+    std::uint32_t host_gaps = 0;
+    std::int64_t host_gap_frames = 0;
+    std::uint32_t speed_changes = 0;
+    double speed_moved_ms = 0;
+    double speed_ppm = 0;
+    double fill_ms = -1;                         // as liveUserBufferMs()
+};
+enum class LiveEventKind : std::uint8_t {
+    None = 0,
+    Stream,                                      // a new stream (value: its first block's sequence)
+    Play,                                        // playback began after buffering (value: µs buffered)
+    Late,                                        // a block came after its turn, unplayed (value: µs after it)
+    Lost,                                        // a block missing at its turn: concealed (value: its sequence)
+    Dry,                                         // nothing at a block's turn: concealed (value: its sequence)
+    Rejoin,                                      // after running dry, back on its delay (value: the block played)
+    Overflow,                                    // a block with no room: buffers afresh (value: its sequence)
+    Rebuffer,                                    // late for good after running dry: buffers afresh
+    Skip,                                        // the position jumped ahead (value: frames)
+    HostGap,                                     // this host missed time: the stream skipped (value: frames)
+    Xrun,                                        // the sender's host missed time: concealed (value: its sequence)
+    SpeedOn,                                     // the speed left the clock's own (value: the fill's error, µs)
+    SpeedOff,                                    // and has been back for 1 s (value: the furthest it went, ppm)
+    End,                                         // the stream ended or went
+};
+const char* liveEventName(LiveEventKind kind);   // "late", "lost", ...
+struct LiveEvent {
+    std::int64_t steady_ns = 0;                  // std::chrono::steady_clock, ns since its epoch
+    LiveEventKind kind = LiveEventKind::None;
+    std::int64_t value = 0;
+};
+
 struct LiveLayer;                                 // Live mode's state (engine/src/live_layer.h)
 struct LiveMix;                                   // a user's channel 0 in the Live mixer (same header)
 
@@ -227,6 +277,11 @@ public:
     // without a round trip yet).
     double liveUserBufferMs(int user) const;
     double liveUserHeardMs(int user) const;
+    // The counts of LiveCounters for this user's stream, false (and `out`
+    // untouched) without one; and its latest events (at most 64, the
+    // oldest first, at most `max`). Any context, lock-free with the audio.
+    bool liveUserCounters(int user, LiveCounters* out) const;
+    std::vector<LiveEvent> liveUserEvents(int user, std::size_t max = 64) const;
     void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
     void setLiveTestSendGap(int ms);            // test hook: the Live data sent in the next `ms` is lost
     void setLiveTestSendHold(int ms);           // test hook: ... is held back, then sent all at once
@@ -234,8 +289,8 @@ public:
     // block) where this user's live audio last went into concealment, -1
     // for never.
     long liveTestConcealedFrom(int user) const;
-    // For diagnostics: the Live network thread's scheduling and timed waits
-    // (live::Transport::timing()), one line.
+    // For diagnostics: the Live network thread's scheduling, its longest
+    // wake-up delay and its timed waits (live::Transport::timing()), one line.
     std::string liveTestTiming() const;
 
 private:

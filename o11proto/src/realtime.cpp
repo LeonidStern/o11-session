@@ -60,6 +60,13 @@ bool makeLatencyCritical() {
 #endif
 }
 
+NetworkScheduling makeNetworkThread() {
+#if defined(__APPLE__)
+    if (makeAudioThread(kNetworkPeriodSeconds)) return NetworkScheduling::Realtime;
+#endif
+    return makeLatencyCritical() ? NetworkScheduling::LatencyCritical : NetworkScheduling::Unchanged;
+}
+
 namespace {
 
 #if defined(__APPLE__)

@@ -127,13 +127,19 @@ void Engine::setLiveTestSendHold(int ms) { live_->setTestSendHold(ms); }
 
 std::string Engine::liveTestTiming() const {
     const live::Transport::Timing t = live_->networkTiming();
-    char b[256];
+#if defined(__APPLE__)
+    const char* plain = "user-interactive QoS";
+#else
+    const char* plain = "the least timer slack";
+#endif
+    char b[384];
     std::snprintf(b, sizeof(b),
-                  "the Live network thread: %s; %llu timed waits of 1 ms ran out, the longest %.1f ms, %llu over 5 ms; "
-                  "woken %llu times",
-                  t.latency_critical ? "user-interactive QoS" : "its QoS unchanged",
-                  static_cast<unsigned long long>(t.timeouts), t.longest_ms,
-                  static_cast<unsigned long long>(t.over_5ms), static_cast<unsigned long long>(t.wakes));
+                  "the Live network thread: %s; woken %llu times, the longest wake-up delay %.1f ms, %llu over 5 ms; "
+                  "%llu timed waits of %d ms ran out, the longest %.1f ms, %llu over 5 ms past their time",
+                  t.realtime ? "real-time (time-constraint)" : t.latency_critical ? plain : "its scheduling unchanged",
+                  static_cast<unsigned long long>(t.wakes), t.wake_longest_ms,
+                  static_cast<unsigned long long>(t.wake_over_5ms), static_cast<unsigned long long>(t.timeouts),
+                  t.wait_ms, t.longest_ms, static_cast<unsigned long long>(t.over_5ms));
     return b;
 }
 
@@ -247,6 +253,91 @@ double Engine::liveUserHeardMs(int user) const {
     double buffer = 0;
     const double oneway = liveOneWayMs(slot, &buffer, nullptr, nullptr);
     return oneway < 0 ? -1 : oneway - buffer + fill;
+}
+
+const char* liveEventName(LiveEventKind kind) {
+    switch (kind) {
+    case LiveEventKind::None: break;
+    case LiveEventKind::Stream: return "stream";
+    case LiveEventKind::Play: return "play";
+    case LiveEventKind::Late: return "late";
+    case LiveEventKind::Lost: return "lost";
+    case LiveEventKind::Dry: return "dry";
+    case LiveEventKind::Rejoin: return "rejoin";
+    case LiveEventKind::Overflow: return "overflow";
+    case LiveEventKind::Rebuffer: return "rebuffer";
+    case LiveEventKind::Skip: return "skip";
+    case LiveEventKind::HostGap: return "host gap";
+    case LiveEventKind::Xrun: return "xrun";
+    case LiveEventKind::SpeedOn: return "speed on";
+    case LiveEventKind::SpeedOff: return "speed off";
+    case LiveEventKind::End: return "end";
+    }
+    return "none";
+}
+
+bool Engine::liveUserCounters(int user, LiveCounters* out) const {
+    int slot = -1;
+    std::uint32_t g = 0;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u || u->live_want < 0) return false;
+        slot = u->live_want;
+        g = u->live_want_gen;
+    }
+    const LiveLayer& L = *live_;
+    const SinkStats& st = L.sinks[slot]->stats;
+    if (L.gen[slot].load() != g || st.gen.load() != g) return false;
+    LiveCounters c;
+    c.late = st.late.load();
+    const std::uint32_t lost = st.lost.load(), came = st.late_missed.load();
+    c.lost = lost > came ? lost - came : 0;
+    c.concealed_frames = st.concealed48.load();
+    c.underruns = st.underruns.load();
+    c.overflows = st.overruns.load();
+    c.xrun_gaps = st.xrun_gaps.load();
+    c.resent = st.resent.load();
+    c.skips = st.skips.load();
+    c.skipped_frames = st.skipped48.load();
+    c.host_gaps = st.host_gaps.load();
+    c.host_gap_frames = st.host_gap48.load();
+    c.speed_changes = st.speed_changes.load();
+    c.speed_moved_ms = st.speed_moved_ns.load() / 1e6;
+    c.speed_ppm = st.speed_ppm.load();
+    const std::int32_t fill = st.active.load() ? st.fill_us.load() : -1;
+    c.fill_ms = fill < 0 ? -1 : fill / 1000.0;
+    if (st.gen.load() != g) return false;        // cleared meanwhile
+    *out = c;
+    return true;
+}
+
+std::vector<LiveEvent> Engine::liveUserEvents(int user, std::size_t max) const {
+    std::vector<LiveEvent> v;
+    int slot = -1;
+    std::uint32_t g = 0;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u || u->live_want < 0) return v;
+        slot = u->live_want;
+        g = u->live_want_gen;
+    }
+    const LiveLayer& L = *live_;
+    const SinkStats& st = L.sinks[slot]->stats;
+    if (L.gen[slot].load() != g || st.gen.load() != g) return v;
+    const std::uint32_t n = st.events_n.load(std::memory_order_acquire);
+    const std::uint32_t k = static_cast<std::uint32_t>(std::min<std::size_t>(max, SinkStats::kEvents));
+    v.reserve(k);
+    for (std::uint32_t i = n > k ? n - k : 0; i < n; ++i) {
+        LiveEvent e;
+        std::uint8_t kind = 0;
+        if (!st.readEvent(i, &e.steady_ns, &kind, &e.value)) continue;   // written over meanwhile
+        e.kind = static_cast<LiveEventKind>(kind);
+        v.push_back(e);
+    }
+    if (st.gen.load() != g) v.clear();
+    return v;
 }
 
 void Engine::liveControl() {

@@ -135,6 +135,7 @@ bool LiveLayer::start(const std::string& a, std::uint16_t p, std::string& error)
     o.peer_id = msg.peer_id;
     o.key = msg.key;
     o.test_receive_loss = test_loss_;
+    o.wait_ms = kLiveNetworkWaitMs;
     addr = a;
     port = p;
     id = msg.peer_id;
@@ -269,6 +270,7 @@ void LiveLayer::apply(const o11proto::live::ServerLive& m) {
         for (const auto& p : peers)
             if (p.id == net[s].peer) slot_name[s] = p.name;
     }
+    transport_.wake();                          // its /starts and /stops go out at once
 }
 
 int LiveLayer::slotOf(const std::string& name) const {
@@ -891,7 +893,7 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
         }
         // A host gap first: what came while the host was away is skipped,
         // which leaves room for what came since.
-        if (gap > 0) k.hostGap(gap, rate);
+        if (gap > 0) k.hostGap(gap, rate, now);
         k.hostBehind(behind48);
         for (int i = 0; i < 256; ++i) {
             SinkItem* it = queue[s]->front();
