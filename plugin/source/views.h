@@ -314,7 +314,7 @@ public:
     juce::Colour color;
     double time = 0; // when (seconds, the clock of now in setNow)
   };
-  enum { LINE_H = 16 };
+  static constexpr int LINE_H = 16;
   explicit EventList(const juce::Font &font);
   void setEvents(const std::vector<Event> &events); // newest first
   void setPlaceholder(const std::string &text);       // shown when there are none
