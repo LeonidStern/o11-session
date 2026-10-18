@@ -378,6 +378,9 @@ private:
   unsigned long long m_hostLogSerial = 0;
   bool m_warnedCantSend = false; // told the user this room can't hear them
   double m_lastPublish = 0;
+  bool m_liveLog = false; // O11_LIVE_LOG: print the `live` line when it changes (benchmarks)
+  double m_liveLogAt = 0;
+  std::string m_liveLogLine;
   unsigned int m_seenProcessCalls = 0;
   std::map<std::string, int> m_playerOutSaid; // the player output we last told about, by user name
   std::map<std::string, double> m_joinedAt;   // when each user joined (RemoteUserView::joinedAt), by user name

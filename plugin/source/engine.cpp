@@ -370,10 +370,11 @@ void Engine::start()
   if (m_running) return;
   m_quit = false;
   m_running = true;
+  if (const char *log = getenv("O11_LIVE_LOG")) m_liveLog = atoi(log) != 0; // before the thread reads it
   m_thread = std::thread([this]() { threadProc(); });
 
-  // benchmarks, with no window: join a room once loaded (O11_CONNECT="host:port name") and pick
-  // Live's buffer (O11_LIVE_BUFFER_MS)
+  // benchmarks, with no window: join a room once loaded (O11_CONNECT="host:port name"), pick
+  // Live's buffer (O11_LIVE_BUFFER_MS) and print the `live` line when it changes (O11_LIVE_LOG=1)
   if (const char *ms = getenv("O11_LIVE_BUFFER_MS")) setLiveBuffer(Settings::nearestLiveBufferMs(atoi(ms)));
   if (const char *c = getenv("O11_CONNECT"))
   {
@@ -923,6 +924,17 @@ void Engine::threadProc()
     {
       m_lastPublish = t;
       publish();
+    }
+    if (m_liveLog && t - m_liveLogAt >= 0.1)
+    {
+      m_liveLogAt = t;
+      const std::string line = command("live");
+      if (line != m_liveLogLine)
+      {
+        m_liveLogLine = line;
+        printf("live: %s", line.c_str());
+        fflush(stdout);
+      }
     }
 
     std::unique_lock<std::mutex> lock(m_cmdMutex);
