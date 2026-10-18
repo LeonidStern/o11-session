@@ -60,6 +60,8 @@ std::string msText(int ms);
 // the Mode box: "Live 28 ms" while the room plays Live ("Live" until the delay is known), else
 // "Intervals"
 std::string liveModeText(bool live, int heardMs);
+// the Mode menu's choice "Intervals · 4 beats", and the box's shorter "Intervals · 4" (just "Intervals" for 0)
+std::string intervalsModeText(int beats, bool unit);
 // why the room plays intervals while its Live switch is on (the Snapshot's liveReason: 1 a
 // connection's dropouts, 2 a client that can't play Live, 3 someone joining) and whose:
 // "Intervals: Anna's connection", "Intervals: your connection", "Intervals: Carol can't play

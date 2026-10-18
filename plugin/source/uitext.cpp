@@ -121,6 +121,12 @@ std::string liveModeText(bool live, int heardMs)
   return heardMs > 0 ? "Live " + msText(heardMs) : "Live";
 }
 
+std::string intervalsModeText(int beats, bool unit)
+{
+  if (beats <= 0) return "Intervals";
+  return "Intervals \xc2\xb7 " + (unit ? beatsText(beats) : std::to_string(beats));
+}
+
 std::string liveAdviceText(int reason, const std::string &who, int others)
 {
   const bool you = who == "You";
