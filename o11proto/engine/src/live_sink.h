@@ -14,6 +14,7 @@
 #include <memory>
 
 #include "live_aoo.h"
+#include "o11proto/engine.h"
 
 struct OpusDecoder;
 struct OpusEncoder;
@@ -80,11 +81,57 @@ struct SinkStats {
     std::atomic<std::uint32_t> gen{0};          // the generation these counts belong to
     std::atomic<bool> active{false};            // playing (not buffering, not dry, not idle)
     std::atomic<std::int64_t> active_since_ns{0};
+    // `lost`: blocks missing at their turn (concealed), which 6.4's loss
+    // counts, including those that came later (`late_missed` of them).
     std::atomic<std::uint32_t> underruns{0}, overruns{0}, lost{0}, xrun_gaps{0}, resent{0};
     std::atomic<std::uint32_t> lost_at_active{0}, resent_at_active{0};   // the counts when it last went active
     std::atomic<std::int32_t> buffer_us{-1};    // what the buffer held when playback last started
     std::atomic<std::int32_t> fill_us{-1};      // while playing: the buffer's smoothed fill now
     std::atomic<std::int32_t> block{0};         // the stream's frame size
+    // For a log (Engine::liveUserCounters()). Blocks that came after their
+    // turn and went unplayed, and of those the ones counted in `lost`.
+    std::atomic<std::uint32_t> late{0}, late_missed{0};
+    std::atomic<std::uint64_t> concealed48{0};  // 48 kHz frames of concealment played once the stream had played
+    // Corrections that moved the playback position: jumps (blocks skipped
+    // when it buffered again, not for a host gap), and the speed leaving the
+    // clock's own to bring the fill back, with how far it moved the stream
+    // in all (ns, + ahead) and its speed now (ppm, + faster).
+    std::atomic<std::uint32_t> skips{0}, host_gaps{0}, speed_changes{0};
+    std::atomic<std::int64_t> skipped48{0}, host_gap48{0}, speed_moved_ns{0};
+    std::atomic<std::int32_t> speed_ppm{0};
+    // The latest events, a ring that `events_n` counts. Each entry is
+    // marked with its number + 1, 0 while it is written: a reader takes an
+    // entry whose mark is the same before and after it read it (readEvent()).
+    static constexpr int kEvents = 64;
+    struct Event {
+        std::atomic<std::uint32_t> mark{0};
+        std::atomic<std::int64_t> ns{0};        // steady clock
+        std::atomic<std::int64_t> value{0};
+        std::atomic<std::uint8_t> kind{0};      // an o11proto::engine::LiveEventKind
+    };
+    Event events[kEvents];
+    std::atomic<std::uint32_t> events_n{0};
+    void event(std::int64_t ns, std::uint8_t kind, std::int64_t value) {
+        const std::uint32_t n = events_n.load(std::memory_order_relaxed);
+        Event& e = events[n % kEvents];
+        e.mark.store(0, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        e.ns.store(ns, std::memory_order_relaxed);
+        e.value.store(value, std::memory_order_relaxed);
+        e.kind.store(kind, std::memory_order_relaxed);
+        e.mark.store(n + 1, std::memory_order_release);
+        events_n.store(n + 1, std::memory_order_release);
+    }
+    // Event number `n` (counted from 0) if the ring still holds it.
+    bool readEvent(std::uint32_t n, std::int64_t* ns, std::uint8_t* kind, std::int64_t* value) const {
+        const Event& e = events[n % kEvents];
+        if (e.mark.load(std::memory_order_acquire) != n + 1) return false;
+        *ns = e.ns.load(std::memory_order_relaxed);
+        *value = e.value.load(std::memory_order_relaxed);
+        *kind = e.kind.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return e.mark.load(std::memory_order_relaxed) == n + 1;
+    }
     void clear(std::uint32_t g);
 };
 
@@ -208,7 +255,7 @@ public:
     // plays out, then the concealment, for the mixer to fade out (16.8).
     void drop();
     void apply(const SinkItem& it, std::int64_t now_ns);
-    void hostGap(int host_frames, int host_rate);   // skip that much of the stream (6.9)
+    void hostGap(int host_frames, int host_rate, std::int64_t now_ns);   // skip that much of the stream (6.9)
     // Before each block's apply(): how far (48 kHz samples) the host's
     // block is behind its schedule, catching up on a stall. The stream went
     // on arriving meanwhile, so the buffer holds that much more without
@@ -238,7 +285,9 @@ public:
 
 private:
     enum Phase { Idle, Buffering, Playing, Dry };
-    enum State : std::uint8_t { Empty, Missing, Full, XrunBlock };
+    // Passed: missing at its turn and concealed; if it comes after all, it
+    // was late, not lost.
+    enum State : std::uint8_t { Empty, Missing, Full, XrunBlock, Passed };
     struct Entry {
         std::int32_t seq = -1;
         State state = Empty;
@@ -261,6 +310,11 @@ private:
     }
     void decodeNext(std::int64_t now_ns);       // one block into the 48 kHz queue
     void conceal();
+    void event(std::int64_t ns, LiveEventKind kind, std::int64_t value) {
+        stats.event(ns, static_cast<std::uint8_t>(kind), value);
+    }
+    void started(std::int64_t now_ns, std::int64_t value, bool rejoin);   // playback begins
+    std::int64_t lateUs(std::int64_t seq) const;   // how long after its turn on align_ block `seq` came
     void prime();
     int concealSamples() const;                 // after a stream: B x kLiveConcealBuffers, the fade, 10 ms
     void sizesChanged();
@@ -280,6 +334,7 @@ private:
     std::unique_ptr<Concealer> concealer_;
     Phase phase_ = Idle;
     bool stopping_ = false;                     // /stop came: play out, then end
+    bool started_ = false;                      // the stream has played: concealment from now on is heard
     int block_ = 240;
     // Sequences in 64 bits, so that a jump near 0x7fffffff can't overflow.
     std::int64_t next_ = 0;                     // the next sequence to play
@@ -304,6 +359,11 @@ private:
     double fill_ref_ = -1;
     double fill_age_ = 0;                       // seconds of this estimate
     int behind48_ = 0;                          // hostBehind()
+    std::int64_t last_ns_ = 0;                  // the steady clock at the last apply() or render()
+    bool speed_on_ = false;                     // the speed is off the clock's own
+    double speed_peak_ = 0;                     // the furthest it went this time (a ratio - 1)
+    double speed_idle_ = 0;                     // seconds since it was last off the clock's own
+    double speed_moved_ns_ = 0;                 // what of the speed's move isn't counted yet
     std::int64_t played48_ = 0;
     // The delay the stream plays at: block s is decoded when played48_ is
     // align_ + s x block_. After running dry, the stream comes back on it.

@@ -891,7 +891,7 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
         }
         // A host gap first: what came while the host was away is skipped,
         // which leaves room for what came since.
-        if (gap > 0) k.hostGap(gap, rate);
+        if (gap > 0) k.hostGap(gap, rate, now);
         k.hostBehind(behind48);
         for (int i = 0; i < 256; ++i) {
             SinkItem* it = queue[s]->front();
