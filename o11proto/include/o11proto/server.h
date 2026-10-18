@@ -66,11 +66,11 @@ struct LiveConfig {
     // advice; on, the room goes through the relay for everyone once a pair
     // has no direct path, until `!live direct`. A backend option, off by
     // default; O11_LIVE_RELAY_FALLBACK (1 or 0) overrides it when the
-    // UDP port opens.
+    // UDP port opens and at each setLiveConfig() while it is open.
     bool relay_fallback = false;
     // Test hooks; the environment variables O11_LIVE_FRESH_SECONDS and
     // O11_LIVE_STATS_SECONDS (decimal seconds, above 0) override them
-    // when the UDP port opens.
+    // when the UDP port opens and at each setLiveConfig() while it is open.
     double fresh_seconds = 20;                 // a player stays bound this long after a verified hello
     double stats_seconds = 60;                 // period of the relay's traffic line
 };

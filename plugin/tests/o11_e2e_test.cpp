@@ -329,9 +329,8 @@ int main()
     peer.enable(false);
   }
 
-  // Live on again: the whole room goes Live at an interval's start, once both have been clean for
-  // a few seconds, and the guest hears the tone in real time (Opus at Live's 128 kbps, though the
-  // room's intervals are FLAC)
+  // Live on again: the whole room goes Live at an interval's start, and the guest hears the tone
+  // in real time (Opus at Live's 128 kbps, though the room's intervals are FLAC)
   CHECK(room.guest.command("live on") == "ok");
   for (int i = 0; i < 100 && (field(room.guest.command("live"), "room") != "live" || field(room.host.command("live"), "room") != "live"); i ++)
     room.advance(0.2);

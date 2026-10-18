@@ -1,5 +1,5 @@
 // Acceptance tests of PORTMAP.md section 8, and of the UDP mapping for Live
-// (PROTOCOL.md 15.11, the Live spec's test 27), against the fake router in
+// (PROTOCOL.md 15.8, the Live spec's test 27), against the fake router in
 // fake_router.py (started per scenario; it prints "READY <http-port>" and
 // reports what it holds at GET /mappings).
 //
@@ -317,7 +317,7 @@ TEST(private_ipv4) {
         CHECK(!isPrivateIPv4(a));
 }
 
-// ------------------------------------------------- UDP for Live (15.11)
+// -------------------------------------------------- UDP for Live (15.8)
 
 static bool holds(const FakeRouter& fake, const std::string& line) {
     for (const auto& l : fake.mappings())
