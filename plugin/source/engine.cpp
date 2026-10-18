@@ -1628,7 +1628,7 @@ std::string Engine::command(const std::string &lineIn)
     if (arg.compare(0, 7, "buffer ") == 0)
     {
       const int ms = atoi(arg.c_str() + 7);
-      if (Settings::nearestLiveBufferMs(ms) != ms) return "error: the buffer is one of 10 15 20 30 40 60 80 100 (ms)";
+      if (Settings::nearestLiveBufferMs(ms) != ms) return "error: the buffer is one of 5 10 15 20 30 40 60 80 100 (ms)";
       setLiveBuffer(ms);
       return "ok";
     }

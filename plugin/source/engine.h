@@ -190,8 +190,8 @@ struct Settings
   static constexpr int NUM_OPUS_KBPS = 6, DEFAULT_OPUS_KBPS = 510; // the best Opus there is, by default
   static int nearestOpusKbps(int kbps);
   // Live's jitter buffer (ms) to pick from: longer is safer on a bad connection, and later
-  static constexpr int LIVE_BUFFER_MS[] = { 10, 15, 20, 30, 40, 60, 80, 100 };
-  static constexpr int NUM_LIVE_BUFFERS = 8, DEFAULT_LIVE_BUFFER_MS = 20;
+  static constexpr int LIVE_BUFFER_MS[] = { 5, 10, 15, 20, 30, 40, 60, 80, 100 }; // 5 ms: wired players close to each other
+  static constexpr int NUM_LIVE_BUFFERS = 9, DEFAULT_LIVE_BUFFER_MS = 20;
   static int nearestLiveBufferMs(int ms);
 
   std::string userName;
