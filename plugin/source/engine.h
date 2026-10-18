@@ -97,6 +97,8 @@ struct RemoteUserView
   int liveFillMs = -1;     // ... and how full its jitter buffer is
   int liveBufferMs = -1;   // ... and the buffer its stream plays with (automatic: 10 ms, or 20 once it fell back)
   bool liveFellBack = false; // its automatic buffer fell back to the longer one
+  bool liveDirect = false; // Live goes straight between you (all to all), not through the room's server
+  int liveRttMs = -1;      // the round trip of that direct path, -1 when not known
   std::string liveCounters; // what its stream did here since it started, "" before it has one (the `live counters` line)
   std::vector<RemoteChannelView> channels;
 };
@@ -135,6 +137,7 @@ struct Snapshot
   int liveReasonOthers = 0;  // how many more have the same trouble
   int liveHeardMs = -1;      // about how late you hear the others while Live, -1 when not known
   int liveBufferMs = 0;      // your jitter buffer (Settings::liveBufferMs; 0 = Settings::LIVE_BUFFER_AUTO)
+  std::string liveRoute = "none"; // how Live's audio goes in the room: "direct" (all to all), "relay" or "none"
   int liveBufferInUseMs = 20; // where a stream starts: the fixed buffer or the automatic one's 10 ms, raised for the host's long blocks
 
   std::vector<RemoteUserView> users;

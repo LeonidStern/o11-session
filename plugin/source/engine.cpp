@@ -372,6 +372,9 @@ void Engine::start()
   // benchmarks, with no window: join a room once loaded (O11_CONNECT="host:port name") or host one
   // (O11_HOST=1, on O11_HOST_PORT), pick the Opus bitrate (O11_BITRATE) and Live's buffer
   // (O11_LIVE_BUFFER_MS: ms, or auto), and print the `live` line when it changes (O11_LIVE_LOG=1)
+  // benchmarks: this player is heard and hears through the room's server instead of directly
+  // (O11_LIVE_FORCE_RELAY=1 on every player: the whole room relayed, as before all to all)
+  if (const char *r = getenv("O11_LIVE_FORCE_RELAY")) m_client->setLiveTestForceRelay(atoi(r) != 0);
   if (const char *ms = getenv("O11_LIVE_BUFFER_MS")) setLiveBuffer(Settings::nearestLiveBufferMs(strcmp(ms, "auto") == 0 ? 0 : atoi(ms)));
   if (const char *k = getenv("O11_BITRATE")) setOpusKbps(atoi(k)); // before hosting: the host's bitrate is the room's
   if (const char *h = getenv("O11_HOST")) setHosting(atoi(h) != 0);
@@ -1292,14 +1295,17 @@ void Engine::updateUsers(Snapshot &snap)
     uv.liveFillMs = (int)lround(m_client->liveUserBufferMs(u));
     uv.liveBufferMs = m_client->liveUserBufferInUseMs(u);
     uv.liveFellBack = m_client->liveUserBufferFellBack(u);
+    uv.liveDirect = m_client->liveUserHasDirectPath(u);
+    uv.liveRttMs = (int)lround(m_client->liveUserProbeRttMs(u));
     {
       o11proto::engine::LiveCounters k;
       if (m_client->liveUserCounters(u, &k))
       {
         char b[320];
-        snprintf(b, sizeof(b), "late=%u lost=%u concealed=%llu dry=%u overflows=%u xruns=%u resent=%u skips=%u host_gaps=%u speed_changes=%u speed_ppm=%.0f fill=%.1f buffer=%d fell_back=%d",
+        snprintf(b, sizeof(b), "late=%u lost=%u concealed=%llu dry=%u overflows=%u xruns=%u resent=%u skips=%u host_gaps=%u speed_changes=%u speed_ppm=%.0f fill=%.1f buffer=%d fell_back=%d route=%s rtt=%d",
                  k.late, k.lost, (unsigned long long)k.concealed_frames, k.underruns, k.overflows, k.xrun_gaps, k.resent,
-                 k.skips, k.host_gaps, k.speed_changes, k.speed_ppm, k.fill_ms, k.buffer_ms, k.fell_back ? 1 : 0);
+                 k.skips, k.host_gaps, k.speed_changes, k.speed_ppm, k.fill_ms, k.buffer_ms, k.fell_back ? 1 : 0,
+                 o11proto::engine::liveRouteName(k.route), uv.liveRttMs);
         uv.liveCounters = b;
       }
       else uv.liveCounters.clear();
@@ -1411,6 +1417,7 @@ void Engine::publish()
   snap.opusKbps = getSettings().opusKbps;
   snap.liveBufferMs = getSettings().liveBufferMs;
   snap.liveBufferInUseMs = m_client->liveBufferInUseMs();
+  snap.liveRoute = o11proto::engine::liveRouteName(m_client->liveRoomRoute().route);
   snap.sendKbps = sendKbps();
   if (m_state == ConnState::Connected || m_state == ConnState::Connecting)
   {
@@ -1676,9 +1683,9 @@ std::string Engine::command(const std::string &lineIn)
     static const char *reasons[] = { "none", "dropouts", "cantlive" };
     char buf[256];
     const std::string bufferText = s.liveBufferMs == Settings::LIVE_BUFFER_AUTO ? "auto" : std::to_string(s.liveBufferMs);
-    snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s others=%d heard=%d buffer=%s inuse=%d\n",
+    snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s others=%d heard=%d buffer=%s inuse=%d route=%s\n",
              s.liveServer ? 1 : 0, s.liveSwitchOn ? 1 : 0, s.liveRoom ? "live" : "intervals", reasons[(int)s.liveReason],
-             s.liveReasonWho.c_str(), s.liveReasonOthers, s.liveHeardMs, bufferText.c_str(), s.liveBufferInUseMs);
+             s.liveReasonWho.c_str(), s.liveReasonOthers, s.liveHeardMs, bufferText.c_str(), s.liveBufferInUseMs, s.liveRoute.c_str());
     // each player's stream: how late you hear them, how full its buffer is and the buffer it plays with (benchmarks)
     std::string line = buf;
     line.pop_back();

@@ -356,6 +356,9 @@ int main()
   CHECK(room.guest.command("chatlog").find("The room is Live now") != std::string::npos);
   // the buffer is automatic, and each stream says what it plays with and what happened to it
   CHECK(field(guestLive, "buffer") == "auto");
+  // all to all: the guest and the host hear each other directly, not through the room's server
+  CHECK(room.waitForLive(room.guest, "route", "direct", 5));
+  CHECK(room.waitForLive(room.host, "route", "direct", 5));
   {
     const std::string counters = room.guest.command("live counters");
     printf("  guest live counters: %s", counters.c_str());
