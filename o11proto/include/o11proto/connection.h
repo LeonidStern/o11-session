@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,7 +31,7 @@ constexpr socket_t kInvalidSocket = -1;
 
 class Connection {
 public:
-    Connection() = default;
+    Connection();
     explicit Connection(socket_t fd);
     ~Connection();
     Connection(const Connection&) = delete;
@@ -39,9 +40,11 @@ public:
     // Takes ownership of an already connected (or connecting) socket and
     // makes it non-blocking with TCP_NODELAY, and with SO_NOSIGPIPE where the
     // system has it (a send to a reset peer is then an error, never SIGPIPE).
+    // A socket adopted by its handle gets an Asio io_context of its own; the
+    // client and the server adopt Asio sockets on theirs (adopt(Net)).
     void adopt(socket_t fd);
-    socket_t fd() const { return fd_; }
-    bool isOpen() const { return fd_ != kInvalidSocket; }
+    socket_t fd() const;
+    bool isOpen() const;
     void close();
 
     // Queues one framed message. Returns false when the queue is over the
@@ -72,8 +75,17 @@ public:
     // The peer address as text ("1.2.3.4"), filled by adopt() when possible.
     const std::string& peerAddress() const { return peer_; }
 
+    // The Asio socket (src/socket_compat.h), for the library's event loops:
+    // null while nothing was adopted.
+    struct Net;
+    struct NetDeleter {
+        void operator()(Net* p) const;
+    };
+    void adopt(std::unique_ptr<Net, NetDeleter> net);
+    Net* net() const { return net_.get(); }
+
 private:
-    socket_t fd_ = kInvalidSocket;
+    std::unique_ptr<Net, NetDeleter> net_;
     std::vector<std::uint8_t> inbuf_;
     std::deque<std::vector<std::uint8_t>> outq_;   // framed messages
     std::size_t out_off_ = 0;                      // bytes of outq_.front() already sent

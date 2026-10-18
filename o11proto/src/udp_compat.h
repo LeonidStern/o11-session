@@ -2,12 +2,14 @@
 // relay (server_live.cpp), the client transport (live_transport.cpp) and the
 // Live tests only.
 //
-// The relay must answer every datagram from the local address it arrived at
-// (a client's connect()ed socket drops anything else). Linux reports and sets
-// that address with IP_PKTINFO, the BSDs and macOS report it with
-// IP_RECVDSTADDR and set it with IP_SENDSRCADDR where that exists. Anywhere
-// else (Windows) the routing table chooses, which is right on a machine with
-// one address.
+// The sockets are Asio's (openSocket()), waited on with Asio; the datagrams
+// themselves go through recvmsg/sendmsg on the socket's handle, because the
+// relay must answer every datagram from the local address it arrived at (a
+// client's connect()ed socket drops anything else) and Asio has no call that
+// reports or sets it. Linux reports and sets that address with IP_PKTINFO,
+// the BSDs and macOS report it with IP_RECVDSTADDR and set it with
+// IP_SENDSRCADDR where that exists. Anywhere else (Windows) the routing table
+// chooses, which is right on a machine with one address.
 #ifndef O11PROTO_UDP_COMPAT_H
 #define O11PROTO_UDP_COMPAT_H
 
@@ -48,14 +50,10 @@ inline bool isBroadcastOrMulticast(std::uint32_t ip_net) {
     return h == 0xFFFFFFFFu || (h >> 28) == 0xE;
 }
 
-// Makes an IPv4 datagram socket, non-blocking, with both buffers at `buffer`
-// bytes, without SIGPIPE where the system has SO_NOSIGPIPE, and (on Windows)
-// without the ICMP "port unreachable" reset. With `exclusive`, a second bind
-// of the same port fails on Windows too.
-inline socket_t open(int buffer, bool exclusive) {
-    if (!compat::startup()) return kInvalidSocket;
-    socket_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == kInvalidSocket) return fd;
+// What Asio has no option for: on Windows, `exclusive` (a second bind of the
+// same port fails there too) and no ICMP "port unreachable" reset of the
+// socket. Before bind().
+inline void platformOptions(socket_t fd, bool exclusive) {
 #ifdef _WIN32
     if (exclusive) {
         int one = 1;
@@ -68,11 +66,41 @@ inline socket_t open(int buffer, bool exclusive) {
     DWORD got = 0;
     ::WSAIoctl(fd, SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &got, nullptr, nullptr);
 #else
+    (void)fd;
     (void)exclusive;
 #endif
+}
+
+// Opens `s` (an Asio socket on its owner's io_context) as an IPv4 datagram
+// socket, non-blocking, with both buffers at `buffer` bytes, without SIGPIPE
+// (Asio sets SO_NOSIGPIPE where the system has it; noSigpipe() again does no
+// harm), and with platformOptions(). False and `ec` on failure.
+inline bool openSocket(asio::ip::udp::socket& s, int buffer, bool exclusive, asio::error_code& ec) {
+    s.open(asio::ip::udp::v4(), ec);
+    if (ec) return false;
+    platformOptions(s.native_handle(), exclusive);
+    asio::error_code ignored;
+    s.set_option(asio::socket_base::receive_buffer_size(buffer), ignored);
+    s.set_option(asio::socket_base::send_buffer_size(buffer), ignored);
+    compat::noSigpipe(s.native_handle());       // a send while another thread closes it must not end the process
+    s.non_blocking(true, ec);
+    if (ec) {
+        s.close(ignored);
+        return false;
+    }
+    return true;
+}
+
+// The same as a raw handle the caller owns (and closes with
+// compat::closeSocket()), for the tests' peers.
+inline socket_t open(int buffer, bool exclusive) {
+    if (!compat::startup()) return kInvalidSocket;
+    socket_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == kInvalidSocket) return fd;
+    platformOptions(fd, exclusive);
     compat::setOpt(fd, SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
     compat::setOpt(fd, SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
-    compat::noSigpipe(fd);                      // a send while another thread closes it must not end the process
+    compat::noSigpipe(fd);
     compat::setNonBlocking(fd);
     return fd;
 }

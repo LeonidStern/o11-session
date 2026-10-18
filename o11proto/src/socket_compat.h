@@ -1,11 +1,18 @@
-// o11proto - the thin layer between the sockets code and the platform.
-// Internal: included by the library sources and the loopback test only.
+// o11proto - the socket layer: standalone Asio, and the few platform bits
+// Asio leaves to us. Internal: included by the library sources and the tests
+// that play raw peers.
 //
-// On POSIX every helper forwards to the usual call, so the behaviour there
-// is unchanged. On Windows (MSVC or MinGW) the same names map to Winsock:
-// SOCKET handles, closesocket(), ioctlsocket(FIONBIO), WSAPoll(), and
-// WSAGetLastError() in place of errno. Winsock is started once, the first
-// time a socket is made, and stays up for the life of the process.
+// The library's sockets, waits and timers are Asio's (one io_context for each
+// client, server and Live transport, run on the library's own threads or the
+// caller's). Asio starts Winsock, makes every socket it opens or accepts
+// SIGPIPE-free (MSG_NOSIGNAL on its sends, SO_NOSIGPIPE where that exists)
+// and maps the platform's error codes. What stays here: the Asio headers in
+// one place, Connection's socket, SIGPIPE for a socket adopted by its handle,
+// the listening socket's address reuse, and the raw calls the tests' peers use.
+//
+// On POSIX every raw helper forwards to the usual call. On Windows (MSVC or
+// MinGW) the same names map to Winsock: SOCKET handles, closesocket(),
+// WSAPoll(), and WSAGetLastError() in place of errno.
 #ifndef O11PROTO_SOCKET_COMPAT_H
 #define O11PROTO_SOCKET_COMPAT_H
 
@@ -13,8 +20,32 @@
 #include <climits>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <type_traits>
+
+// Asio (ASIO_STANDALONE and the rest come from the o11proto_asio target). Its
+// headers come first: on Windows they include winsock2.h before windows.h.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wshorten-64-to-32"
+#pragma clang diagnostic ignored "-Wcomma"
+#elif defined(_MSC_VER)
+#pragma warning(push, 0)
+#endif
+#include <asio/io_context.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/ip/udp.hpp>
+#include <asio/post.hpp>
+#include <asio/steady_timer.hpp>
+#if !defined(_WIN32)
+#include <asio/posix/stream_descriptor.hpp>
+#endif
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 #include "o11proto/connection.h"   // socket_t, kInvalidSocket
 
@@ -39,13 +70,9 @@
 #include <unistd.h>
 #endif
 
-// A send() to a peer that has reset the connection raises SIGPIPE on POSIX,
-// whose default action ends the process: inside a plug-in, the whole host.
-// The library never changes the process's signal handling, so it stops the
-// signal at each socket instead: MSG_NOSIGNAL on every send where the flag
-// exists (Linux, FreeBSD, newer macOS SDKs), and SO_NOSIGPIPE on every socket
-// where that exists (macOS and the BSDs; see noSigpipe() below). Windows has
-// no SIGPIPE, and there the flag is simply 0.
+// The raw sends below never raise SIGPIPE either: MSG_NOSIGNAL where the flag
+// exists (Linux, FreeBSD, newer macOS SDKs), SO_NOSIGPIPE on the socket where
+// that exists (noSigpipe()). Windows has no SIGPIPE, and there the flag is 0.
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
@@ -56,6 +83,16 @@
 #endif
 
 namespace o11proto {
+
+// Connection's socket (connection.h): an Asio socket on its owner's
+// io_context, or, for a socket adopted by its handle, on one of its own.
+struct Connection::Net {
+    std::unique_ptr<asio::io_context> own;     // declared first: it outlives the socket
+    asio::ip::tcp::socket socket;
+    explicit Net(asio::ip::tcp::socket&& s) : socket(std::move(s)) {}
+    Net(std::unique_ptr<asio::io_context> io, asio::ip::tcp::socket&& s) : own(std::move(io)), socket(std::move(s)) {}
+};
+
 namespace compat {
 
 #ifdef _WIN32
@@ -69,9 +106,22 @@ using ssize_type = ssize_t;
 using poll_count = nfds_t;
 #endif
 
-// One-time Winsock startup; a no-op elsewhere. Call before the first
-// socket()/getaddrinfo(). WSACleanup is deliberately never called: the
-// library has no shutdown point and the OS reclaims everything at exit.
+// A wait or read that would block, in Asio's terms.
+inline bool wouldBlock(const asio::error_code& ec) {
+    return ec == asio::error::would_block || ec == asio::error::try_again;
+}
+
+// The address of an endpoint as text: "1.2.3.4", an IPv4-mapped IPv6
+// address (::ffff:1.2.3.4) as plain IPv4, other IPv6 addresses as such.
+inline std::string addressText(const asio::ip::address& a) {
+    if (a.is_v6() && a.to_v6().is_v4_mapped())
+        return asio::ip::make_address_v4(asio::ip::v4_mapped, a.to_v6()).to_string();
+    return a.to_string();
+}
+
+// Winsock startup for the raw calls (Asio starts it for its own sockets); a
+// no-op elsewhere. WSACleanup is deliberately never called: the library has
+// no shutdown point and the OS reclaims everything at exit.
 inline bool startup() {
 #ifdef _WIN32
     struct Once {
@@ -96,17 +146,6 @@ inline void closeSocket(socket_t s) {
 #endif
 }
 
-inline bool setNonBlocking(socket_t s) {
-#ifdef _WIN32
-    u_long one = 1;
-    return ::ioctlsocket(s, FIONBIO, &one) == 0;
-#else
-    int flags = fcntl(s, F_GETFL, 0);
-    if (flags < 0) return false;
-    return fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
-#endif
-}
-
 // setsockopt/getsockopt take char* on Windows and void* on POSIX; a char*
 // converts to both.
 inline int setOpt(socket_t s, int level, int name, const void* val, socklen_t len) {
@@ -119,13 +158,42 @@ inline int getOpt(socket_t s, int level, int name, void* val, socklen_t* len) {
 // Lets a listening socket reuse a port in TIME_WAIT (POSIX). On Windows
 // SO_REUSEADDR would let a second server bind the very same port while the
 // first is still listening, so SO_EXCLUSIVEADDRUSE is used there instead;
-// Windows does not keep the port busy after close the way POSIX does.
+// Windows does not keep the port busy after close the way POSIX does. (Asio's
+// reuse_address is SO_REUSEADDR everywhere, which is why this is ours.)
 inline void setListenReuse(socket_t s) {
     int one = 1;
 #ifdef _WIN32
     setOpt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &one, sizeof(one));
 #else
     setOpt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
+}
+
+// Sets SO_NOSIGPIPE where it exists, for systems whose send() takes no
+// MSG_NOSIGNAL; harmless where both exist, a no-op where neither does. Asio
+// does this for the sockets it makes; Connection::adopt() for one adopted by
+// its handle.
+inline void noSigpipe(socket_t s) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setOpt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)s;
+#endif
+}
+
+// ------------------------------------------------------------- raw calls
+// For the native calls Asio has no equivalent of (the relay's recvmsg and
+// sendmsg with their local address) and for the tests' raw peers.
+
+inline bool setNonBlocking(socket_t s) {
+#ifdef _WIN32
+    u_long one = 1;
+    return ::ioctlsocket(s, FIONBIO, &one) == 0;
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) return false;
+    return fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
 #endif
 }
 
@@ -148,20 +216,8 @@ inline ssize_type send(socket_t s, const void* buf, std::size_t len, int flags) 
 #endif
 }
 
-// Sets SO_NOSIGPIPE where it exists, for systems whose send() takes no
-// MSG_NOSIGNAL; harmless where both exist, a no-op where neither does.
-// Called on every socket the library connects or accepts (Connection::adopt).
-inline void noSigpipe(socket_t s) {
-#ifdef SO_NOSIGPIPE
-    int one = 1;
-    setOpt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-#else
-    (void)s;
-#endif
-}
-
 // poll(): WSAPoll shares the pollfd layout and the POLLIN/POLLOUT/POLLERR/
-// POLLHUP names.
+// POLLHUP names. The library waits with Asio; this is for the tests.
 inline int poll(pollfd* fds, std::size_t n, int timeout_ms) {
 #ifdef _WIN32
     return ::WSAPoll(fds, static_cast<poll_count>(n), timeout_ms);
@@ -193,7 +249,7 @@ inline bool connectFailed(socket_t s, int& err) {
 #endif
 }
 
-// The error of the last socket call on this thread.
+// The error of the last raw socket call on this thread.
 inline int lastError() {
 #ifdef _WIN32
     return ::WSAGetLastError();
