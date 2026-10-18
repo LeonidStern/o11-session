@@ -402,6 +402,22 @@ struct LiveRoom {
         return -1;
     }
     double secondsOf(long blocks) const { return blocks * double(kBlock) / kRate; }
+    // For a failure's log: `listener`'s stream of the other, its events
+    // against now, and the machine's last hiccup.
+    void printEvents(int listener) const {
+        const std::int64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+        std::string line;
+        for (const LiveEvent& e : side[listener].e.liveUserEvents(0)) {
+            char b[96];
+            std::snprintf(b, sizeof(b), " %s %lld at %.3f s,", liveEventName(e.kind), static_cast<long long>(e.value),
+                          (e.steady_ns - now_ns) / 1e9);
+            line += b;
+        }
+        std::printf("      %s's stream of %s:%s (now %.3f s of output; the machine's last hiccup at %.3f s)\n",
+                    side[listener].name.c_str(), side[1 - listener].name.c_str(), line.c_str(),
+                    frames.load() / double(kRate), hiccup_frame.load() / double(kRate));
+    }
     // The peak of output 0 over `seconds` from frame `from`.
     float peak(int listener, long from, double seconds) const {
         float p = 0;
@@ -445,6 +461,22 @@ TEST(both_hear_each_other_live) {
         CHECK_EQ(doubles, 0);                    // the interval copy is muted while live (6.6)
         CHECK(median(d) > 0 && median(d) < 100);   // spec test 35's bounds
         CHECK(p95(d) < 150);
+    }
+    for (int s = 0; s < 2; ++s) {                // for the log: how each stream came (all-to-all: directly)
+        std::string by;
+        for (const LiveEvent& e : r.side[s].e.liveUserEvents(0))
+            if (e.kind == LiveEventKind::Route)
+                by += std::string(by.empty() ? "" : ", ") + liveRouteName(static_cast<LiveRoute>(e.value));
+        std::printf("    %s's stream of %s came by: %s\n", r.side[s].name.c_str(), r.side[1 - s].name.c_str(), by.c_str());
+    }
+    for (int s = 0; s < 2; ++s) {                // for a failure's log: what the advice said, and why
+        const std::string advice = r.side[s].findNotice("Intervals may sound better");
+        if (advice.empty()) continue;
+        std::printf("    %s was told: %s (the checks from %.3f s)\n", r.side[s].name.c_str(), advice.c_str(),
+                    from / double(kRate));
+        r.printEvents(0);
+        r.printEvents(1);
+        break;
     }
     if (r.calmSince(from)) {                     // a steady stream stays live
         CHECK(r.side[0].e.userLive(0) && r.side[1].e.userLive(0));

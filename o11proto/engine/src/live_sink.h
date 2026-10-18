@@ -328,11 +328,13 @@ private:
     }
     // A path change (SinkItem::Path): a shorter path brings the blocks
     // early, which the room above takes and the speed then plays back to
-    // the fill it keeps; a longer one brings them late, and a stream that
-    // runs dry within kPathWindowNs of the change buffers afresh at the new
-    // path's delay, instead of dropping the late blocks to keep the old one.
+    // the fill it keeps. A longer one brings them late, as any path that
+    // grows longer does: a stream that runs dry keeps its delay as after a
+    // gap (16.6), until it is late for good and buffers afresh. (It once
+    // buffered afresh at once when it ran dry within 2 s of any change; a
+    // machine's hiccup then concealed the whole buffer: 30 ms for a 25 ms
+    // gap, 10 ms without.)
     static constexpr int kPathRoom48 = 4800;    // 100 ms
-    static constexpr std::int64_t kPathWindowNs = 2000000000LL;
     void pathChanged(int route, bool change, std::int64_t now_ns);
     void decodeNext(std::int64_t now_ns);       // one block into the 48 kHz queue
     void conceal();

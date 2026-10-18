@@ -202,7 +202,7 @@ void LiveLayer::forget() {
     has_paths = lan_sent = false;
     paths = o11proto::live::LivePaths();
     paths_sent.clear();
-    transport_.setRoomRoute(true, false);       // until the new room's message says
+    transport_.setRoomRoute(false, false);      // direct only, until the new room's message says
     std::lock_guard<std::mutex> lock(net_mutex);
     peers.clear();
     net_room_on = false;

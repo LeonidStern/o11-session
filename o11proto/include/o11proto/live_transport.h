@@ -150,7 +150,9 @@ public:
     Route route(std::uint32_t peer) const;
     bool pathUp(std::uint32_t peer) const;      // its direct path holds (up or suspect)
     // The room's route: whether the server falls back to the relay (else
-    // direct only), and whether the room is on the relay now.
+    // direct only), and whether the room is on the relay now. Direct only
+    // until it is told otherwise: a path that opens before the room's
+    // message comes waits for its answer, as the room's own rule would.
     void setRoomRoute(bool relay_fallback, bool room_relay);
     std::vector<PathsReport::Entry> pathStates() const;   // each listed peer's path, as setPaths() listed them
     double probeRttMs(std::uint32_t peer) const;   // the latest answered probe's round trip; -1 for none

@@ -510,9 +510,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         // the other players (16.6): what comes too late for its turn goes,
         // the rest waits for its turn. Only a stream more than the capacity
         // ahead of it buffers afresh.
-        // Just after a path change the stream may come later for good:
-        // it buffers afresh at the new delay.
-        realign_ = has_align_ && seq - turn() <= room() && !(path_ns_ != 0 && now_ns - path_ns_ < kPathWindowNs);
+        realign_ = has_align_ && seq - turn() <= room();
         if (!realign_) event(now_ns, LiveEventKind::Rebuffer, seq);
         has_align_ = realign_;
         late48_ = 0;
