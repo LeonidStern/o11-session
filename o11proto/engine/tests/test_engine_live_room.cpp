@@ -473,8 +473,18 @@ TEST(stopped_daw_gives_no_advice) {
     const std::string line = r[0].findNotice("dave: ", seen);
     std::printf("    %s\n", line.c_str());
     CHECK(line.find("dave: not sending") == 0);
+    long checked_from = b0 * kBlock;             // where the window of the check before began
     for (int step = 0; step < 2; ++step) {
+        // Advice lasts until 10 s after the reports are clean again, 2 s
+        // after the last dropout (16.7). Advice still there from before
+        // this step came with a hiccup of the machine's (else the check
+        // before failed), so it clears first.
+        auto none = [&] { return noAdvice(r[0]) && noAdvice(r[1]) && noAdvice(r[2]); };
+        if (!none() && !r.calm(checked_from, r.frames.load()))
+            std::printf("    the advice from the machine's hiccup %s\n",
+                        r.until(none, 25) ? "clears first" : "doesn't clear within 25 s");
         const long from = r.block();
+        checked_from = from * kBlock;
         r[2].e.setLiveHostState(step == 0, false);   // it starts, then stops again
         const bool some = anyAdvice(r, {0, 1, 2}, 4);
         r.until([&] { return r.frames.load() > (from * kBlock) + 4L * o.rate; }, 4);
@@ -652,12 +662,26 @@ TEST(gaps_give_advice_and_the_room_stays_live) {
     CHECK(advised(r[0], Engine::LiveAdvice::Dropouts, "alice"));
 
     // Clean again: the advice clears 10 s after the reports are clean (a
-    // player is clean again 2 s after its last dropout, 6.4).
+    // player is clean again 2 s after its last dropout, 6.4). A dropout
+    // meanwhile that follows a hiccup of the machine's (three within 2 s
+    // make a clean report fail) starts those 10 s again, rightly: then the
+    // time isn't checked.
     const long last = r.frames.load();
+    const int alice_at_bob = userIndex(r[1], "alice");
+    auto dropouts = [&] {
+        LiveCounters c;
+        return alice_at_bob >= 0 && r[1].e.liveUserCounters(alice_at_bob, &c)
+                   ? static_cast<long>(c.underruns + c.overflows + c.xrun_gaps)
+                   : -1L;
+    };
+    const long drops0 = dropouts();
     REQUIRE(r.until([&] { return !r[1].findNotice("alice's connection is clean again.", seen[1]).empty(); }, 20));
     const double cleared = r.ms(r.frames.load() - last) / 1000;
-    std::printf("    the advice clears %.1f s after the last gap\n", cleared);
-    CHECK(cleared >= 10.0 && cleared <= 14.5);
+    const long drops = dropouts() - drops0;
+    const bool clean_calm = r.calm(last, r.frames.load());
+    std::printf("    the advice clears %.1f s after the last gap; bob's stream of alice had %ld dropouts meanwhile%s\n",
+                cleared, drops, clean_calm ? "" : " (the machine had a hiccup)");
+    if (clean_calm || drops == 0) CHECK(cleared >= 10.0 && cleared <= 14.5);
     CHECK(r.until([&] { return !r[0].findNotice("Your connection is clean again.", seen[0]).empty(); }, 2));
     CHECK(noAdvice(r[0]) && noAdvice(r[1]));
 
@@ -1266,10 +1290,25 @@ TEST(listening_file) {
     // the block, since the codecs spread an attack by a few ms (before it
     // too, as pre-echo), and a block where a hit starts is exempt: how a
     // codec renders an attack depends on how it falls on its frames.
+    //
+    // Through intervals each player is an interval late on the clocks'
+    // own terms: an interval that player began at its boundary plays from
+    // carl's next one. So when the interval clocks started apart, each
+    // player has a lag of its own there too: an interval plus carl's start
+    // less theirs (on a CI runner alice's started 11.25 ms after the
+    // others', and her drums were heard 11.25 ms earlier through intervals
+    // than bob's). Each is measured on its own, as the live lags are.
     auto material = [&](long n) { return drums.mix(n); };
     const long d_live = bestLag(x, material, live_at + 300 * ms, live_at + 1300 * ms, 0, 100 * ms);
-    const long d_int = bestLag(x, material, start + 100 * ms, live_at - 100 * ms, L - 50 * ms, L + 50 * ms);
-    std::printf("    carl hears the players %.1f ms late live, %.1f ms through intervals\n", r.ms(d_live), r.ms(d_int));
+    long d_int[2];
+    for (int p = 0; p < 2; ++p) {
+        auto played = [&drums, p](long n) { return drums.player(p, n); };
+        d_int[p] = bestLag(x, played, start + 100 * ms, live_at - 100 * ms, L - 50 * ms, L + 50 * ms);
+    }
+    std::printf("    carl hears the players %.1f ms late live; through intervals alice %.1f ms late and bob %.1f ms "
+                "(an interval and their clocks' starts against carl's: %.1f and %.1f ms)\n",
+                r.ms(d_live), r.ms(d_int[0]), r.ms(d_int[1]), r.ms(L + r[2].clock_from - r[0].clock_from),
+                r.ms(L + r[2].clock_from - r[1].clock_from));
     // carl hears each player through a sink of its own, so each player's
     // live delay is measured again for every 100 ms that plays live, within
     // 10 ms of the first.
@@ -1337,12 +1376,14 @@ TEST(listening_file) {
         for (long b = (c.frame - 30 * ms) / kBlock; b <= (c.frame + B + 30 * ms) / kBlock; ++b)
             (r[2].room[b] ? live : intervals) = true;
         const long da = liveLag(0, c.frame), db = liveLag(1, c.frame);
-        const double mine = std::max(live ? own(c.frame, da, db) : 0.0, intervals ? own(c.frame, d_int, d_int) : 0.0);
+        const double mine =
+            std::max(live ? own(c.frame, da, db) : 0.0, intervals ? own(c.frame, d_int[0], d_int[1]) : 0.0);
         if (!r.calm(c.frame - 100 * ms, c.frame + 100 * ms)) {
             ++skipped;
             continue;
         }
-        if ((live && (onset(c.frame, da) || onset(c.frame, db))) || (intervals && onset(c.frame, d_int))) {
+        if ((live && (onset(c.frame, da) || onset(c.frame, db))) ||
+            (intervals && (onset(c.frame, d_int[0]) || onset(c.frame, d_int[1])))) {
             if (c.d2 > 3 * std::max(c.median, mine)) ++at_onsets;
             continue;
         }

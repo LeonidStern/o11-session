@@ -257,7 +257,8 @@ public:
     // `fallback_ms` at its second late dropout within kFallbackWindowNs (a
     // block, not one asked for again, that comes after its turn; one per
     // concealment). It grows while the audio is concealing, and stays
-    // there for the stream's life.
+    // there for the stream's life. A fixed buffer (no `fallback_ms`) clears
+    // the fallback and the late dropouts counted towards one.
     void configure(double latency_ms, int host_block, int host_rate, double fallback_ms = 0);
     static constexpr std::int64_t kFallbackWindowNs = 10000000000LL;   // 10 s
     void reset();                               // no stream

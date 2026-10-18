@@ -143,7 +143,7 @@ struct LiveRoom {
             }).join();
         }
         server_thread = std::thread([this] {
-            thread::makeLatencyCritical();
+            thread::makeNetworkThread();         // it relays the Live datagrams, as the engines' Live threads send them
             while (!server_stop.load()) server.poll(1);
         });
         side[0].name = "alice";
