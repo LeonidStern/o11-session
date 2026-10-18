@@ -556,6 +556,32 @@ TEST(sink_buffer_falls_back_on_late_audio) {
         CHECK(f.k.stats.late.load() >= 3);
         CHECK_EQ(f.count(LiveEventKind::Fallback), 0);
     }
+    {   // A fixed buffer clears a fallback and the late dropouts counted
+        // towards it: automatic again, it takes two more within 10 s.
+        Feed f(10, 20);
+        f.seconds(2);
+        f.run(8, 4);
+        f.seconds(1);
+        f.run(8, 4);                             // the second within 10 s: it falls back
+        f.seconds(1);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 1);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 20);
+        f.fallback = 0;                          // fixed at 10 ms
+        f.seconds(2);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 10);
+        CHECK(!f.k.stats.fell_back.load());
+        f.fallback = 20;                         // automatic again, within 10 s of both
+        f.seconds(1);
+        CHECK(f.k.playing());
+        f.run(8, 4);
+        f.seconds(1);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 1);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 10);
+        f.run(8, 4);
+        f.seconds(1);
+        CHECK_EQ(f.count(LiveEventKind::Fallback), 2);
+        CHECK_EQ(f.k.stats.buffer_ms.load(), 20);
+    }
     {   // A fixed buffer never falls back.
         Feed f(10, 0);
         f.seconds(2);

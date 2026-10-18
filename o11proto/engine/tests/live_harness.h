@@ -87,13 +87,21 @@ struct Room {
     // audio can arrive; the checks that need a steady stream skip them.
     // The audio thread's wakes don't show every hiccup (it runs as an audio
     // thread, o11proto/realtime.h, as a host's does), so a thread scheduled
-    // as the server's is (thread::makeLatencyCritical(), as the Live network
-    // threads were before they became network threads, real-time on macOS)
-    // watches too: when it wakes that late, the server may have been as
-    // late, and a listener's buffer ran dry.
+    // as the server's is watches too: when it wakes that late, the server
+    // may have been as late, and a listener's buffer ran dry.
+    //
+    // The server's thread here is the test's, and it relays every Live
+    // datagram, so it is a network thread (thread::makeNetworkThread(),
+    // real-time on macOS), as each engine's Live network thread is. It was
+    // latency-critical (user-interactive QoS on macOS), and on a CI runner a
+    // thread scheduled so woke up to 42.7 ms late, 18 times over 10 ms in
+    // one test: a relay that late runs a 20 ms buffer dry, and three such
+    // within 2 s make a clean health report fail (ENGINE.md 16.7), which
+    // starts the 10 s before the advice clears again.
     std::atomic<long> late_us{0}, late_blocks{0}, slow_us{0}, sum_us{0}, calls{0}, slow_calls{0};
     std::atomic<long> plain_late_us{0}, plain_late_count{0};
     std::atomic<int> host_audio_thread{-1};      // whether the host thread became an audio thread
+    std::atomic<int> server_sched{-1};           // how the server's thread is scheduled (thread::NetworkScheduling)
     std::mutex hm;
     std::vector<long> hiccups;                   // the frames they came at
     std::thread audio, watch;
@@ -122,7 +130,7 @@ struct Room {
         if (!ok) std::printf("    the server didn't start\n");
         describeTiming(opt.rate);
         server_thread = std::thread([this] {
-            thread::makeLatencyCritical();
+            server_sched.store(static_cast<int>(thread::makeNetworkThread()));
             while (!server_stop.load()) server.poll(1);
         });
         for (int i = 0; i < opt.sides; ++i) {
@@ -174,15 +182,20 @@ struct Room {
     }
 
     ~Room() {
+        const int ss = server_sched.load();
         std::printf("    the host: woke at most %.1f ms late (%ld blocks over 10 ms; %s), the longest process() "
-                    "%.1f ms, the mean %.3f ms, %ld over 2 ms; a network-like thread woke at most %.1f ms late (%ld "
-                    "times over 10 ms)\n",
+                    "%.1f ms, the mean %.3f ms, %ld over 2 ms; a thread scheduled as the server's (%s) woke at most "
+                    "%.1f ms late (%ld times over 10 ms)\n",
                     late_us.load() / 1000.0, late_blocks.load(),
                     host_audio_thread.load() == 1   ? "an audio thread"
                     : host_audio_thread.load() == 0 ? "not an audio thread"
                                                     : "not started",
                     slow_us.load() / 1000.0, calls.load() ? sum_us.load() / 1000.0 / calls.load() : 0.0,
-                    slow_calls.load(), plain_late_us.load() / 1000.0, plain_late_count.load());
+                    slow_calls.load(),
+                    ss == static_cast<int>(thread::NetworkScheduling::Realtime)          ? "real-time"
+                    : ss == static_cast<int>(thread::NetworkScheduling::LatencyCritical) ? "latency-critical"
+                                                                                         : "unchanged",
+                    plain_late_us.load() / 1000.0, plain_late_count.load());
         if (!side.empty()) std::printf("    %s: %s\n", side[0]->name.c_str(), side[0]->e.liveTestTiming().c_str());
         audio_stop.store(true);
         if (audio.joinable()) audio.join();
@@ -199,7 +212,7 @@ struct Room {
     }
 
     void watchLoop() {
-        thread::makeLatencyCritical();
+        thread::makeNetworkThread();             // as the server's thread is
         while (!audio_stop.load()) {
             const auto t = Clock::now() + std::chrono::milliseconds(1);
             std::this_thread::sleep_until(t);

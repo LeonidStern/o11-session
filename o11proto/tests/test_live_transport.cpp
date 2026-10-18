@@ -19,6 +19,7 @@
 #include "o11proto/client.h"
 #include "o11proto/live.h"
 #include "o11proto/live_transport.h"
+#include "o11proto/realtime.h"
 #include "o11proto/server.h"
 #include "socket_compat.h"
 #include "udp_compat.h"
@@ -212,14 +213,21 @@ struct Player {
 
 // A host's audio thread: it wakes the transports every half millisecond, as
 // the engine's audio does when it has queued, from before their restarts to
-// after. It stops when it goes, so it is declared after what it wakes.
+// after. It is scheduled as an audio thread of that period
+// (o11proto/realtime.h), as a host's is: on macOS an ordinary thread's sleep
+// of 0.5 ms can take 9, and then the test would measure its own waits. It
+// stops when it goes, so it is declared after what it wakes.
 struct Waker {
     std::atomic<bool> stop{false};
+    std::atomic<bool> realtime{false};         // makeAudioThread() took
+    std::atomic<int> sent{0};                  // rounds of wakes
     std::thread thread;
     explicit Waker(std::vector<live::Transport*> ts)
         : thread([this, ts] {
+              realtime.store(o11proto::thread::makeAudioThread(0.0005));
               while (!stop.load()) {
                   for (live::Transport* t : ts) t->wake();
+                  sent.fetch_add(1);
                   std::this_thread::sleep_for(std::chrono::microseconds(500));
               }
           }) {}
@@ -478,19 +486,23 @@ TEST(housekeeping_wait_and_wakes) {
     const int t0 = ticks.load();
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const int alone = ticks.load() - t0;
-    int woken = 0;
+    int woken = 0, sent = 0;
+    bool realtime = false;
     {
         Waker host({&t});
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        const int t1 = ticks.load();
+        const int t1 = ticks.load(), s1 = host.sent.load();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         woken = ticks.load() - t1;
+        sent = host.sent.load() - s1;
+        realtime = host.realtime.load();
     }
     const live::Transport::Timing tm = t.timing();
     t.stop();
-    std::printf("    in 200 ms: %d passes alone, %d woken every 0.5 ms; %llu wakes, the longest wake-up delay %.2f ms "
-                "(%llu over 5 ms); waits of %d ms, the longest %.1f ms\n",
-                alone, woken, static_cast<unsigned long long>(tm.wakes), tm.wake_longest_ms,
+    std::printf("    in 200 ms: %d passes alone, %d woken every 0.5 ms (the host woke it %d times, %s); %llu wakes, "
+                "the longest wake-up delay %.2f ms (%llu over 5 ms); waits of %d ms, the longest %.1f ms\n",
+                alone, woken, sent, realtime ? "an audio thread" : "an ordinary thread",
+                static_cast<unsigned long long>(tm.wakes), tm.wake_longest_ms,
                 static_cast<unsigned long long>(tm.wake_over_5ms), tm.wait_ms, tm.longest_ms);
 #ifdef _WIN32
     CHECK_EQ(tm.wait_ms, 1);                   // wake() does nothing here: every millisecond

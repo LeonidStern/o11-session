@@ -331,7 +331,7 @@ void LiveSink::configure(double latency_ms, int host_block, int host_rate, doubl
     if (latency_ms != base_ms_ || fallback_ms != fallback_ms_ || host_block != host_block_ || host_rate != host_rate_) {
         base_ms_ = latency_ms;
         fallback_ms_ = fallback_ms;
-        if (fallback_ms_ == 0) fell_back_ = false;
+        if (fallback_ms_ == 0) fell_back_ = has_dropout_ = false;   // automatic again, it counts afresh
         const double was = latency_ms_;
         latency_ms_ = fell_back_ ? fallback_ms_ : base_ms_;   // a stream that fell back stays there
         host_block_ = host_block;
