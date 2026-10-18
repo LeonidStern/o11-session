@@ -7,10 +7,11 @@
 #
 # Everything it needs is downloaded at configure time and linked statically: JUCE 8.0.9
 # (AGPLv3 or commercial: see README.md), Opus and FLAC (BSD), miniupnpc and libnatpmp (BSD,
-# for the built-in server's port mapping) and Ableton Link (GPL v2 or later, header-only, with
-# its asio-standalone; so the plug-in built with it is GPL). To use local copies pass
-# -DFETCHCONTENT_SOURCE_DIR_<NAME>=/path for JUCE, OPUS, FLAC, MINIUPNP, LIBNATPMP or LINK
-# (with its modules/asio-standalone).
+# for the built-in server's port mapping), Ableton Link (GPL v2 or later, header-only, with
+# its asio-standalone; so the plug-in built with it is GPL) and, through ../o11proto, standalone
+# Asio 1.38.2 (Boost Software License 1.0, header-only: ../o11proto/third_party/Asio-LICENSE_1_0.txt).
+# To use local copies pass -DFETCHCONTENT_SOURCE_DIR_<NAME>=/path for JUCE, OPUS, FLAC, MINIUPNP,
+# LIBNATPMP, LINK (with its modules/asio-standalone) or ASIO.
 #
 # On Windows build with the static runtime (-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
 # -DCMAKE_POLICY_DEFAULT_CMP0091=NEW) so O11Session.vst3 needs no Visual C++ runtime.
