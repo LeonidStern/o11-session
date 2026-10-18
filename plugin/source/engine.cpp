@@ -1272,6 +1272,8 @@ void Engine::updateUsers(Snapshot &snap)
       }
       uv.joinedAt = it->second;
     }
+    uv.liveHeardMs = (int)lround(m_client->liveUserHeardMs(u));
+    uv.liveFillMs = (int)lround(m_client->liveUserBufferMs(u));
     signature += uv.name + "\n";
     for (int i = 0; ; i ++)
     {
@@ -1635,7 +1637,13 @@ std::string Engine::command(const std::string &lineIn)
     snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s others=%d heard=%d buffer=%d inuse=%d\n",
              s.liveServer ? 1 : 0, s.liveSwitchOn ? 1 : 0, s.liveRoom ? "live" : "intervals", reasons[(int)s.liveReason],
              s.liveReasonWho.c_str(), s.liveReasonOthers, s.liveHeardMs, s.liveBufferMs, s.liveBufferInUseMs);
-    return buf;
+    // each player's stream: how late you hear them and how full its buffer is (benchmarks)
+    std::string line = buf;
+    line.pop_back();
+    for (const auto &uv : s.users)
+      if (uv.liveHeardMs >= 0 || uv.liveFillMs >= 0)
+        line += " " + uv.displayName + "=" + std::to_string(uv.liveHeardMs) + "/" + std::to_string(uv.liveFillMs);
+    return line + "\n";
   }
   if (verb == "vote")
   {

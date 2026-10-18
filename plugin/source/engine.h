@@ -93,6 +93,8 @@ struct RemoteUserView
   std::string name;        // as the server names the user (name@address)
   std::string displayName; // without the @address
   double joinedAt = 0;     // when they joined the room you're in (nowSeconds()), 0 if they were there first
+  int liveHeardMs = -1;    // while their Live stream plays here: how late you hear them, -1 when not known
+  int liveFillMs = -1;     // ... and how full its jitter buffer is
   std::vector<RemoteChannelView> channels;
 };
 
