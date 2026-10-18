@@ -2,6 +2,9 @@
 // cookie and the system random source. See PROTOCOL.md section 15.
 #include "o11proto/live.h"
 
+#include <algorithm>
+#include <cstring>
+
 #include "o11proto/message.h"
 
 #ifdef _WIN32
@@ -77,6 +80,100 @@ bool decode(const std::vector<std::uint8_t>& p, ServerLive& out) {
     return true;
 }
 
+// ----------------------------------------------------------- 0x09, 0x86
+
+std::vector<std::uint8_t> encode(const LivePaths& m) {
+    Writer w;
+    w.u8(kLivePathsVersion);
+    w.u8(static_cast<std::uint8_t>(kLivePathsFixed));
+    w.u16(static_cast<std::uint16_t>(kLivePathRecord));
+    w.u32(0);
+    for (const auto& r : m.peers) {
+        w.u32(r.id);
+        w.u32(static_cast<std::uint32_t>(r.key));
+        w.u32(static_cast<std::uint32_t>(r.key >> 32));
+        std::uint8_t a[4];
+        std::memcpy(a, &r.public_ip, 4);
+        for (std::uint8_t b : a) w.u8(b);
+        w.u16(r.public_port);
+        std::memcpy(a, &r.lan_ip, 4);
+        for (std::uint8_t b : a) w.u8(b);
+        w.u16(r.lan_port);
+    }
+    return w.data();
+}
+
+bool decode(const std::vector<std::uint8_t>& p, LivePaths& out) {
+    if (p.size() < kLivePathsFixed) return false;
+    const std::uint8_t* d = p.data();
+    const std::size_t fixed = d[1], rec = getLE16(d + 2);
+    if (d[0] == 0 || fixed < kLivePathsFixed || fixed > p.size() || rec < kLivePathRecord) return false;
+    out = LivePaths();
+    out.version = d[0];
+    for (std::size_t at = fixed, n = 0; n < kMaxPeerRecords && p.size() - at >= rec; at += rec, ++n) {
+        PathRecord r;
+        r.id = getLE32(d + at);
+        r.key = getLE64(d + at + 4);
+        std::memcpy(&r.public_ip, d + at + 12, 4);
+        r.public_port = getLE16(d + at + 16);
+        std::memcpy(&r.lan_ip, d + at + 18, 4);
+        r.lan_port = getLE16(d + at + 22);
+        if (r.id == 0 || r.key == 0) continue;
+        out.peers.push_back(r);
+    }
+    return true;
+}
+
+std::vector<std::uint8_t> encode(const LiveLan& m) {
+    Writer w;
+    w.u8(1);
+    w.u8(0);
+    w.u16(m.port);
+    std::uint8_t a[4];
+    std::memcpy(a, &m.ip, 4);
+    for (std::uint8_t b : a) w.u8(b);
+    return w.data();
+}
+
+bool decode(const std::vector<std::uint8_t>& p, LiveLan& out) {
+    if (p.size() < kLiveLanSize || p[0] == 0) return false;
+    out = LiveLan();
+    out.port = getLE16(p.data() + 2);
+    std::memcpy(&out.ip, p.data() + 4, 4);
+    return true;
+}
+
+std::vector<std::uint8_t> encode(const PathsReport& m) {
+    Writer w;
+    w.u8(kLivePathsReportVersion);
+    w.u8(m.flags);
+    const std::size_t n = std::min<std::size_t>(m.peers.size(), kMaxPeerRecords);
+    w.u16(static_cast<std::uint16_t>(n));
+    for (std::size_t i = 0; i < n; ++i) {
+        w.u32(m.peers[i].id);
+        w.u8(static_cast<std::uint8_t>(m.peers[i].state));
+        w.u8(0);
+        w.u16(0);
+    }
+    return w.data();
+}
+
+bool decode(const std::vector<std::uint8_t>& p, PathsReport& out) {
+    if (p.size() < kLivePathsReportFixed || p[0] == 0) return false;
+    out = PathsReport();
+    out.flags = p[1];
+    const std::size_t count = getLE16(p.data() + 2);
+    for (std::size_t i = 0, at = kLivePathsReportFixed;
+         i < count && i < kMaxPeerRecords && at + kLivePathsReportRecord <= p.size();
+         ++i, at += kLivePathsReportRecord) {
+        PathsReport::Entry e;
+        e.id = getLE32(p.data() + at);
+        e.state = p[at + 4] <= 2 ? static_cast<PathState>(p[at + 4]) : PathState::Opening;
+        if (e.id != 0) out.peers.push_back(e);
+    }
+    return true;
+}
+
 // -------------------------------------------------------------- SipHash
 
 namespace {
@@ -138,6 +235,14 @@ std::uint64_t helloCookie(const std::uint8_t secret[16], std::uint32_t peer_id, 
     m[17] = port[1];
     putLE32(m + 18, epoch);
     return siphash24(secret, m, sizeof(m));
+}
+
+std::uint64_t pairKey(const std::uint8_t secret[16], std::uint32_t a, std::uint32_t b) {
+    std::uint8_t m[8];
+    putLE32(m, a < b ? a : b);
+    putLE32(m + 4, a < b ? b : a);
+    const std::uint64_t k = siphash24(secret, m, sizeof(m));
+    return k != 0 ? k : 1;
 }
 
 bool constantTimeEqual(std::uint64_t a, std::uint64_t b) {

@@ -574,6 +574,16 @@ struct StaysLive {
     bool until(const std::function<bool()>& pred, double seconds) {
         return r.until([&] { look(); return pred(); }, seconds);
     }
+    // Advice lasts until 10 s after the reports are clean again (16.7).
+    // Advice still there from a hiccup of the machine's (both players
+    // named, a hiccup before liveAndCalm()'s calm second) clears first, so
+    // that the advice and the notices checked are the test's own.
+    bool clearFirst() {
+        if (none(0) && none(1)) return true;
+        const bool cleared = r.until([&] { return none(0) && none(1); }, 25);
+        std::printf("    the advice from the machine's hiccup %s\n", cleared ? "clears first" : "doesn't clear within 25 s");
+        return cleared && r.liveAndCalm(20);
+    }
 };
 
 TEST(sender_stall_gives_advice_and_stays_live) {
@@ -581,6 +591,7 @@ TEST(sender_stall_gives_advice_and_stays_live) {
     REQUIRE(r.connect());
     REQUIRE(r.liveAndCalm(20));
     StaysLive w{r};
+    REQUIRE(w.clearFirst());
     const std::size_t seen[2] = {r.side[0].noticeCount(), r.side[1].noticeCount()};
     const long block = r.frames.load() / kBlock;
     const Server::IntervalTraffic t0 = r.server.intervalTraffic();
@@ -626,6 +637,7 @@ TEST(packet_loss_gives_advice_and_stays_live) {
     REQUIRE(r.connect());
     REQUIRE(r.liveAndCalm(20));
     StaysLive w{r};
+    REQUIRE(w.clearFirst());
     const std::size_t seen = r.side[1].noticeCount();
     const long block = r.frames.load() / kBlock;
     const Server::IntervalTraffic t0 = r.server.intervalTraffic();

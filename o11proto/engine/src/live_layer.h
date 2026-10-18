@@ -90,6 +90,8 @@ struct LiveLayer {
 
     // A new 0x07 (a full state).
     void apply(const o11proto::live::ServerLive& m);
+    // A new 0x09: the direct paths to the room's other players (all-to-all).
+    void applyPaths(const o11proto::live::LivePaths& m);
     // Starts (or restarts) the transport; false and the reason on failure.
     bool start(const std::string& addr, std::uint16_t port, std::string& error);
     void stop();                                // the source's /stops go out first
@@ -109,7 +111,26 @@ struct LiveLayer {
     }
     void setTestSendGap(int ms) { transport_.setTestSendGap(ms); }
     void setTestSendHold(int ms) { transport_.setTestSendHold(ms); }
+    void setTestForceRelay(bool on) {           // sends through the relay only, and says so (0x87)
+        force_relay.store(on);
+        transport_.setTestForceRelay(on);
+    }
+    void setTestBlocked(const std::string& name, bool on);   // by user name, through reconnects
     live::Transport::Timing networkTiming() const { return transport_.timing(); }
+    // All-to-all: the listed peer of this name (0 for none), and the
+    // probes' round trip to it.
+    std::uint32_t peerId(const std::string& name);
+    double probeRttMs(std::uint32_t peer) const { return transport_.probeRttMs(peer); }
+    bool pathUp(std::uint32_t peer) const { return transport_.pathUp(peer); }
+    void localAddress(std::uint32_t* ip, std::uint16_t* port) const { transport_.localAddress(ip, port); }
+    // The paths' report (0x87) to send now, false when it is the one last
+    // sent (or there is nothing to report).
+    bool pathsReport(std::vector<std::uint8_t>* bytes);
+    bool has_paths = false;                     // a 0x09 came on this connection
+    o11proto::live::LivePaths paths;            // the latest
+    bool lan_sent = false;                      // CLIENT_LIVE_LAN went for this Live client's socket
+    std::vector<std::uint8_t> paths_sent;       // the last CLIENT_LIVE_PATHS
+    std::atomic<bool> force_relay{false};       // the test setting
 
     o11proto::live::ServerLive msg;
     bool has_msg = false;
@@ -222,10 +243,14 @@ struct LiveLayer {
         double rtt_ms = -1;                     // smoothed
         std::uint64_t pong_t2 = 0;
         std::uint32_t pong_lost = 0;
+        // The path its blocks come by (1 directly, 2 the relay, 0 none yet),
+        // and the one the latest came by, how many in a row.
+        int path = 0, path_seen = 0, path_run = 0;
         void clearStream() {
             has_stream = stopped = got_data = false;
             stream = -1;
             source_latency = 0;
+            path = path_seen = path_run = 0;
         }
     };
     std::vector<Peer> peers;                    // the listed peers, in the message's order
@@ -233,7 +258,7 @@ struct LiveLayer {
     bool net_room_on = false;
     std::vector<std::uint32_t> stop_to;         // peers no longer listed that get a /stop
 
-    void onData(std::uint32_t from, const std::uint8_t* p, std::size_t n);
+    void onData(std::uint32_t from, const std::uint8_t* p, std::size_t n, bool direct);
     void onTick();
     void onClosing();
 
@@ -242,7 +267,10 @@ private:
     Peer* findPeer(std::uint32_t id);
     void send(std::uint32_t dest, const std::uint8_t* p, std::size_t n) { transport_.send(dest, p, n); }
     bool hostRunning(std::int64_t now_ns) const;
-    void sinkData(int s, const std::uint8_t* p, std::size_t n, TimePoint now);
+    void sinkData(int s, const std::uint8_t* p, std::size_t n, TimePoint now, bool direct);
+    void sendAudio(const std::uint8_t* p, std::size_t n);   // a block to every listed peer
+    void applyBlocked();
+    std::vector<std::string> blocked_names_;    // setTestBlocked()
     void sinkOsc(int s, const aoo::OscMessage& m, TimePoint now);
     void sourceRequest(Peer& peer, const std::uint8_t* p, std::size_t n, TimePoint now);
     void sourceOsc(Peer& peer, const aoo::OscMessage& m, TimePoint now);

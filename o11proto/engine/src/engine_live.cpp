@@ -97,8 +97,14 @@ void Engine::liveNotice(const std::string& text, bool error) {
 void Engine::liveMessage(const live::ServerLive& m) { live_->apply(m); }
 
 void Engine::liveRawMessage(const RawMessage& m) {
+    if (!client_.loggedIn()) return;
+    if (m.type == live::kMsgServerLivePaths) {  // all-to-all: the direct paths
+        live::LivePaths p;
+        if (live_enabled_.load() && live::decode(m.payload, p)) live_->applyPaths(p);
+        return;
+    }
     live::LiveRoom r;
-    if (m.type != live::kMsgServerLiveRoom || !client_.loggedIn() || !live::decode(m.payload, r)) return;
+    if (m.type != live::kMsgServerLiveRoom || !live::decode(m.payload, r)) return;
     live_->applyRoom(r, Clock::now());
 }
 
@@ -139,6 +145,84 @@ void Engine::setLiveTestLoss(double fraction) { live_->setTestLoss(fraction); }
 void Engine::setLiveTestSendGap(int ms) { live_->setTestSendGap(ms); }
 
 void Engine::setLiveTestSendHold(int ms) { live_->setTestSendHold(ms); }
+
+void Engine::setLiveTestForceRelay(bool on) { live_->setTestForceRelay(on); }
+
+void Engine::setLiveTestBlockPeer(const std::string& name, bool blocked) { live_->setTestBlocked(name, blocked); }
+
+const char* liveRouteName(LiveRoute route) {
+    switch (route) {
+    case LiveRoute::Direct: return "direct";
+    case LiveRoute::Relay: return "relay";
+    case LiveRoute::None: break;
+    }
+    return "none";
+}
+
+LiveRoomRoute Engine::liveRoomRoute() const {
+    const LiveLayer& L = *live_;
+    LiveRoomRoute r;
+    if (!L.has_room) return r;
+    switch (L.room.route) {
+    case live::RoomRoute::Direct: r.route = LiveRoute::Direct; break;
+    case live::RoomRoute::Relay: r.route = LiveRoute::Relay; break;
+    default: return r;
+    }
+    if (r.route != LiveRoute::Relay) return r;
+    switch (L.room.why) {
+    case live::RelayWhy::NoPath: r.reason = LiveRelayReason::NoPath; break;
+    case live::RelayWhy::NoDirect: r.reason = LiveRelayReason::NoDirectClient; break;
+    case live::RelayWhy::RelayOnly: r.reason = LiveRelayReason::RelayOnly; break;
+    default: break;
+    }
+    r.user_a = L.room.why_a;
+    r.user_b = L.room.why_b;
+    r.direct_possible = L.room.direct_possible;
+    return r;
+}
+
+std::string Engine::liveRoomRouteText() const {
+    const LiveRoomRoute r = liveRoomRoute();
+    if (r.route != LiveRoute::Relay) return liveRouteName(r.route);
+    const std::string a = liveDisplayName(r.user_a), b = liveDisplayName(r.user_b);
+    std::string s = "relay";
+    switch (r.reason) {
+    case LiveRelayReason::NoPath: s += ": " + a + " and " + b + " had no direct path"; break;
+    case LiveRelayReason::NoDirectClient: s += ": " + a + "'s client doesn't send directly"; break;
+    case LiveRelayReason::RelayOnly: s += ": " + a + "'s client sends through the relay only"; break;
+    default: break;
+    }
+    if (r.direct_possible) s += "; everyone can connect directly again";
+    return s;
+}
+
+void Engine::setLiveRoomDirect() {
+    if (status_.load() == Status::Ok && client_.loggedIn()) say("!live direct");
+}
+
+bool Engine::liveUserHasDirectPath(int user) const {
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u) return false;
+        name = u->name;
+    }
+    const std::uint32_t id = live_->peerId(name);
+    return id && live_->pathUp(id);
+}
+
+double Engine::liveUserProbeRttMs(int user) const {
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u) return -1;
+        name = u->name;
+    }
+    const std::uint32_t id = live_->peerId(name);
+    return id ? live_->probeRttMs(id) : -1;
+}
 
 std::string Engine::liveTestTiming() const {
     const live::Transport::Timing t = live_->networkTiming();
@@ -288,6 +372,7 @@ const char* liveEventName(LiveEventKind kind) {
     case LiveEventKind::SpeedOff: return "speed off";
     case LiveEventKind::End: return "end";
     case LiveEventKind::Fallback: return "fallback";
+    case LiveEventKind::Route: return "route";
     }
     return "none";
 }
@@ -326,6 +411,7 @@ bool Engine::liveUserCounters(int user, LiveCounters* out) const {
     const std::int32_t b = st.buffer_ms.load();
     c.buffer_ms = b > 0 ? b : -1;
     c.fell_back = st.fell_back.load();
+    c.route = static_cast<LiveRoute>(st.route.load());
     if (st.gen.load() != g) return false;        // cleared meanwhile
     *out = c;
     return true;
@@ -425,6 +511,19 @@ void Engine::liveControl() {
         L.addr.clear();
         L.port = 0;
     }
+
+    // All-to-all: once a Live client has its socket and the server has
+    // sent the paths, its LAN address, for the players on its network.
+    if (client_.loggedIn() && L.has_paths && L.running.load() && !L.lan_sent) {
+        live::LiveLan lan;
+        L.localAddress(&lan.ip, &lan.port);
+        if (lan.port != 0) client_.sendRaw(live::kMsgClientLiveLan, live::encode(lan));
+        L.lan_sent = true;
+    }
+    // And how each of its paths stands, whenever that changes: the server
+    // works out the room's route from these.
+    std::vector<std::uint8_t> paths_report;
+    if (client_.loggedIn() && L.pathsReport(&paths_report)) client_.sendRaw(live::kMsgClientLivePaths, paths_report);
 
     // 6.4: health. Then each user's slot, and a mixer for each user's
     // channel 0 once the server has Live (made here, outside the lock).

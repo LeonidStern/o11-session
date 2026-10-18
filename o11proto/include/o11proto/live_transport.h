@@ -1,7 +1,21 @@
 // o11proto - the client side of Live UDP (PROTOCOL.md 15.5 and 15.6): one
-// IPv4 socket connected to the relay, the hellos and their cookie, and
-// opaque payloads in and out. What the payloads mean is the caller's (the
-// engine's Live layer, ENGINE.md section 15).
+// IPv4 socket for the relay and the direct paths, the hellos and their
+// cookie, the probes that open a direct path to each of the room's other
+// players (15.10), and opaque payloads in and out. What the payloads mean
+// is the caller's (the engine's Live layer, ENGINE.md section 15).
+//
+// All-to-all: with the paths of 0x09 (setPaths()), a payload to one peer
+// goes to it directly once a probe of the pair was answered, and through
+// the relay (destination: its id) while the path opens and once it is
+// unreachable (no answer for kPathDeadMs). A path that was up and misses
+// its answers for kPathSuspectMs is suspect: payloads go both ways until
+// an answer comes or it is unreachable. Without paths everything goes
+// through the relay, as before. setRoomRoute() takes the room's route
+// (SERVER_LIVE_ROOM): without the server's relay fallback, nothing goes to
+// a peer whose path isn't up (direct only: not even while it opens, nor
+// the second copy while suspect); with it, while the room is on the relay,
+// everything goes through the relay. The paths are probed throughout, and
+// pathStates() says how each stands, for CLIENT_LIVE_PATHS.
 //
 // The transport runs its own network thread. Every callback runs on that
 // thread, and send() may only be called from inside one: the thread owns the
@@ -27,6 +41,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "o11proto/live.h"
 
@@ -51,8 +66,9 @@ public:
 
     // Set before start(); each runs on the network thread.
     // A data datagram that passed the client's checks: `from` is the
-    // sender's peer id (never 0), the payload is 1..1452 bytes.
-    std::function<void(std::uint32_t from, const std::uint8_t* payload, std::size_t len)> on_data;
+    // sender's peer id (never 0), the payload is 1..1452 bytes, `direct`
+    // when it came from the sender itself (else through the relay).
+    std::function<void(std::uint32_t from, const std::uint8_t* payload, std::size_t len, bool direct)> on_data;
     // After each pass over the socket: at least every Options::wait_ms, and
     // soon after each datagram and each wake().
     std::function<void()> on_tick;
@@ -105,9 +121,51 @@ public:
     Timing timing() const;
 
     // Network thread only. One data datagram to `dest` (0 = the room's
-    // other senders); false when the payload is empty or too long, or the
-    // send failed.
+    // other senders, through the relay): directly where its path is up,
+    // else through the relay; false when the payload is empty or too long,
+    // or the send failed.
     bool send(std::uint32_t dest, const std::uint8_t* payload, std::size_t len);
+
+    // The direct paths. Any thread. setPaths() takes the room's other
+    // players that can be reached directly (0x09, a full list each time;
+    // ports in host order, addresses in network order, 0 for none): a
+    // peer already listed keeps its path (a new key opens it again),
+    // the others are forgotten. A peer's loopback address is the relay's
+    // when the relay isn't on loopback itself (a player who hosts the room).
+    struct PathPeer {
+        std::uint32_t id = 0;
+        std::uint64_t key = 0;                  // the pair's key
+        std::uint32_t public_ip = 0;
+        std::uint16_t public_port = 0;
+        std::uint32_t lan_ip = 0;
+        std::uint16_t lan_port = 0;
+    };
+    void setPaths(const std::vector<PathPeer>& peers);
+    bool hasPaths() const;                      // setPaths() listed any
+    // How a payload to `peer` goes now: Direct (also while suspect), Relay
+    // (a peer without a path, every peer while the room is on the relay or
+    // with setTestForceRelay()), Off (direct only and its path isn't up:
+    // send() drops it); None while stopped.
+    enum class Route : std::uint8_t { None = 0, Direct = 1, Relay = 2, Off = 3 };
+    Route route(std::uint32_t peer) const;
+    bool pathUp(std::uint32_t peer) const;      // its direct path holds (up or suspect)
+    // The room's route: whether the server falls back to the relay (else
+    // direct only), and whether the room is on the relay now.
+    void setRoomRoute(bool relay_fallback, bool room_relay);
+    std::vector<PathsReport::Entry> pathStates() const;   // each listed peer's path, as setPaths() listed them
+    double probeRttMs(std::uint32_t peer) const;   // the latest answered probe's round trip; -1 for none
+    // After start(): the socket's port, and its LAN address toward the
+    // relay (0 when that is loopback): for CLIENT_LIVE_LAN.
+    void localAddress(std::uint32_t* lan_ip, std::uint16_t* port) const;
+    // Test hooks. setTestForceRelay(): no direct path at all, every path
+    // unreachable at once (nothing sent directly, no probes, direct
+    // datagrams dropped). setTestBlocked(): nothing goes between this
+    // client and these peers directly, either way, as on a network that
+    // stops letting it through; the paths go suspect and unreachable by the
+    // probe rule, and open again with the first probe answered once the
+    // block is lifted.
+    void setTestForceRelay(bool on);
+    void setTestBlocked(const std::vector<std::uint32_t>& peers);
 
     // Any thread.
     bool serverAnswered() const { return answered_.load(); }        // a hello reply accepted
@@ -116,6 +174,8 @@ public:
     std::uint64_t datagramsSent() const { return sent_.load(); }
     std::uint64_t datagramsReceived() const { return received_.load(); }   // data passed to on_data
     std::uint64_t datagramsDropped() const { return dropped_.load(); }     // failed a check (or the test loss)
+    std::uint64_t directSent() const { return direct_sent_.load(); }       // data sent directly
+    std::uint64_t directReceived() const { return direct_received_.load(); }   // data received directly
 
 private:
     struct Impl;
@@ -124,9 +184,12 @@ private:
     std::atomic<double> rtt_ms_{-1.0};
     std::atomic<std::uint64_t> cookie_{0};
     std::atomic<std::uint64_t> sent_{0}, received_{0}, dropped_{0};
+    std::atomic<std::uint64_t> direct_sent_{0}, direct_received_{0};
     void loop();
     void sendHello();
     void handleDatagram(const std::uint8_t* d, std::size_t n);
+    void handleDirect(const std::uint8_t* d, std::size_t n, std::uint32_t ip, std::uint16_t port);
+    void probePaths();
 };
 
 }  // namespace live

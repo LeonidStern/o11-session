@@ -105,7 +105,8 @@ if(O11PROTO_BUILD_ENGINE)
   endforeach()
 
   # Live mode (ENGINE.md section 16): the unit tests reach the engine's internal headers.
-  foreach(t test_engine_live_units test_engine_live test_engine_live_room test_engine_live_tone)
+  foreach(t test_engine_live_units test_engine_live test_engine_live_room test_engine_live_tone
+            test_engine_live_paths)
     add_executable(${t} engine/tests/${t}.cpp)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
                                             ${CMAKE_CURRENT_SOURCE_DIR}/engine/src)

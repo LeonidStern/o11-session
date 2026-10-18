@@ -315,6 +315,7 @@ void Client::answerLicence(bool agree) {
 void Client::sendLogin(bool licence_agreed) {
     std::uint32_t caps = opt_.codec_caps & kCapCodecMask;
     if (opt_.live) caps |= live::kCapLive;
+    if (opt_.live && opt_.live_direct) caps |= live::kCapLiveDirect;
     if (licence_pending_) {
         if (!licence_agreed && !opt_.login_when_licence_refused) {
             fail("licence not agreed");

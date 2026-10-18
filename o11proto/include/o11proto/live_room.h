@@ -27,7 +27,7 @@ namespace live {
 constexpr std::uint8_t kMsgClientLiveReport = 0x85;   // client -> server
 constexpr std::uint8_t kMsgServerLiveRoom = 0x08;     // server -> client
 constexpr std::uint8_t kLiveReportVersion = 1;
-constexpr std::uint8_t kLiveRoomVersion = 2;
+constexpr std::uint8_t kLiveRoomVersion = 3;
 constexpr std::size_t kLiveReportSize = 8;
 constexpr std::size_t kLiveRoomFixed = 4;             // then the advice's user name, then (version 2) the count
 
@@ -62,25 +62,64 @@ enum class Advice : std::uint8_t {
     CantLive = 2,      // the user can't play Live: no Live client, no UDP, or no place among the senders
 };
 
+// How the room's Live audio goes between its players (all-to-all,
+// PROTOCOL.md 15.10). Direct: each player sends to each other player
+// directly where the pair's path is up, and only there; a pair whose path
+// is unreachable (one of the two reports it so: no probe answered for
+// kPathDeadMs) can't hear each other, and both are "can't play Live"
+// advice. A player that can't send directly (no client_caps bit 17, or
+// relay-only in its CLIENT_LIVE_PATHS) has no paths, and the others send to
+// it, and it to the room, through the relay.
+//
+// With the server's backend option relay_fallback (kRouteRelayFallback),
+// a pair whose path is still opening goes through the relay meanwhile, and
+// once a pair of bound senders has no direct path, or a bound sender can't
+// send directly, the room goes Relay: every player sends once to the room
+// through the relay. It stays Relay until a player sends `!live direct`
+// (shown nowhere); while it is, the paths are still probed, and
+// `direct_possible` says when every pair has a direct path again. A room
+// with no Live player starts Direct again. None: the server has no direct
+// paths.
+enum class RoomRoute : std::uint8_t { None = 0, Direct = 1, Relay = 2 };
+// Why the room is Relay: the first of these the server found.
+enum class RelayWhy : std::uint8_t {
+    None = 0,
+    NoPath = 1,          // the pair `why_a`, `why_b` had no direct path
+    NoDirect = 2,        // `why_a`'s client doesn't send directly (no client_caps bit 17)
+    RelayOnly = 3,       // `why_a`'s client sends through the relay only (CLIENT_LIVE_PATHS)
+};
+constexpr std::uint8_t kRouteDirectPossible = 0x01;   // the route's flags
+constexpr std::uint8_t kRouteRelayFallback = 0x02;
+
+
 // SERVER_LIVE_ROOM: u8 version, u8 mode (0 intervals, 1 live), u8 the
 // advice's reason, u8 reserved (0), string: the advice's user name ("" with
 // no advice), then in version 2 u16 how many players have trouble (the one
-// named among them; 0 with no advice). The mode is the room's switch; the
-// advice comes only while the room is Live.
+// named among them; 0 with no advice), then in version 3 the route: u8
+// route (RoomRoute), u8 flags (kRouteDirectPossible, kRouteRelayFallback), u8 why (RelayWhy), u8
+// reserved (0), and two strings, the names `why` gives ("" for none). The
+// mode is the room's switch; the advice comes only while the room is Live.
 struct LiveRoom {
     std::uint8_t version = kLiveRoomVersion;
     bool live = false;
     Advice advice = Advice::None;
     std::string user;
     std::uint16_t count = 0;
+    RoomRoute route = RoomRoute::None;
+    bool relay_fallback = false;               // the server's backend option
+    bool direct_possible = false;              // Relay only
+    RelayWhy why = RelayWhy::None;             // Relay only
+    std::string why_a, why_b;
 };
 std::vector<std::uint8_t> encode(const LiveRoom& m);
 // False (ignore it) when shorter than 4 bytes or the version is 0. A mode
 // other than 1 is intervals, a reason above 2 is none; the name runs to the
 // first NUL or the end. Version 1 (where the reason said why the room was
 // on intervals) has no count: 1 with a reason. A later version is read as
-// 2, its count as 1 with a reason when the two bytes after the name's NUL
-// are missing, and bytes after them are ignored.
+// 3, its count as 1 with a reason when the two bytes after the name's NUL
+// are missing, its route as None when the four after the count are, and
+// bytes after the route's names are ignored. A route above 2 is None, a
+// reason above 3 none; a name runs to its NUL or the end.
 bool decode(const std::vector<std::uint8_t>& p, LiveRoom& out);
 
 // ----------------------------------------------- the server's advice
@@ -116,6 +155,10 @@ public:
         LiveReport report;
         bool was_clean = false;          // has reported clean at some time since joining
         double joined = 0;               // seconds, the same clock as update()'s
+        // All-to-all, direct only: how many of its pairs have no direct
+        // path. It can't play Live with them: "can't play Live", the one
+        // with the most named first.
+        int no_path = 0;
     };
     struct State {
         Advice advice = Advice::None;

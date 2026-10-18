@@ -40,6 +40,13 @@ std::vector<std::uint8_t> encode(const LiveRoom& m) {
     w.u8(0);
     w.str(m.user);
     w.u16(m.count);
+    w.u8(static_cast<std::uint8_t>(m.route));
+    w.u8(static_cast<std::uint8_t>((m.direct_possible ? kRouteDirectPossible : 0) |
+                                   (m.relay_fallback ? kRouteRelayFallback : 0)));
+    w.u8(static_cast<std::uint8_t>(m.why));
+    w.u8(0);
+    w.str(m.why_a);
+    w.str(m.why_b);
     return w.data();
 }
 
@@ -54,6 +61,19 @@ bool decode(const std::vector<std::uint8_t>& p, LiveRoom& out) {
     out.user.assign(reinterpret_cast<const char*>(p.data() + kLiveRoomFixed), end - kLiveRoomFixed);
     out.count = out.advice != Advice::None ? 1 : 0;
     if (out.version >= 2 && end + 3 <= p.size()) out.count = getLE16(p.data() + end + 1);
+    std::size_t at = end + 3;                  // the route (version 3)
+    if (out.version < 3 || at + 4 > p.size()) return true;
+    out.route = p[at] <= 2 ? static_cast<RoomRoute>(p[at]) : RoomRoute::None;
+    out.direct_possible = (p[at + 1] & kRouteDirectPossible) != 0;
+    out.relay_fallback = (p[at + 1] & kRouteRelayFallback) != 0;
+    out.why = p[at + 2] <= 3 ? static_cast<RelayWhy>(p[at + 2]) : RelayWhy::None;
+    at += 4;
+    for (std::string* name : {&out.why_a, &out.why_b}) {
+        std::size_t e = at;
+        while (e < p.size() && p[e] != 0) ++e;
+        if (at < p.size()) name->assign(reinterpret_cast<const char*>(p.data() + at), e - at);
+        at = e + 1;
+    }
     return true;
 }
 
@@ -88,6 +108,9 @@ const RoomAdvice::State& RoomAdvice::update(double now, bool live, const std::ve
         } else if (p.was_bound && !p.bound) {
             what[i] = Advice::Dropouts;
             worst[i] = everyone;
+        } else if (p.no_path > 0) {
+            what[i] = Advice::CantLive;
+            worst[i] = std::min(everyone, p.no_path);
         }
     }
     for (const Player& q : players) {
