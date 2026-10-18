@@ -189,6 +189,8 @@ private:
   unsigned long long m_chatRevision = ~0ull;
   double m_eventsSince = -1;    // the room the events list was made for (Snapshot::roomSince)
   int m_chipsShown = -1;        // how many chips the room panel was laid out for
+  std::string m_syncChip = "DAW"; // the DAW's name the room panel was laid out for ("Ableton", "Link")
+  float m_syncTextW = 0;          // the width it gave the DAW's tempo
   struct Vote
   {
     std::string who; // "You" for you
