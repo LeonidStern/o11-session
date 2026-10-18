@@ -316,12 +316,17 @@ void MenuBox::paint(juce::Graphics &g)
   g.fillPath(p);
 }
 
+void MenuBox::setEntryEnabled(int index, bool enabled)
+{
+  if (index >= 0 && index < (int)m_entryEnabled.size()) m_entryEnabled[(size_t)index] = enabled;
+}
+
 void MenuBox::mouseDown(const juce::MouseEvent &e)
 {
   if (!isEnabled() || !e.mods.isLeftButtonDown()) return;
   juce::PopupMenu menu;
   menu.setLookAndFeel(&getLookAndFeel());
-  for (size_t i = 0; i < m_entries.size(); i ++) menu.addItem((int)i + 1, str(m_entries[i]), true, (int)i == m_current);
+  for (size_t i = 0; i < m_entries.size(); i ++) menu.addItem((int)i + 1, str(m_entries[i]), m_entryEnabled[i], (int)i == m_current);
   menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this).withMinimumWidth(getWidth()),
                      [safe = juce::Component::SafePointer<MenuBox>(this)](int result) {
     if (!safe || result <= 0) return;
