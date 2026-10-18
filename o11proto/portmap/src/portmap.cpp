@@ -7,7 +7,6 @@
 // after TCP and with TCP's lease; a UDP failure never fails the TCP mapping.
 #include "o11proto/portmap.h"
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>

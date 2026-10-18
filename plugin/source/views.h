@@ -187,7 +187,6 @@ public:
   void setEntryEnabled(int index, bool enabled); // a greyed entry can't be picked
   void setShown(const std::string &text); // what the box says (the room's value may not be one of the choices)
   void setCurrentIndex(int index) { m_current = index; } // the checked entry, -1 for none
-  int currentIndex() const { return m_current; }
   std::function<void(int)> onSelect; // an entry was picked
   void paint(juce::Graphics &g) override;
   void mouseDown(const juce::MouseEvent &e) override;
@@ -259,7 +258,6 @@ class LevelMeter : public juce::Component, public juce::SettableTooltipClient
 public:
   LevelMeter() = default;
   void setLevel(float peak, double now); // the latest peak (linear), at now (seconds)
-  bool clipped() const { return m_clip; }
   void paint(juce::Graphics &g) override;
   void mouseDown(const juce::MouseEvent &e) override; // puts the clip light out
 

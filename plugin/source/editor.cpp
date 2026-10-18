@@ -8,7 +8,6 @@
 #include "editor.h"
 
 #include <math.h>
-#include <string.h>
 #include <algorithm>
 #include <chrono>
 #include <vector>

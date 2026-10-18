@@ -1,8 +1,6 @@
 // o11proto - non-blocking framed TCP connection, on an Asio socket.
 #include "o11proto/connection.h"
 
-#include <cstring>
-
 #include "socket_compat.h"
 
 namespace o11proto {

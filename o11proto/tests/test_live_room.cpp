@@ -4,9 +4,7 @@
 // whose transports bind and whose reports are written by hand. The room's
 // mode follows its switch alone.
 #include <atomic>
-#include <cstring>
 #include <functional>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>

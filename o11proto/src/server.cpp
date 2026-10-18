@@ -5,9 +5,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cmath>
-#include <cstring>
 #include <random>
-#include <sstream>
 
 #include "o11proto/live.h"
 #include "o11proto/sha1.h"

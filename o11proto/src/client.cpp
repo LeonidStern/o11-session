@@ -2,7 +2,6 @@
 #include "o11proto/client.h"
 
 #include <chrono>
-#include <cstring>
 #include <random>
 
 #include "o11proto/sha1.h"
