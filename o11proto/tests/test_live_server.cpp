@@ -768,9 +768,9 @@ TEST(freshness) {                                   // 18
 }
 
 TEST(rate_limit) {                                  // 19
-    setEnv("NINJAM_LIVE_STATS_SECONDS", "1");
+    setEnv("O11_LIVE_STATS_SECONDS", "1");
     Harness h(LiveMode::On);
-    setEnv("NINJAM_LIVE_STATS_SECONDS", "");
+    setEnv("O11_LIVE_STATS_SECONDS", "");
     LiveClient a, b;
     REQUIRE(h.login(a, "anonymous:a"));
     REQUIRE(h.login(b, "anonymous:b"));

@@ -68,8 +68,8 @@ struct LiveConfig {
     // default; O11_LIVE_RELAY_FALLBACK (1 or 0) overrides it when the
     // UDP port opens.
     bool relay_fallback = false;
-    // Test hooks; the environment variables NINJAM_LIVE_FRESH_SECONDS and
-    // NINJAM_LIVE_STATS_SECONDS (decimal seconds, above 0) override them
+    // Test hooks; the environment variables O11_LIVE_FRESH_SECONDS and
+    // O11_LIVE_STATS_SECONDS (decimal seconds, above 0) override them
     // when the UDP port opens.
     double fresh_seconds = 20;                 // a player stays bound this long after a verified hello
     double stats_seconds = 60;                 // period of the relay's traffic line
