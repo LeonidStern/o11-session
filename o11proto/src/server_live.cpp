@@ -186,6 +186,10 @@ struct Server::Live {
     std::uint64_t in = 0, out = 0;
     std::array<std::uint64_t, kReasons> dropped{};
     std::uint8_t buf[2048];
+    // A datagram since the last pass that may change what a pass does (a
+    // hello: a binding, its 0x07 and 0x09, the advice). Relayed data
+    // changes nothing there: no pass of its own (the 20 ms tick has them).
+    bool pass_wanted = false;
     // The advice: worked out at every tick from the players' reports.
     live::RoomAdvice advice;
     TimePoint epoch = Clock::now();            // the advice's clock starts here
@@ -764,7 +768,10 @@ void Server::relayReadable() {
             relayReadable();
         });
     }
-    schedulePass();
+    if (live_->pass_wanted) {
+        live_->pass_wanted = false;
+        schedulePass();
+    }
 }
 
 bool Server::liveReadable() {
@@ -857,6 +864,7 @@ bool Server::liveReadable() {
         };
 
         if (d[3] == live::kTypeHello) {
+            L.pass_wanted = true;
             // 7: always answered; bound only with the cookie sent to this very address
             std::uint8_t ip[4], port[2];
             std::memcpy(ip, &from.ip, 4);

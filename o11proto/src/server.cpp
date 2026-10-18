@@ -229,7 +229,8 @@ Server::Conn* Server::connById(int id) {
 // datagrams); then one pass for everything that was ready: the timers, Live's
 // tick, every queue flushed, the closed connections reaped and, last, the new
 // ones accepted (so a peer that already closed doesn't count against the
-// pending limits). The timer makes a pass of its own when nothing happens.
+// pending limits). A relay read that only forwarded Live data needs none.
+// The timer makes a pass of its own when nothing happens.
 
 // The housekeeping: Live's freshness, its advice and the room's messages
 // every 20 ms while its UDP port is open; else the keepalives, the login,
