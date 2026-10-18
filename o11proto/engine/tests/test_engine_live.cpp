@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "check.h"
+#include "live_layer.h"
 #include "o11proto/engine.h"
 #include "o11proto/realtime.h"
 #include "o11proto/server.h"
@@ -425,6 +426,10 @@ TEST(both_hear_each_other_live) {
         REQUIRE(b > 0);
         CHECK(r.boundaryIn(s, b));
     }
+    // The line waits for its estimate (up to kLiveNoticeWaitMs: a stream
+    // can be dry at the switch, after a hiccup of the machine's).
+    CHECK(r.until([&] { return !r.side[0].findNotice("The room is Live now").empty() &&
+                               !r.side[1].findNotice("The room is Live now").empty(); }, 2.5));
     const std::string said = r.side[1].findNotice("The room is Live now, about ");
     std::printf("    %s\n", said.c_str());
     CHECK(said.size() > 0 && said.back() == '.' && said.find(" ms late.") != std::string::npos);
@@ -446,6 +451,43 @@ TEST(both_hear_each_other_live) {
         CHECK(r.side[1].findNotice("Intervals may sound better").empty());   // no advice
         CHECK(r.side[0].findNotice("Intervals may sound better").empty());
     }
+}
+
+// "The room is Live now, about N ms late." needs a stream that plays: a
+// listener who hears nobody at the switch says it once someone's stream
+// plays, and without N when nobody's does within kLiveNoticeWaitMs.
+TEST(live_notice_waits_for_its_estimate) {
+    LiveRoom r;
+    r.side[1].e.setLiveHostState(false, false);  // bob's host is stopped: alice hears nobody
+    REQUIRE(r.connect());
+    REQUIRE(r.until([&] { return r.side[0].e.liveRoomLive() && r.side[1].e.liveRoomLive(); }, 15));
+    const TimePoint live_at = Clock::now();
+    r.wait(0.4);
+    const bool early = !r.side[0].findNotice("The room is Live now").empty();
+    r.side[1].e.setLiveHostState(true, false);   // he starts
+    const bool said = r.until([&] { return !r.side[0].findNotice("The room is Live now").empty(); }, 2);
+    const double after = std::chrono::duration<double>(Clock::now() - live_at).count();
+    const std::string line = r.side[0].findNotice("The room is Live now");
+    std::printf("    alice, who heard nobody at the switch: \"%s\" %.2f s after it (bob's host started at 0.4 s)%s\n",
+                line.c_str(), after, early ? ", but she had said it before he started" : "");
+    CHECK(!early && said);
+    CHECK(line.find("The room is Live now, about ") == 0 && line.find(" ms late.") != std::string::npos);
+    CHECK(!r.side[1].findNotice("The room is Live now, about ").empty());   // bob heard alice from the start
+
+    // Nobody plays at the next switch: the line without N.
+    r.side[1].e.setLiveHostState(false, false);
+    const std::size_t seen = r.side[0].noticeCount();
+    CHECK(r.side[0].e.liveCommand("/live off"));
+    REQUIRE(r.until([&] { return !r.side[0].e.liveRoomLive(); }, 3));
+    CHECK(r.side[0].e.liveCommand("/live on"));
+    REQUIRE(r.until([&] { return r.side[0].e.liveRoomLive(); }, 15));
+    const TimePoint again = Clock::now();
+    REQUIRE(r.until([&] { return !r.side[0].findNotice("The room is Live now", seen).empty(); }, 3));
+    const double waited = std::chrono::duration<double>(Clock::now() - again).count();
+    const std::string plain = r.side[0].findNotice("The room is Live now", seen);
+    std::printf("    with nobody playing: \"%s\" %.2f s after the switch\n", plain.c_str(), waited);
+    CHECK(plain == "The room is Live now.");
+    CHECK(waited >= kLiveNoticeWaitMs / 1000.0 - 0.1);
 }
 
 TEST(live_off_falls_back_at_once) {
@@ -691,6 +733,33 @@ TEST(host_stalls_keep_the_delay) {
     REQUIRE(r.connect());
     REQUIRE(r.liveAndCalm(20));
     r.wait(2);                                    // each buffer's level is taken after 1 s of playing
+    // A hiccup of the machine's can leave a buffer's fill below its level
+    // (5 ms here once, on a loaded machine), which the drift control builds
+    // again over many seconds, and the delay with it. So the stalls start
+    // once both delays have held still (the medians of the last two 2.5 s
+    // within 0.25 ms of each other, as in the long run below), and a stall
+    // is held to the delay before only when the machine had no hiccup since
+    // that was measured.
+    auto still = [&] {
+        const long now = r.frames.load();
+        for (int l = 0; l < 2; ++l) {
+            const std::vector<double> all = r.liveDelays(l, now - 5 * kRate);
+            std::vector<double> late = r.liveDelays(l, now - 5 * kRate / 2);
+            if (late.empty() || all.size() <= late.size()) return false;
+            std::vector<double> early(all.begin(), all.end() - static_cast<std::ptrdiff_t>(late.size()));
+            std::sort(early.begin(), early.end());
+            std::sort(late.begin(), late.end());
+            if (std::fabs(median(early) - median(late)) > 0.25) return false;
+        }
+        return true;
+    };
+    r.wait(3);
+    bool settled = still();
+    for (int i = 0; i < 40 && !settled; ++i) {
+        r.wait(1);
+        settled = still();
+    }
+    REQUIRE(settled);
     const long t0 = r.frames.load();
     r.wait(3);
     const char* who[2] = {"alice hears bob", "bob hears alice"};
@@ -706,14 +775,13 @@ TEST(host_stalls_keep_the_delay) {
     }
     for (int ms : {30, 60, 80}) {
         const int n = (ms * kRate / 1000 + kBlock - 1) / kBlock;
-        const long at = r.frames.load();
         r.side[0].hold.store(n);                  // alice's host: n blocks late, then back to back
         r.wait(3);
         const long settled = r.frames.load();
         double fill[2];
         for (int s = 0; s < 2; ++s) fill[s] = r.side[s].e.liveUserBufferMs(0);
         r.wait(1.5);
-        const bool calm = r.calmSince(at - 3 * kRate);
+        const bool calm = r.calmSince(t0);
         for (int s = 0; s < 2; ++s) {
             const std::vector<double> d = r.liveDelays(s, settled);
             double worst = 0;

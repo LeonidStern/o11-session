@@ -491,14 +491,25 @@ void Engine::liveControl() {
 void Engine::liveRoomNotices() {
     LiveLayer& L = *live_;
     const int applied = L.room_applied.load();
+    if (applied != 1) L.room_notice_by = TimePoint{};
     if (applied != L.room_noticed) {
-        if (applied == 1) {
-            const int heard = liveHeardMs();
-            liveNotice("The room is Live now" +
-                           (heard >= 0 ? ", about " + std::to_string(heard) + " ms late." : std::string(".")),
-                       false);
+        // How late it hears the others needs a stream that plays and its
+        // round trip. At the switch a stream may only just be starting (its
+        // first audio and the boundary can come together), or be dry for
+        // a moment (the machine's hiccup), so the line waits for an
+        // estimate, up to kLiveNoticeWaitMs.
+        const TimePoint now = Clock::now();
+        const int heard = applied == 1 ? liveHeardMs() : -1;
+        if (applied == 1 && L.room_notice_by == TimePoint{})
+            L.room_notice_by = now + std::chrono::milliseconds(kLiveNoticeWaitMs);
+        if (applied != 1 || heard >= 0 || now >= L.room_notice_by) {
+            if (applied == 1)
+                liveNotice("The room is Live now" +
+                               (heard >= 0 ? ", about " + std::to_string(heard) + " ms late." : std::string(".")),
+                           false);
+            L.room_noticed = applied;
+            L.room_notice_by = TimePoint{};
         }
-        L.room_noticed = applied;
     }
     const LiveAdvice a = liveAdviceReason();
     const std::string u = liveAdviceUser();

@@ -168,6 +168,7 @@ void LiveLayer::forget() {
     report_ever = false;
     report_at = TimePoint{};
     room_noticed = 0;
+    room_notice_by = TimePoint{};
     advice_said.clear();
     advice_said_reason = o11proto::live::Advice::None;
     advice_said_count = 0;
