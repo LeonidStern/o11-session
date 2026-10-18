@@ -594,8 +594,8 @@ static void test_tempo_follower()
 
 static void test_host_note()
 {
-  CHECK_EQ(shortHostName("Ableton Live 12 Suite"), "Live");
-  CHECK_EQ(shortHostName(" Live "), "Live");
+  CHECK_EQ(shortHostName("Ableton Live 12 Suite"), "Ableton");
+  CHECK_EQ(shortHostName(" Live "), "Ableton");
   CHECK_EQ(shortHostName("Bitwig Studio"), "Bitwig Studio");
   CHECK_EQ(shortHostName(""), "The DAW");
   CHECK_EQ(shortHostName("Unknown"), "The DAW");
@@ -606,22 +606,22 @@ static void test_host_note()
   CHECK_EQ(bpmText(120), "120");
   CHECK_EQ(bpmText(109.6), "109.6");
   CHECK_EQ(bpmText(120.25), "120.25");
-  CHECK_EQ(hostTempoNote("Ableton Live 12 Suite", 120, 95, true), "Live is at 120 BPM, the room at 95: set Live to 95");
+  CHECK_EQ(hostTempoNote("Ableton Live 12 Suite", 120, 95, true), "Ableton is at 120 BPM, the room at 95: set Ableton to 95");
   CHECK_EQ(hostTempoNote("Ableton Live 12 Suite", 120, 95, false),
-           "Live is at 120 BPM, the room at 95: set Live to 95, or turn on Sync");
+           "Ableton is at 120 BPM, the room at 95: set Ableton to 95, or turn on Sync");
   CHECK_EQ(hostTempoNote("Bitwig Studio", 95.3, 95, true), "Bitwig Studio is at 95.3 BPM, the room at 95: set its tempo to 95");
   CHECK_EQ(hostTempoNote("Ableton Live 12", 95.004, 95, true), "");
   CHECK_EQ(hostTempoNote("Ableton Live 12", 0, 95, true), "");
   CHECK_EQ(hostTempoNote("Ableton Live 12", 120, 0, true), "");
   // where Link would lead the host (Sync is on, and this instance leads Link or would)
-  CHECK_EQ(hostTempoNote("Ableton Live 12 Suite", 120, 95, true, true), "Live is at 120 BPM, the room at 95: turn on Link in Live, or set it to 95");
+  CHECK_EQ(hostTempoNote("Ableton Live 12 Suite", 120, 95, true, true), "Ableton is at 120 BPM, the room at 95: turn on Link in Ableton, or set it to 95");
   CHECK_EQ(hostTempoNote("Bitwig Studio", 120, 95, true, true),
            "Bitwig Studio is at 120 BPM, the room at 95: turn on its Link if it has one, or set its tempo to 95");
-  CHECK_EQ(hostTempoNote("Ableton Live 12 Suite", 120, 95, false, true), "Live is at 120 BPM, the room at 95: set Live to 95, or turn on Sync");
+  CHECK_EQ(hostTempoNote("Ableton Live 12 Suite", 120, 95, false, true), "Ableton is at 120 BPM, the room at 95: set Ableton to 95, or turn on Sync");
   CHECK_EQ(hostTempoNote("Ableton Live 12", 95, 95, true, true), "");
 
   // the transport bar's name for the host
-  CHECK_EQ(hostChipName("Ableton Live 12 Suite"), "Live");
+  CHECK_EQ(hostChipName("Ableton Live 12 Suite"), "Ableton");
   CHECK_EQ(hostChipName("REAPER"), "REAPER");
   CHECK_EQ(hostChipName("Bitwig Studio"), "Bitwig");
   CHECK_EQ(hostChipName("Steinberg Cubase 10.5"), "Cubase");
@@ -636,13 +636,13 @@ static void test_host_note()
   CHECK_EQ(hostChipName("\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"), "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9");
 
   // where the next interval starts, in the host's bars
-  CHECK_EQ(nextIntervalText("Live", 32, 4, 4), "Next interval at Live bar 9");
-  CHECK_EQ(nextIntervalText("Live", 31.9999999, 0, 0), "Next interval at Live bar 9"); // 4/4 when the host doesn't say
-  CHECK_EQ(nextIntervalText("Live", 34, 4, 4), "Next interval at Live bar 9, beat 3");
+  CHECK_EQ(nextIntervalText("Ableton", 32, 4, 4), "Next interval at Ableton bar 9");
+  CHECK_EQ(nextIntervalText("Ableton", 31.9999999, 0, 0), "Next interval at Ableton bar 9"); // 4/4 when the host doesn't say
+  CHECK_EQ(nextIntervalText("Ableton", 34, 4, 4), "Next interval at Ableton bar 9, beat 3");
   CHECK_EQ(nextIntervalText("DAW", 0, 3, 4), "Next interval at DAW bar 1");
-  CHECK_EQ(nextIntervalText("Live", 9, 6, 8), "Next interval at Live bar 4"); // 6/8: a bar is 3 quarter notes
-  CHECK_EQ(nextIntervalText("Live", 10, 6, 8), "Next interval at Live bar 4, beat 3");
-  CHECK_EQ(nextIntervalText("Live", 33.25, 4, 4), "Next interval at Live bar 9, beat 2");
+  CHECK_EQ(nextIntervalText("Ableton", 9, 6, 8), "Next interval at Ableton bar 4"); // 6/8: a bar is 3 quarter notes
+  CHECK_EQ(nextIntervalText("Ableton", 10, 6, 8), "Next interval at Ableton bar 4, beat 3");
+  CHECK_EQ(nextIntervalText("Ableton", 33.25, 4, 4), "Next interval at Ableton bar 9, beat 2");
   int bar = 0, beat = 0;
   bool onBeat = true;
   barAndBeat(33.25, 4, 4, &bar, &beat, &onBeat);
@@ -1672,29 +1672,29 @@ static void test_tempo_keeper()
 
 static void test_link_texts()
 {
-  CHECK_EQ(linkHint("Ableton Live 12 Suite"), "Turn on Link in Live: then Live takes the room's tempo, and its bars start with the intervals.");
+  CHECK_EQ(linkHint("Ableton Live 12 Suite"), "Turn on Link in Ableton: then Ableton takes the room's tempo, and its bars start with the intervals.");
   CHECK_EQ(linkHint("Bitwig Studio"),
            "Turn on Link in Bitwig Studio if it has Link: then it takes the room's tempo, and its bars start with the intervals.");
   CHECK_EQ(linkHint(""), "Turn on Link in your DAW if it has Link: then it takes the room's tempo, and its bars start with the intervals.");
 
   const std::string live = "Ableton Live 12 Suite";
-  const std::string plain = "Sync with Live: when you change its tempo, vote the room to it; and while it plays, start the "
+  const std::string plain = "Sync with Ableton: when you change its tempo, vote the room to it; and while it plays, start the "
                             "intervals on its bars (a multiple of BPI beats from bar 1)";
   CHECK_EQ(syncTooltip(live, LinkState::Off, 0), plain);
   CHECK_EQ(syncTooltip(live, LinkState::Leading, 1),
-           "Sync with Live through Link: Live takes the room's tempo, and its bars start with the intervals; when you change "
-           "Live's tempo, you vote the room to it");
+           "Sync with Ableton through Link: Ableton takes the room's tempo, and its bars start with the intervals; when you change "
+           "Ableton's tempo, you vote the room to it");
   // out of a room (not in Link yet)
   CHECK_EQ(syncTooltip(live, LinkState::Waiting, 0),
-           plain + ". In a room, with Link on in Live, Live takes the room's tempo instead, and its bars start with the intervals");
+           plain + ". In a room, with Link on in Ableton, Ableton takes the room's tempo instead, and its bars start with the intervals");
   CHECK_EQ(syncTooltip("Bitwig Studio", LinkState::Waiting, 0),
            "Sync with Bitwig Studio: when you change its tempo, vote the room to it; and while it plays, start the intervals on "
            "its bars (a multiple of BPI beats from bar 1). In a room, with Link on in Bitwig Studio (if it has Link), it takes the "
            "room's tempo instead, and its bars start with the intervals");
-  // no Link app: say to turn it on in Live
+  // no Link app: say to turn it on in Ableton
   CHECK_EQ(syncTooltip(live, LinkState::Leading, 0),
-           "Turn on Link in Live: then Live takes the room's tempo, and its bars start with the intervals. Until then, Sync votes "
-           "the room to Live's tempo when you change it, and starts the intervals on its bars while it plays");
+           "Turn on Link in Ableton: then Ableton takes the room's tempo, and its bars start with the intervals. Until then, Sync votes "
+           "the room to Ableton's tempo when you change it, and starts the intervals on its bars while it plays");
   CHECK_EQ(syncTooltip(live, LinkState::OtherInstance, 1), plain + ". Another O11 Session in this set leads Link");
   CHECK_EQ(syncTooltip(live, LinkState::Contested, 1),
            plain + ". Another app on the network keeps leading Link, so this one stopped: turn Sync off and on to lead it again");

@@ -148,8 +148,8 @@ struct Snapshot
 
   // following the host (hostsync.h)
   bool followTempo = true;   // the toggle
-  std::string hostLabel;     // "Live", or the host's name
-  std::string hostChip;      // the same, short: "Live", "Bitwig", or "DAW" when it doesn't fit
+  std::string hostLabel;     // "Ableton", or the host's name
+  std::string hostChip;      // the same, short: "Ableton", "Bitwig", or "DAW" when it doesn't fit
   double nextIntervalPpq = -1; // where the next interval starts in the host (quarter notes), -1 when not in line
   int timeSigNum = 0, timeSigDen = 0; // the host's time signature, 0 when it doesn't say
   double hostTempo = 0;      // 0 when the host doesn't say (or doesn't run the audio)
