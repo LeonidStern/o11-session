@@ -84,6 +84,7 @@ struct Side {
     }
     std::mutex m;
     std::vector<std::string> notices;
+    std::vector<long> notice_at;                 // the room's frame each came at
     std::size_t noticeCount() {
         std::lock_guard<std::mutex> lock(m);
         return notices.size();
@@ -111,6 +112,8 @@ struct LiveRoom {
     // stream are made only when there was none.
     std::atomic<long> late_us{0}, late_blocks{0}, slow_us{0};
     std::atomic<long> hiccup_frame{-1};
+    std::mutex hiccups_m;
+    std::vector<long> hiccups;                   // the frame of each
     std::atomic<int> host_audio_thread{-1};      // whether the host thread became an audio thread (realtime.h)
     std::thread audio;
 
@@ -157,9 +160,10 @@ struct LiveRoom {
             lc.mute = true;                      // no local monitoring: the output is the other's audio only
             s.e.setLocalChannel(0, lc);
             Side* sp = &s;
-            s.e.onLiveNotice = [sp](const std::string& text, bool) {
+            s.e.onLiveNotice = [this, sp](const std::string& text, bool) {
                 std::lock_guard<std::mutex> lock(sp->m);
                 sp->notices.push_back(text);
+                sp->notice_at.push_back(frames.load());
             };
         }
         audio = std::thread([this] { audioLoop(); });
@@ -234,6 +238,8 @@ struct LiveRoom {
             if (late > 10000) {
                 late_blocks.fetch_add(1);
                 hiccup_frame.store(frames.load());
+                std::lock_guard<std::mutex> lock(hiccups_m);
+                hiccups.push_back(frames.load());
             }
             if (now - next > std::chrono::seconds(1)) next = now;
             const long f = frames.load();
@@ -305,6 +311,26 @@ struct LiveRoom {
         return true;
     }
     bool calmSince(long frame) const { return hiccup_frame.load() < frame; }
+    // The machine's hiccup that what happened at `frame` may be from: the
+    // latest within the 3 s before it, as the long run attributes a
+    // stall's (calmSince(at - 3 s)); -1 for none.
+    long hiccupBefore(long frame) {
+        std::lock_guard<std::mutex> lock(hiccups_m);
+        long found = -1;
+        for (long h : hiccups)
+            if (h <= frame && h >= frame - 3 * kRate) found = h;
+        return found;
+    }
+    // The advice `listener` was told (16.7: "...: Intervals may sound
+    // better ..."), each with the room's frame it came at.
+    std::vector<std::pair<std::string, long>> adviceNotices(int listener) {
+        Side& s = side[listener];
+        std::lock_guard<std::mutex> lock(s.m);
+        std::vector<std::pair<std::string, long>> v;
+        for (std::size_t i = 0; i < s.notices.size(); ++i)
+            if (s.notices[i].find("Intervals may sound better") != std::string::npos) v.push_back({s.notices[i], s.notice_at[i]});
+        return v;
+    }
     // Both live, and calm, for the last `seconds`.
     bool liveAndCalm(double budget, double seconds = 1.0) {
         const long span = static_cast<long>(seconds * kRate);
@@ -402,6 +428,22 @@ struct LiveRoom {
         return -1;
     }
     double secondsOf(long blocks) const { return blocks * double(kBlock) / kRate; }
+    // For a failure's log: `listener`'s stream of the other, its events
+    // against now, and the machine's last hiccup.
+    void printEvents(int listener) const {
+        const std::int64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+        std::string line;
+        for (const LiveEvent& e : side[listener].e.liveUserEvents(0)) {
+            char b[96];
+            std::snprintf(b, sizeof(b), " %s %lld at %.3f s,", liveEventName(e.kind), static_cast<long long>(e.value),
+                          (e.steady_ns - now_ns) / 1e9);
+            line += b;
+        }
+        std::printf("      %s's stream of %s:%s (now %.3f s of output; the machine's last hiccup at %.3f s)\n",
+                    side[listener].name.c_str(), side[1 - listener].name.c_str(), line.c_str(),
+                    frames.load() / double(kRate), hiccup_frame.load() / double(kRate));
+    }
     // The peak of output 0 over `seconds` from frame `from`.
     float peak(int listener, long from, double seconds) const {
         float p = 0;
@@ -446,10 +488,35 @@ TEST(both_hear_each_other_live) {
         CHECK(median(d) > 0 && median(d) < 100);   // spec test 35's bounds
         CHECK(p95(d) < 150);
     }
+    for (int s = 0; s < 2; ++s) {                // for the log: how each stream came (all-to-all: directly)
+        std::string by;
+        for (const LiveEvent& e : r.side[s].e.liveUserEvents(0))
+            if (e.kind == LiveEventKind::Route)
+                by += std::string(by.empty() ? "" : ", ") + liveRouteName(static_cast<LiveRoute>(e.value));
+        std::printf("    %s's stream of %s came by: %s\n", r.side[s].name.c_str(), r.side[1 - s].name.c_str(), by.c_str());
+    }
     if (r.calmSince(from)) {                     // a steady stream stays live
         CHECK(r.side[0].e.userLive(0) && r.side[1].e.userLive(0));
-        CHECK(r.side[1].findNotice("Intervals may sound better").empty());   // no advice
-        CHECK(r.side[0].findNotice("Intervals may sound better").empty());
+    }
+    // A steady stream gives no advice; the machine's hiccups (a host wake
+    // over 10 ms late) can, which is right. So each advice must have come
+    // within the 3 s after a hiccup, and none after the last one's.
+    bool unexplained = false;
+    for (int s = 0; s < 2; ++s)
+        for (const auto& a : r.adviceNotices(s)) {
+            const long h = r.hiccupBefore(a.second);
+            if (h >= 0)
+                std::printf("    %s was told at %.3f s, %.3f s after the machine's hiccup: %s\n", r.side[s].name.c_str(),
+                            a.second / double(kRate), (a.second - h) / double(kRate), a.first.c_str());
+            else
+                std::printf("    %s was told at %.3f s, after no hiccup of the machine's: %s\n", r.side[s].name.c_str(),
+                            a.second / double(kRate), a.first.c_str());
+            CHECK(h >= 0);
+            unexplained = unexplained || h < 0;
+        }
+    if (unexplained) {                           // for the log: what the streams did
+        r.printEvents(0);
+        r.printEvents(1);
     }
 }
 

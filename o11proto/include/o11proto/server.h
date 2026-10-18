@@ -62,7 +62,7 @@ struct LiveConfig {
     // players, and a pair without a direct path is "can't play Live"
     // advice; on, the room goes through the relay for everyone once a pair
     // has no direct path, until `!live direct`. A backend option, off by
-    // default; NINJAM_LIVE_RELAY_FALLBACK (1 or 0) overrides it when the
+    // default; O11_LIVE_RELAY_FALLBACK (1 or 0) overrides it when the
     // UDP port opens.
     bool relay_fallback = false;
     // Test hooks; the environment variables NINJAM_LIVE_FRESH_SECONDS and

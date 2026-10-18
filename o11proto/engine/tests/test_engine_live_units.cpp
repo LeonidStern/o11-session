@@ -649,6 +649,44 @@ TEST(sink_keeps_its_delay_after_a_gap) {        // 16.6: back in time with the o
     std::printf("    after gaps of 20 to 250 ms, lost or held back: the delay moved at most %.2f ms\n", worst * 5.0 / 90);
 }
 
+// All-to-all: a gap just after a path change, to direct or to the relay,
+// is one like any other: the stream keeps its delay (16.6) and conceals no
+// more than without the change. (It buffered afresh within 2 s of a
+// change, and a 25 ms gap concealed 30 ms instead of 10: the dip of
+// test_engine_live_paths after `!live direct` on a loaded machine.)
+TEST(sink_path_change_and_a_late_block) {
+    std::uint64_t plain = 0;
+    for (int to : {0, 1, 2}) {                   // no change, to direct, to the relay
+        Feed f(20, 20);
+        f.seconds(3);
+        long before = 0, after = 0;
+        for (int i = 0; i < 48; ++i) {           // 240 ms
+            f.run(1);
+            before += f.k.heldBlocks();
+        }
+        if (to) f.k.apply(item(SinkItem::Path, to, 1), f.now);
+        f.seconds(0.5);
+        const int rebuffers = f.count(LiveEventKind::Rebuffer);
+        const std::uint64_t concealed = f.concealed();
+        f.run(20, 5);                            // 25 ms held back, then all at once
+        f.seconds(1);
+        for (int i = 0; i < 48; ++i) {
+            f.run(1);
+            after += f.k.heldBlocks();
+        }
+        const int rebuffered = f.count(LiveEventKind::Rebuffer) - rebuffers;
+        const std::uint64_t c = f.concealed() - concealed;
+        std::printf("    %s, a 25 ms gap: %d buffering afresh, %llu blocks concealed, the delay moved %+.2f ms\n",
+                    to == 0 ? "no path change" : to == 1 ? "after a change to direct" : "after a change to the relay",
+                    rebuffered, static_cast<unsigned long long>(c), (after - before) * 5.0 / 48);
+        CHECK(f.k.playing());
+        CHECK(std::labs(after - before) <= 48);  // within a block
+        if (to == 0) plain = c;
+        CHECK_EQ(rebuffered, 0);
+        CHECK_EQ(c, plain);
+    }
+}
+
 TEST(sink_marks_where_its_concealment_begins) {   // 16.8: the mixer's hold counts from that frame
     // A sender in real time, a tone in 240-frame Opus blocks, against
     // 270-frame host blocks, and a lost gap. The frame where the sink's

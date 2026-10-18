@@ -272,7 +272,7 @@ struct Server::Live {
         }
         paths_ok = live::systemRandom(path_secret, sizeof(path_secret));   // new keys for every pair
         cfg.fresh_seconds = envSeconds("NINJAM_LIVE_FRESH_SECONDS", cfg.fresh_seconds);
-        cfg.relay_fallback = envFlag("NINJAM_LIVE_RELAY_FALLBACK", cfg.relay_fallback);
+        cfg.relay_fallback = envFlag("O11_LIVE_RELAY_FALLBACK", cfg.relay_fallback);
         cfg.stats_seconds = envSeconds("NINJAM_LIVE_STATS_SECONDS", cfg.stats_seconds);
         stats_since = next_fresh_check = Clock::now();
         in = out = 0;
@@ -384,7 +384,7 @@ void Server::setLiveConfig(const LiveConfig& config) {
         }
     } else {
         L.cfg.fresh_seconds = envSeconds("NINJAM_LIVE_FRESH_SECONDS", L.cfg.fresh_seconds);
-        L.cfg.relay_fallback = envFlag("NINJAM_LIVE_RELAY_FALLBACK", L.cfg.relay_fallback);
+        L.cfg.relay_fallback = envFlag("O11_LIVE_RELAY_FALLBACK", L.cfg.relay_fallback);
         L.cfg.stats_seconds = envSeconds("NINJAM_LIVE_STATS_SECONDS", L.cfg.stats_seconds);
     }
     if (!L.room_chosen) L.room_on = L.cfg.mode == LiveMode::On;

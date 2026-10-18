@@ -101,7 +101,7 @@ struct Transport::Impl {
     // briefly and never while it calls back.
     mutable std::mutex paths_mutex;
     std::vector<DirectPath> paths;
-    bool relay_fallback = true;                    // setRoomRoute(): until a room message says
+    bool relay_fallback = false;                   // setRoomRoute(): direct only until a room message says
     bool room_relay = false;
     bool force_relay = false;
     std::vector<std::uint32_t> blocked;
