@@ -38,6 +38,7 @@ namespace {
 constexpr int kRate = 48000;
 constexpr int kBlock = 270;                      // not a divisor of the interval (spec test 35)
 constexpr long kMaxFrames = 120L * kRate;        // the most one room records
+constexpr long kMaxOwn = kMaxFrames + kRate;     // a side's own frames: its clock may run ahead (Side::ppm)
 constexpr long kBurst = kRate * 30 / 1000;
 constexpr long kWindow = kRate * 300 / 1000;     // a burst is looked for this long after it is sent
 constexpr double kAmp = 0.5;
@@ -60,10 +61,22 @@ std::vector<long> burstStarts() {
 struct Side {
     Engine e;
     std::string name;
-    std::unique_ptr<float[]> heard{new float[kMaxFrames]()};          // output 0
+    std::unique_ptr<float[]> heard{new float[kMaxOwn]()};             // output 0, at the side's own frames
     std::unique_ptr<std::uint8_t[]> live{new std::uint8_t[kMaxFrames / kBlock + 1]()};   // userLive(0) after each block
     std::unique_ptr<int[]> pos{new int[kMaxFrames / kBlock + 1]()};  // the interval position after each block
     std::atomic<int> stall{0};                   // blocks the host doesn't call process() for
+    std::atomic<int> hold{0};                    // blocks the host calls process() for late, then back to back
+    // How much faster this side's audio clock runs than the room's, in
+    // ppm: its host's blocks are a frame longer as often as that takes.
+    // Its own frames (its input, `heard`) are then ahead of the room's by
+    // ext[b] after block b.
+    std::atomic<int> ppm{0};
+    std::unique_ptr<int[]> ext{new int[kMaxFrames / kBlock + 1]()};
+    // The room's frame for this side's frame `own`, to a frame.
+    long roomFrame(long own) const {
+        const long b = std::max(0L, std::min(own / kBlock, kMaxFrames / kBlock));
+        return own - ext[b];
+    }
     std::mutex m;
     std::vector<std::string> notices;
     std::size_t noticeCount() {
@@ -163,16 +176,50 @@ struct LiveRoom {
         server_thread.join();
     }
 
+    // What both engines get on their channel 0 at frame `n`: the bursts.
+    float signalAt(long n) const {
+        const auto it = std::upper_bound(starts.begin(), starts.end(), n);
+        if (it == starts.begin()) return 0.0f;
+        const long into = n - *(it - 1);
+        return into < kBurst ? static_cast<float>(kAmp * std::sin(2 * M_PI * kHz * into / kRate)) : 0.0f;
+    }
+
     // The host: one block of both engines every 270 frames. After a late wake
     // it calls again at once to catch up, as hosts do (the machine's own
-    // hiccups are not host gaps, 6.9); a stall is a side's `stall`.
+    // hiccups are not host gaps, 6.9). A side's `stall` is a host gap: the
+    // host doesn't call its process() for those blocks. Its `hold` is a
+    // stall of its host's callbacks that catches up: the blocks are held
+    // back, then all called back to back.
     void audioLoop() {
-        std::vector<float> in(kBlock), out[2][2];
-        for (auto& o : out) o[0].assign(kBlock, 0.0f), o[1].assign(kBlock, 0.0f);
+        std::vector<float> in(kBlock + 1), out[2][2];
+        for (auto& o : out) o[0].assign(kBlock + 1, 0.0f), o[1].assign(kBlock + 1, 0.0f);
         const auto period = std::chrono::nanoseconds(1000000000LL * kBlock / kRate);
         host_audio_thread.store(thread::makeAudioThread(static_cast<double>(kBlock) / kRate) ? 1 : 0);
+        struct Held {
+            long b, own;
+            int n;
+        };
+        std::vector<Held> held[2];               // the blocks held back
+        long own[2] = {0, 0};                    // each side's own frames so far
+        double drift[2] = {0, 0};                // and the part of a frame its clock is ahead
+        // One block of side `s`: the room's block `b`, `n` frames from its own frame `at`.
+        auto play = [&](int s, long b, long at, int n) {
+            Side& sd = side[s];
+            for (int i = 0; i < n; ++i) in[static_cast<std::size_t>(i)] = signalAt(at + i);
+            const float* inp[1] = {in.data()};
+            float* o[2] = {out[s][0].data(), out[s][1].data()};
+            const auto t0 = Clock::now();
+            sd.e.process(inp, 1, o, 2, n, kRate);
+            const long took =
+                static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
+            if (took > slow_us.load()) slow_us.store(took);
+            std::copy(out[s][0].begin(), out[s][0].begin() + n, sd.heard.get() + at);
+            sd.live[b] = sd.e.userLive(0) ? 1 : 0;
+            int p = 0, len = 0;
+            sd.e.position(&p, &len);
+            sd.pos[b] = p;
+        };
         auto next = Clock::now();
-        std::size_t burst = 0;
         while (!audio_stop.load()) {
             std::this_thread::sleep_until(next);
             next += period;
@@ -186,33 +233,29 @@ struct LiveRoom {
             if (now - next > std::chrono::seconds(1)) next = now;
             const long f = frames.load();
             if (f + kBlock > kMaxFrames) break;
-            for (int i = 0; i < kBlock; ++i) {
-                const long n = f + i;
-                while (burst < starts.size() && n >= starts[burst] + kBurst) ++burst;
-                const long into = burst < starts.size() ? n - starts[burst] : -1;
-                in[static_cast<std::size_t>(i)] =
-                    into >= 0 && into < kBurst ? static_cast<float>(kAmp * std::sin(2 * M_PI * kHz * into / kRate)) : 0.0f;
-            }
             const long b = f / kBlock;
             for (int s = 0; s < 2; ++s) {
                 Side& sd = side[s];
+                drift[s] += kBlock * sd.ppm.load() * 1e-6;
+                const int n = kBlock + (drift[s] >= 1.0 ? 1 : 0);
+                if (n > kBlock) drift[s] -= 1.0;
+                const long at = own[s];
+                own[s] += n;
+                sd.ext[b] = static_cast<int>(own[s] - (f + kBlock));
                 if (sd.stall.load() > 0) {
                     sd.stall.fetch_sub(1);
                     sd.live[b] = b > 0 ? sd.live[b - 1] : 0;
                     sd.pos[b] = b > 0 ? sd.pos[b - 1] : 0;
                     continue;
                 }
-                const float* inp[1] = {in.data()};
-                float* o[2] = {out[s][0].data(), out[s][1].data()};
-                const auto t0 = Clock::now();
-                sd.e.process(inp, 1, o, 2, kBlock, kRate);
-                const long took = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
-                if (took > slow_us.load()) slow_us.store(took);
-                std::copy(out[s][0].begin(), out[s][0].end(), sd.heard.get() + f);
-                sd.live[b] = sd.e.userLive(0) ? 1 : 0;
-                int p = 0, len = 0;
-                sd.e.position(&p, &len);
-                sd.pos[b] = p;
+                if (sd.hold.load() > 0) {
+                    sd.hold.fetch_sub(1);
+                    held[s].push_back({b, at, n});
+                    continue;
+                }
+                for (const Held& h : held[s]) play(s, h.b, h.own, h.n);
+                held[s].clear();
+                play(s, b, at, n);
             }
             frames.store(f + kBlock);
         }
@@ -313,6 +356,28 @@ struct LiveRoom {
         if (missing) *missing = miss;
         if (doubles) *doubles = dbl;
         return d;
+    }
+
+    // On the room's clock (Side::ppm): for each burst the other sent from
+    // room frame `from` on whose window ends by `to`, when it was sent
+    // (s) and how late `listener` heard it (ms, -1 when not at all).
+    std::vector<std::pair<double, double>> roomDelays(int listener, long from, long to) const {
+        const Side& l = side[listener];
+        const Side& o = side[1 - listener];
+        std::vector<std::pair<double, double>> v;
+        for (long st : starts) {                 // the other's own frames
+            const long at = o.roomFrame(st);
+            if (at < from || at + kWindow > to || at + kWindow >= kMaxFrames) continue;
+            const long m0 = at + l.ext[at / kBlock];
+            long found = -1;
+            for (long m = m0; m < m0 + kWindow; ++m)
+                if (std::fabs(l.heard[m]) > 0.12f) {
+                    found = m;
+                    break;
+                }
+            v.push_back({at / double(kRate), found < 0 ? -1.0 : (l.roomFrame(found) - at) * 1000.0 / kRate});
+        }
+        return v;
     }
 
     // Whether an interval boundary fell into block `b` (the position after it is at most a block).
@@ -592,4 +657,157 @@ TEST(jitter_buffer_setting_takes_effect) {
     CHECK_EQ(r.side[1].e.liveBufferMs(), 60);
 }
 
-TEST_MAIN()
+// A host whose process() calls stall and then catch up, back to back,
+// missed nothing (6.9): it sends what it captured meanwhile all at once,
+// and plays the stream that came meanwhile as it catches up. Each
+// listener's delay to the other is the same after each stall as before, to
+// the frame: alice's own stall holds what she hears longer, without
+// overflowing her buffer into a new delay (or taking a new level for it to
+// keep), and bob, who ran dry while she was away, goes on at the delay he
+// had.
+TEST(host_stalls_keep_the_delay) {
+    LiveRoom r;
+    REQUIRE(r.connect());
+    REQUIRE(r.liveAndCalm(20));
+    r.wait(2);                                    // each buffer's level is taken after 1 s of playing
+    const long t0 = r.frames.load();
+    r.wait(3);
+    const char* who[2] = {"alice hears bob", "bob hears alice"};
+    double before[2], fill_before[2];
+    for (int s = 0; s < 2; ++s) {
+        before[s] = median(r.liveDelays(s, t0));
+        fill_before[s] = r.side[s].e.liveUserBufferMs(0);
+        std::printf("    %s: %.2f ms (the estimate %.1f ms, the buffer %.2f ms)\n", who[s], before[s],
+                    r.side[s].e.liveUserHeardMs(0), fill_before[s]);
+        REQUIRE(before[s] > 0);
+        CHECK(fill_before[s] > 0);
+        CHECK(r.side[s].e.liveUserHeardMs(0) > fill_before[s]);
+    }
+    for (int ms : {30, 60, 80}) {
+        const int n = (ms * kRate / 1000 + kBlock - 1) / kBlock;
+        const long at = r.frames.load();
+        r.side[0].hold.store(n);                  // alice's host: n blocks late, then back to back
+        r.wait(3);
+        const long settled = r.frames.load();
+        double fill[2];
+        for (int s = 0; s < 2; ++s) fill[s] = r.side[s].e.liveUserBufferMs(0);
+        r.wait(1.5);
+        const bool calm = r.calmSince(at - 3 * kRate);
+        for (int s = 0; s < 2; ++s) {
+            const std::vector<double> d = r.liveDelays(s, settled);
+            double worst = 0;
+            for (double x : d) worst = std::max(worst, std::fabs(x - before[s]));
+            std::printf("    alice's host %d ms late: %s from 3 s on: %zu bursts, %.2f to %.2f ms "
+                        "(the buffer %.2f ms)%s\n", n * kBlock * 1000 / kRate, who[s], d.size(),
+                        d.empty() ? -1.0 : d.front(), d.empty() ? -1.0 : d.back(), fill[s], calm ? "" : " (not calm)");
+            CHECK(d.size() >= 2);
+            if (!calm) continue;
+            CHECK(worst <= 1.0);                  // back within 1 ms, and it stays there
+            CHECK(std::fabs(fill[s] - fill_before[s]) <= 1.0);
+        }
+    }
+    // Neither buffer overflowed: no new delay at all.
+    for (int s = 0; s < 2; ++s) {
+        const std::size_t seen = r.side[s].noticeCount();
+        CHECK(r.side[s].e.liveCommand("/live"));
+        r.wait(0.2);
+        const std::string line = r.side[s].findNotice("Dropouts:", seen);
+        std::printf("    [%s] %s\n", r.side[s].name.c_str(), line.c_str());
+        CHECK(!line.empty());
+        if (r.calmSince(t0)) CHECK(line.find(" 0 overflowed") != std::string::npos);
+    }
+}
+
+// A long run on two clocks 200 ppm apart (alice's runs fast), with host
+// stalls that catch up, of either host or both, 20 to 170 ms long, and two
+// 300 ms network outages both ways: one that loses what is sent, one that
+// holds it back and then lets it all through. Each listener's delay to the
+// other is back within 1 ms of where it was 3 s after each stall, and 1 s
+// after the network comes back, and no burst is heard earlier than the
+// buffer (20 ms) after the sender played it. On these clocks the speed
+// makes up for the 200 ppm with the fill a few ms off the level it keeps,
+// which takes it some 30 s to reach, so the delays still move a little at
+// first.
+TEST(long_run_stalls_and_outages_on_clocks_200_ppm_apart) {
+    LiveRoom r;
+    r.side[0].ppm.store(200);
+    REQUIRE(r.connect());
+    REQUIRE(r.liveAndCalm(20));
+    r.wait(20);
+    const long t0 = r.frames.load();
+    const char* who[2] = {"alice hears bob", "bob hears alice"};
+    struct Event {
+        int host;                                 // 0 alice, 1 bob, 2 both
+        int ms;
+        int net;                                  // 0 a host stall, 1 an outage that loses, 2 one that holds
+    };
+    const Event events[] = {{0, 20, 0}, {1, 50, 0}, {0, 80, 0}, {2, 120, 0}, {1, 170, 0}, {2, 300, 1}, {2, 300, 2}};
+    for (const Event& ev : events) {
+        const long at = r.frames.load();
+        for (int s = 0; s < 2; ++s) {
+            if (ev.host != s && ev.host != 2) continue;
+            if (ev.net == 1) r.side[s].e.setLiveTestSendGap(ev.ms);
+            else if (ev.net == 2) r.side[s].e.setLiveTestSendHold(ev.ms);
+            else r.side[s].hold.store((ev.ms * kRate / 1000 + kBlock - 1) / kBlock);
+        }
+        const double back = ev.net ? ev.ms / 1000.0 + 1.0 : 3.0;   // when it should be back
+        r.wait(5);
+        const long to = r.frames.load();
+        const bool calm = r.calmSince(at - 3 * kRate);
+        const char* hosts[3] = {"alice's host", "bob's host", "both hosts"};
+        char what[64];
+        if (ev.net)
+            std::snprintf(what, sizeof(what), "the network %s for %d ms", ev.net == 1 ? "lost all" : "held all", ev.ms);
+        else
+            std::snprintf(what, sizeof(what), "%s %d ms late", hosts[ev.host], ev.ms);
+        for (int l = 0; l < 2; ++l) {
+            std::vector<double> before;
+            for (const auto& x : r.roomDelays(l, at - 5 * kRate / 2, at))
+                if (x.second >= 0) before.push_back(x.second);
+            std::sort(before.begin(), before.end());
+            const double pre = median(before);
+            double lo = 1e9, hi = -1e9;
+            int n = 0;
+            for (const auto& x : r.roomDelays(l, at + static_cast<long>(back * kRate), to)) {
+                if (x.second < 0) continue;
+                lo = std::min(lo, x.second);
+                hi = std::max(hi, x.second);
+                ++n;
+            }
+            std::printf("    %s: %s %.2f ms before, %.2f to %.2f ms from %.1f s on (%d bursts; the buffer %.2f ms)%s\n",
+                        what, who[l], pre, lo, hi, back, n, r.side[l].e.liveUserBufferMs(0), calm ? "" : " (not calm)");
+            CHECK(before.size() >= 3);
+            CHECK(n >= 2);
+            if (!calm) continue;
+            CHECK(lo >= pre - 1.0 && hi <= pre + 1.0);
+        }
+    }
+    // Never earlier than the buffer, from the start of the run on.
+    for (int l = 0; l < 2; ++l) {
+        double lowest = 1e9;
+        for (const auto& x : r.roomDelays(l, t0, r.frames.load()))
+            if (x.second >= 0) lowest = std::min(lowest, x.second);
+        std::printf("    %s: the earliest %.2f ms\n", who[l], lowest);
+        CHECK(lowest >= 20.0);
+    }
+    for (int s = 0; s < 2; ++s) {
+        const std::size_t seen = r.side[s].noticeCount();
+        CHECK(r.side[s].e.liveCommand("/live"));
+        r.wait(0.2);
+        const std::string line = r.side[s].findNotice("Dropouts:", seen);
+        std::printf("    [%s] %s\n", r.side[s].name.c_str(), line.c_str());
+        CHECK(!line.empty());
+        if (r.calmSince(t0)) CHECK(line.find(" 0 overflowed") != std::string::npos);
+    }
+}
+
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, TESTING_STDOUT_MODE, BUFSIZ);
+    if (argc > 1) {
+        auto& c = testing::cases();
+        const std::string want = argv[1];         // only the cases whose names contain it
+        auto other = [&](const testing::Case& k) { return std::string(k.name).find(want) == std::string::npos; };
+        c.erase(std::remove_if(c.begin(), c.end(), other), c.end());
+    }
+    return testing::runAll();
+}

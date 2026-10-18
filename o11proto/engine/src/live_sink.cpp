@@ -37,6 +37,7 @@ void SinkStats::clear(std::uint32_t g) {
     lost_at_active.store(0);
     resent_at_active.store(0);
     buffer_us.store(-1);
+    fill_us.store(-1);
     block.store(0);
     gen.store(g);
 }
@@ -322,6 +323,7 @@ void LiveSink::configure(double latency_ms, int host_block, int host_rate) {
         phase_ = Buffering;
         waited_ = 0;
         has_align_ = realign_ = false;          // and so has a new delay
+        fill_ref_ = -1;
         stats.active.store(false);
     }
 }
@@ -341,7 +343,7 @@ void LiveSink::reset() {
     last_played_ = -1;
     far_ = false;
     if (!tail) fifo_n_ = fifo_at_ = 0;
-    fill_ = -1;
+    fill_ = fill_ref_ = -1;
     has_align_ = realign_ = false;
     stats.active.store(false);
 }
@@ -407,7 +409,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         stopping_ = false;
         waited_ = 0;
         fifo_n_ = fifo_at_ = 0;
-        fill_ = -1;
+        fill_ = fill_ref_ = -1;
         has_align_ = realign_ = false;          // a new stream finds its own delay
         stats.block.store(block_);
         stats.active.store(false);
@@ -448,7 +450,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         // the other players (16.6): what comes too late for its turn goes,
         // the rest waits for its turn. Only a stream more than the capacity
         // ahead of it buffers afresh.
-        realign_ = has_align_ && seq - turn() <= sizes_.capacity_blocks;
+        realign_ = has_align_ && seq - turn() <= room();
         has_align_ = realign_;
         late48_ = 0;
     }
@@ -472,7 +474,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
             far_seq_ = seq;
             return;
         }
-    } else if (static_cast<std::int64_t>(seq) - next_ + 1 <= sizes_.capacity_blocks) {
+    } else if (static_cast<std::int64_t>(seq) - next_ + 1 <= room()) {
         take(seq, it, now_ns);
         return;
     }
@@ -529,25 +531,32 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
                 stats.resent_at_active.store(stats.resent.load());
                 stats.active_since_ns.store(now_ns);
                 stats.active.store(true);
-            } else if (newest_ < due && (late48_ += block_) >= sizes_.latency48) {
+            } else if (newest_ < due && behind48_ < block_ && (late48_ += block_) >= sizes_.latency48) {
                 // Late for good (its sender's host stopped, say): it buffers
                 // afresh, on a delay of its own. The stream has jumped back,
                 // and like a jump ahead (5.9) that counts as an overrun.
+                // While this host catches up on a stall of its own, the
+                // turns go by faster than the stream can come: not late.
                 stats.overruns.fetch_add(1);
                 realign_ = has_align_ = false;
                 waited_ = 0;
             }
-        } else if (waited_ >= sizes_.latency48 && (held >= sizes_.latency_blocks || (stopping_ && held > 0))) {
-            if (held > sizes_.latency_blocks) {  // more than the latency: the oldest go
-                const std::int64_t skip = held - sizes_.latency_blocks;
+        } else if (waited_ >= sizes_.latency48 &&
+                   (held - behindBlocks() >= sizes_.latency_blocks || (stopping_ && held > 0))) {
+            // More than the latency: the oldest go. While the host catches
+            // up on a stall, what it has yet to catch up on stays too: the
+            // stream that came meanwhile.
+            const int keep = sizes_.latency_blocks + behindBlocks();
+            if (held > keep) {
+                const std::int64_t skip = held - keep;
                 for (std::int64_t s = next_; s < next_ + skip; ++s) ring_[s & (kRing - 1)].state = Empty;
                 next_ += skip;
                 last_played_ = next_ - 1;
             }
-            const int buffered = std::min(heldBlocks() * block_, waited_);
+            const int buffered = std::min(std::max(0, heldBlocks() * block_ - behind48_), waited_);
             stats.buffer_us.store(static_cast<std::int32_t>(static_cast<std::int64_t>(buffered) * 1000000 / 48000));
             phase_ = Playing;
-            fill_ = -1;
+            fill_ = -1;                          // a new estimate, of the fill it already keeps once it has one
             stats.lost_at_active.store(stats.lost.load());
             stats.resent_at_active.store(stats.resent.load());
             stats.active_since_ns.store(now_ns);
@@ -631,16 +640,19 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
 
 void LiveSink::hostGap(int host_frames, int host_rate) {
     if (phase_ == Idle || host_rate <= 0) return;
-    const double g48 = static_cast<double>(host_frames) * 48000.0 / host_rate;
-    const std::int64_t n = static_cast<std::int64_t>(g48 / block_ + 0.5);
+    // What is left of the block decoded last goes, and whole blocks, to
+    // the nearest of the time the host missed: the delay stays, and so
+    // does the fill (to half a block), with the level it keeps.
+    const int rest = fifo_n_ - fifo_at_;
+    const double g48 = static_cast<double>(host_frames) * 48000.0 / host_rate - rest;
+    const std::int64_t n = std::max<std::int64_t>(0, static_cast<std::int64_t>(std::floor(g48 / block_ + 0.5)));
     fifo_at_ = fifo_n_;
     for (std::int64_t s = next_; s < next_ + n && s <= newest_; ++s) ring_[s & (kRing - 1)].state = Empty;
     next_ += n;
     last_played_ = next_ - 1;
     if (newest_ < next_ - 1) newest_ = next_ - 1;
     align_ -= n * block_;                        // the time the host missed: the delay stays
-    fill_ = -1;                                  // the clock estimate restarts
-    if (n > 0 && phase_ == Playing) concealer_->cut();   // the stream jumps: joined over
+    if ((n > 0 || rest > 0) && phase_ == Playing) concealer_->cut();   // the stream jumps: joined over
 }
 
 bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
@@ -652,24 +664,36 @@ bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
     }
     double step = 48000.0 / rate;
     if (phase_ == Playing) {                     // the speed follows the fill (6.9)
-        const double fill = (heldBlocks() * block_ + (fifo_n_ - fifo_at_)) / 48000.0;
-        if (fill_ < 0) {                         // a new estimate: from this fill
-            fill_ = fill;
-            fill_ref_ = -1;
-            fill_age_ = 0;
-        } else {
-            fill_ += (fill - fill_) * std::min(1.0, frames / (rate * kFillSmoothing));
+        // While the host catches up on a stall, the stream that came
+        // meanwhile isn't fill: it is what the host has yet to play. And
+        // what the fill does then (the stream's sender may have stalled
+        // too) says nothing of the clocks: the estimate holds until the host
+        // has caught up.
+        if (behind48_ == 0) {
+            const double fill = (heldBlocks() * block_ + (fifo_n_ - fifo_at_)) / 48000.0;
+            if (fill_ < 0) {                     // a new estimate: from this fill
+                fill_ = fill;
+                fill_age_ = 0;
+            } else {
+                fill_ += (fill - fill_) * std::min(1.0, frames / (rate * kFillSmoothing));
+            }
+            fill_age_ += static_cast<double>(frames) / rate;
         }
         // The level it settles at after a second is the one to keep: the
         // speed only makes up for the clocks' difference, so the stream
         // plays at its own pitch and the delay stays what buffering gave.
-        fill_age_ += static_cast<double>(frames) / rate;
-        if (fill_ref_ < 0 && fill_age_ >= kFillSettle) fill_ref_ = fill_;
-        if (fill_ref_ >= 0) {                    // within the dead band the fill's own jitter changes nothing
-            const double e = fill_ - fill_ref_;
+        // It is kept for the stream's life: after it buffers again (it
+        // overflowed, or ran dry and was late for good), the speed brings
+        // the delay back to it.
+        if (fill_ >= 0 && fill_ref_ < 0 && fill_age_ >= kFillSettle) fill_ref_ = fill_;
+        if (fill_ >= 0 && fill_ref_ >= 0 && fill_age_ >= kFillSmoothing) {
+            const double e = fill_ - fill_ref_;  // within the dead band the fill's own jitter changes nothing
             const double off = e > kFillDeadBand ? e - kFillDeadBand : (e < -kFillDeadBand ? e + kFillDeadBand : 0.0);
             step *= 1.0 + std::max(-kMaxSpeedChange, std::min(kMaxSpeedChange, kFillGain * off));
         }
+        stats.fill_us.store(fill_ >= 0 ? static_cast<std::int32_t>(std::lround(fill_ * 1e6)) : -1);
+    } else {
+        stats.fill_us.store(-1);
     }
     for (int i = 0; i < frames; ++i) {
         while (t_ >= 1.0) {

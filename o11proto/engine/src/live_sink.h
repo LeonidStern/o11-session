@@ -83,6 +83,7 @@ struct SinkStats {
     std::atomic<std::uint32_t> underruns{0}, overruns{0}, lost{0}, xrun_gaps{0}, resent{0};
     std::atomic<std::uint32_t> lost_at_active{0}, resent_at_active{0};   // the counts when it last went active
     std::atomic<std::int32_t> buffer_us{-1};    // what the buffer held when playback last started
+    std::atomic<std::int32_t> fill_us{-1};      // while playing: the buffer's smoothed fill now
     std::atomic<std::int32_t> block{0};         // the stream's frame size
     void clear(std::uint32_t g);
 };
@@ -208,6 +209,12 @@ public:
     void drop();
     void apply(const SinkItem& it, std::int64_t now_ns);
     void hostGap(int host_frames, int host_rate);   // skip that much of the stream (6.9)
+    // Before each block's apply(): how far (48 kHz samples) the host's
+    // block is behind its schedule, catching up on a stall. The stream went
+    // on arriving meanwhile, so the buffer holds that much more without
+    // being any later: it has room for it, and its fill and its start leave
+    // it out.
+    void hostBehind(int samples48) { behind48_ = std::max(0, samples48); }
     // Renders `frames` frames at `rate` into `out` (interleaved stereo).
     // False when there is no stream: then `out` is silence. After a stream
     // ended or was dropped, the concealment goes on long enough
@@ -245,6 +252,13 @@ private:
     void take(std::int32_t seq, const SinkItem& it, std::int64_t now_ns);
     void dropBefore(std::int64_t seq);          // the blocks before `seq` go unplayed
     std::int64_t turn() const { return (played48_ - align_) / block_; }   // the block whose turn it is on align_
+    int behindBlocks() const { return (behind48_ + block_ / 2) / block_; }
+    // How many blocks from next_ it may hold: the capacity, and what came
+    // while the host was behind.
+    std::int64_t room() const {
+        const int extra = behind48_ > 0 ? (behind48_ + block_ - 1) / block_ + 1 : 0;
+        return std::min(kRing - 2, sizes_.capacity_blocks + extra);
+    }
     void decodeNext(std::int64_t now_ns);       // one block into the 48 kHz queue
     void conceal();
     void prime();
@@ -285,8 +299,11 @@ private:
     int first_real_ = -1, quiet_from_ = 0;
     double t_ = 0;                              // its position between x_[1] and x_[2]
     double fill_ = -1;                          // smoothed buffer fill, seconds; -1: a new estimate
-    double fill_ref_ = -1;                      // the fill it keeps, once settled
+    // The fill it keeps, taken once settled after the stream's first
+    // buffering (or a new buffer setting), and kept through its later ones.
+    double fill_ref_ = -1;
     double fill_age_ = 0;                       // seconds of this estimate
+    int behind48_ = 0;                          // hostBehind()
     std::int64_t played48_ = 0;
     // The delay the stream plays at: block s is decoded when played48_ is
     // align_ + s x block_. After running dry, the stream comes back on it.
