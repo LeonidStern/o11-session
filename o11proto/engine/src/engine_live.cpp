@@ -127,13 +127,19 @@ void Engine::setLiveTestSendHold(int ms) { live_->setTestSendHold(ms); }
 
 std::string Engine::liveTestTiming() const {
     const live::Transport::Timing t = live_->networkTiming();
-    char b[256];
+#if defined(__APPLE__)
+    const char* plain = "user-interactive QoS";
+#else
+    const char* plain = "the least timer slack";
+#endif
+    char b[384];
     std::snprintf(b, sizeof(b),
-                  "the Live network thread: %s; %llu timed waits of 1 ms ran out, the longest %.1f ms, %llu over 5 ms; "
-                  "woken %llu times",
-                  t.latency_critical ? "user-interactive QoS" : "its QoS unchanged",
-                  static_cast<unsigned long long>(t.timeouts), t.longest_ms,
-                  static_cast<unsigned long long>(t.over_5ms), static_cast<unsigned long long>(t.wakes));
+                  "the Live network thread: %s; woken %llu times, the longest wake-up delay %.1f ms, %llu over 5 ms; "
+                  "%llu timed waits of %d ms ran out, the longest %.1f ms, %llu over 5 ms past their time",
+                  t.realtime ? "real-time (time-constraint)" : t.latency_critical ? plain : "its scheduling unchanged",
+                  static_cast<unsigned long long>(t.wakes), t.wake_longest_ms,
+                  static_cast<unsigned long long>(t.wake_over_5ms), static_cast<unsigned long long>(t.timeouts),
+                  t.wait_ms, t.longest_ms, static_cast<unsigned long long>(t.over_5ms));
     return b;
 }
 

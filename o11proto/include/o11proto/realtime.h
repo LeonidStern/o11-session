@@ -23,10 +23,21 @@ namespace thread {
 // timer slack. True when it took.
 bool makeAudioThread(double period_seconds);
 
-// The calling thread does latency-critical work and blocks between (Live's
-// network thread): on macOS the user-interactive QoS class; on Linux the
-// least timer slack. True when it took.
+// The calling thread does latency-critical work and blocks between (a
+// server's thread, say): on macOS the user-interactive QoS class; on Linux
+// the least timer slack. True when it took.
 bool makeLatencyCritical();
+
+// The calling thread is Live's network thread (live::Transport): it blocks
+// on its socket and wakes for each datagram and for each block the audio
+// thread queues, and what it does then is on the audio's time. On macOS
+// the time-constraint policy, as an audio thread of kNetworkPeriodSeconds
+// (1 ms of computation within 2 ms; an ordinary thread's wake there came up
+// to 24 ms late on a CI runner), else as makeLatencyCritical(); elsewhere as
+// makeLatencyCritical().
+enum class NetworkScheduling { Unchanged, LatencyCritical, Realtime };
+constexpr double kNetworkPeriodSeconds = 0.002;
+NetworkScheduling makeNetworkThread();
 
 // For diagnostics, one line: the calling thread's scheduling (on macOS its
 // QoS class, whether it has the time-constraint policy, the process's task

@@ -2,6 +2,7 @@
 // rules of PROTOCOL.md 15.5-15.6.
 #include "o11proto/live_transport.h"
 
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -36,9 +37,11 @@ struct Transport::Impl {
     // it is written once until the network thread has woken.
     int wake_fd[2] = {-1, -1};
     std::atomic<bool> wake_pending{false};
-    std::atomic<bool> latency_critical{false};
-    std::atomic<std::uint64_t> timeouts{0}, over_5ms{0}, wakes{0};
-    std::atomic<std::int64_t> longest_us{0};
+    std::atomic<bool> latency_critical{false}, realtime{false};
+    std::atomic<std::uint64_t> timeouts{0}, over_5ms{0}, wakes{0}, wake_over_5ms{0};
+    std::atomic<std::int64_t> longest_us{0}, wake_longest_us{0};
+    std::atomic<std::int64_t> woken_at_us{0};      // wake(): when it wrote to the pipe
+    int wait_ms = 1;
     void drainWake() {
 #ifndef _WIN32
         char b[64];
@@ -91,6 +94,7 @@ void Transport::wake() {
 #ifndef _WIN32
     Impl& m = *impl_;
     if (m.wake_fd[1] < 0 || m.wake_pending.exchange(true, std::memory_order_acq_rel)) return;
+    m.woken_at_us.store(static_cast<std::int64_t>(monotonicMicros()));
     const char c = 1;
     if (::write(m.wake_fd[1], &c, 1) != 1) m.wake_pending.store(false);
 #endif
@@ -100,10 +104,14 @@ Transport::Timing Transport::timing() const {
     const Impl& m = *impl_;
     Timing t;
     t.latency_critical = m.latency_critical.load();
+    t.realtime = m.realtime.load();
+    t.wait_ms = m.wait_ms;
     t.timeouts = m.timeouts.load();
     t.over_5ms = m.over_5ms.load();
     t.wakes = m.wakes.load();
+    t.wake_over_5ms = m.wake_over_5ms.load();
     t.longest_ms = static_cast<double>(m.longest_us.load()) / 1000.0;
+    t.wake_longest_ms = static_cast<double>(m.wake_longest_us.load()) / 1000.0;
     return t;
 }
 
@@ -149,7 +157,14 @@ bool Transport::start(const Options& o, std::string& error) {
     m.timeouts.store(0);
     m.over_5ms.store(0);
     m.wakes.store(0);
+    m.wake_over_5ms.store(0);
     m.longest_us.store(0);
+    m.wake_longest_us.store(0);
+#ifdef _WIN32
+    m.wait_ms = 1;                             // wake() does nothing here: the passes are the only tick
+#else
+    m.wait_ms = m.wake_fd[0] >= 0 ? std::max(1, std::min(100, o.wait_ms)) : 1;
+#endif
     for (auto& s : m.stamps) s = 0;
     m.next_stamp = 0;
     m.rng = 0x9e3779b9u ^ o.peer_id;
@@ -277,7 +292,9 @@ void Transport::handleDatagram(const std::uint8_t* d, std::size_t n) {
 
 void Transport::loop() {
     Impl& m = *impl_;
-    m.latency_critical.store(thread::makeLatencyCritical());
+    const thread::NetworkScheduling sched = thread::makeNetworkThread();
+    m.realtime.store(sched == thread::NetworkScheduling::Realtime);
+    m.latency_critical.store(sched == thread::NetworkScheduling::LatencyCritical);
     while (!m.stopping.load()) {
         pollfd p[2] = {};
         p[0].fd = m.fd;
@@ -291,14 +308,22 @@ void Transport::loop() {
         }
 #endif
         const TimePoint t0 = Clock::now();
-        const int ready = compat::poll(p, n_fds, 1);
+        const int ready = compat::poll(p, n_fds, m.wait_ms);
         if (ready == 0) {                      // the timed wait ran out: how long it took
             const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
             m.timeouts.fetch_add(1, std::memory_order_relaxed);
-            if (us > 5000) m.over_5ms.fetch_add(1, std::memory_order_relaxed);
+            if (us > 1000L * m.wait_ms + 5000) m.over_5ms.fetch_add(1, std::memory_order_relaxed);
             if (us > m.longest_us.load(std::memory_order_relaxed)) m.longest_us.store(us, std::memory_order_relaxed);
         }
         if (n_fds == 2 && (p[1].revents & POLLIN)) {
+            // How long after the wake() it runs: the wake-up delay.
+            const std::int64_t at = m.woken_at_us.load();
+            const std::int64_t us = static_cast<std::int64_t>(monotonicMicros()) - at;
+            if (at > 0 && us >= 0) {
+                if (us > 5000) m.wake_over_5ms.fetch_add(1, std::memory_order_relaxed);
+                if (us > m.wake_longest_us.load(std::memory_order_relaxed))
+                    m.wake_longest_us.store(us, std::memory_order_relaxed);
+            }
             m.drainWake();                     // then the flag: a wake() after it writes again
             m.wake_pending.store(false, std::memory_order_release);
             m.wakes.fetch_add(1, std::memory_order_relaxed);

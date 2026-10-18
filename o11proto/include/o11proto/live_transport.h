@@ -6,10 +6,11 @@
 // The transport runs its own network thread. Every callback runs on that
 // thread, and send() may only be called from inside one: the thread owns the
 // socket, so nothing else can send while it is being closed. The thread
-// wakes for a datagram, for wake(), and at least every millisecond; on macOS
-// it asks for the user-interactive QoS class (o11proto/realtime.h), and
-// wake() keeps its sends to the audio's time where the system stretches its
-// timed waits.
+// blocks on its socket and wakes for a datagram, for wake(), and at least
+// every Options::wait_ms (1 ms on Windows, where wake() does nothing). It is
+// made a network thread (thread::makeNetworkThread(): on macOS the
+// time-constraint policy, as an audio thread), so its wakes come on the
+// audio's time where the system stretches an ordinary thread's.
 //
 // The callbacks may run until stop() returns. ~Transport() stops too, but
 // only once an owner's later members, or the locals declared after the
@@ -42,14 +43,18 @@ public:
         // Test hook: this fraction (0..1) of the data datagrams received is
         // dropped before on_data, as a lossy network would.
         double test_receive_loss = 0;
+        // The longest the thread waits for a datagram or a wake() before a
+        // pass of its own (on_tick), 1..100 ms: housekeeping for an owner
+        // that wakes it for its work. Always 1 where wake() does nothing.
+        int wait_ms = 1;
     };
 
     // Set before start(); each runs on the network thread.
     // A data datagram that passed the client's checks: `from` is the
     // sender's peer id (never 0), the payload is 1..1452 bytes.
     std::function<void(std::uint32_t from, const std::uint8_t* payload, std::size_t len)> on_data;
-    // After each pass over the socket: at least every millisecond, and
-    // soon after each wake().
+    // After each pass over the socket: at least every Options::wait_ms, and
+    // soon after each datagram and each wake().
     std::function<void()> on_tick;
     // Once, from stop(), while the socket is still open: the last chance
     // to send (the source's /stop messages).
@@ -84,13 +89,18 @@ public:
     // passes come every millisecond.
     void wake();
 
-    // For diagnostics, any thread: whether the network thread got its QoS
-    // class, its timed waits of 1 ms that ended without a datagram or a
-    // wake and the longest of them, how many took over 5 ms, and the wakes.
+    // For diagnostics, any thread: the network thread's scheduling
+    // (thread::makeNetworkThread()); its timed waits (of `wait_ms`) that
+    // ended without a datagram or a wake, the longest of them, and how many
+    // ended over 5 ms past their time; the wakes it woke for, the longest
+    // wake-up delay (from a wake() to the thread running) and how many were
+    // over 5 ms.
     struct Timing {
-        bool latency_critical = false;
-        std::uint64_t timeouts = 0, over_5ms = 0, wakes = 0;
-        double longest_ms = 0;
+        bool latency_critical = false;          // the QoS class or the timer slack took
+        bool realtime = false;                  // the time-constraint policy took
+        int wait_ms = 1;
+        std::uint64_t timeouts = 0, over_5ms = 0, wakes = 0, wake_over_5ms = 0;
+        double longest_ms = 0, wake_longest_ms = 0;
     };
     Timing timing() const;
 

@@ -289,8 +289,8 @@ public:
     // block) where this user's live audio last went into concealment, -1
     // for never.
     long liveTestConcealedFrom(int user) const;
-    // For diagnostics: the Live network thread's scheduling and timed waits
-    // (live::Transport::timing()), one line.
+    // For diagnostics: the Live network thread's scheduling, its longest
+    // wake-up delay and its timed waits (live::Transport::timing()), one line.
     std::string liveTestTiming() const;
 
 private:

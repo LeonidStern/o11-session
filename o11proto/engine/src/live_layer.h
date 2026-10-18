@@ -42,6 +42,9 @@ constexpr int kLiveDefaultBufferMs = 20;
 constexpr int kLiveMinBufferMs = 5;
 constexpr int kLiveMaxBufferMs = 200;
 constexpr int kLiveMaxHostBlock = 16384;     // longer host blocks play intervals only
+// The network thread's housekeeping wait: the audio thread wakes it for
+// each block it queues, and a datagram does (live::Transport::Options).
+constexpr int kLiveNetworkWaitMs = 10;
 
 // The buffer in use, B (6.8), and the longest host block that plays well.
 int liveBufferInUse(int setting_ms, int host_block, int host_rate);
