@@ -518,14 +518,17 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
     int pos = 0, length = 0;
     m_client->position(&pos, &length);
     if (m_client->isIntervalRunning() && pos < length) n = std::min(n, length - pos);
-    for (int i = 0; i < n; i ++)
+    for (int c = 0; c < 2; c ++)
     {
-      m_monL[(size_t)i] = inL ? inL[done + i] * gain : 0.0f;
-      m_monR[(size_t)i] = inR ? inR[done + i] * gain : 0.0f;
-      m_bufL[(size_t)i] = stopped ? 0.0f : m_monL[(size_t)i];
-      m_bufR[(size_t)i] = stopped ? 0.0f : m_monR[(size_t)i];
+      const float *src = c == 0 ? inL : inR;
+      float *mon = c == 0 ? m_monL.data() : m_monR.data();
+      if (src)
+        for (int i = 0; i < n; i ++) mon[i] = src[done + i] * gain;
+      else memset(mon, 0, sizeof(float) * (size_t)n);
     }
-    const float *ins[2] = { m_bufL.data(), m_bufR.data() };
+    // the engine only reads its input: your input as you hear it, or silence (m_bufL and m_bufR
+    // are never written after setupProcessing) while the host is stopped
+    const float *ins[2] = { stopped ? m_bufL.data() : m_monL.data(), stopped ? m_bufR.data() : m_monR.data() };
     float *mix[MIX_OUTS];
     for (int c = 0; c < MIX_OUTS; c ++) mix[c] = m_mix[(size_t)c].data();
     m_client->process(ins, 2, mix, MIX_OUTS, n, srate);
@@ -533,21 +536,20 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
     // the main output: everyone, and your monitoring (the engine's own is muted, so it goes on
     // while nothing is sent); each player output: that player alone
     float *outs[2] = { out[0] + done, numOut > 1 && out[1] ? out[1] + done : m_spare.data() };
-    for (int i = 0; i < n; i ++)
+    // a channel at a time (loops the compiler vectorizes: the host's buffer is none of ours), in
+    // the same order for each sample: the main pair, the player pairs, your monitoring
+    static_assert(NUM_PLAYER_OUTS == 8, "the sum below names each player pair");
+    for (int c = 0; c < 2; c ++)
     {
-      float l = mix[0][i], r = mix[1][i];
-      for (int p = 0; p < NUM_PLAYER_OUTS; p ++)
-      {
-        l += mix[2 + 2 * p][i];
-        r += mix[3 + 2 * p][i];
-      }
+      float *__restrict o = outs[c];
+      const float *m = mix[c], *p0 = mix[2 + c], *p1 = mix[4 + c], *p2 = mix[6 + c], *p3 = mix[8 + c], *p4 = mix[10 + c],
+                  *p5 = mix[12 + c], *p6 = mix[14 + c], *p7 = mix[16 + c];
+      for (int i = 0; i < n; i ++) o[i] = m[i] + p0[i] + p1[i] + p2[i] + p3[i] + p4[i] + p5[i] + p6[i] + p7[i];
       if (monitor)
       {
-        l += m_monL[(size_t)i];
-        r += m_monR[(size_t)i];
+        const float *mon = c == 0 ? m_monL.data() : m_monR.data();
+        for (int i = 0; i < n; i ++) o[i] += mon[i];
       }
-      outs[0][i] = l;
-      outs[1][i] = r;
     }
     if (playerOuts)
       for (int p = 0; p < NUM_PLAYER_OUTS; p ++)
