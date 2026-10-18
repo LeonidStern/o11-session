@@ -165,7 +165,9 @@ void LiveLayer::forget() {
     report_ever = false;
     report_at = TimePoint{};
     room_noticed = 0;
-    cant_said.clear();
+    advice_said.clear();
+    advice_said_reason = o11proto::live::Advice::None;
+    advice_said_count = 0;
     room_due_ns.store(0);
     room_announce.store((++room_seq) << 1, std::memory_order_release);   // intervals, at the next boundary
     start_failed_said = no_answer_said = offer_said = false;
@@ -699,6 +701,9 @@ void LiveLayer::startStream(int rate, TimePoint now) {
         src_.format = nextId(src_.next_format); // a new format id each time the format is set
     }
     opus_encoder_ctl(src_.enc, OPUS_RESET_STATE);
+    // Opus's prediction from one frame to the next stays on: without it the
+    // codec's noise is 9 dB louder on a held tone. A sink primes its
+    // decoder after a loss instead (live_sink.cpp, LiveSink::prime()).
     opus_encoder_ctl(src_.enc, OPUS_SET_BITRATE(src_.kbps * 1000));
     src_.kbps_changed = src_.frame_changed = false;
     src_.stream = nextId(src_.next_stream);

@@ -1,7 +1,7 @@
 // o11proto engine - Live mode, one sink's playback in the audio context:
-// the jitter buffer of 5.9, Opus decoding with the clamp of 5.7, and the
-// cubic resampler to the host rate whose speed keeps the buffer's fill
-// (6.9, see engine/NOTES.md).
+// the jitter buffer of 5.9, Opus decoding with the clamp of 5.7, the
+// concealment (ENGINE.md 16.6), and the cubic resampler to the host rate
+// whose speed keeps the buffer's fill (6.9, see engine/NOTES.md).
 #include "live_sink.h"
 
 #include <algorithm>
@@ -63,16 +63,253 @@ void clampDecoded(float* s, std::size_t n) {
     }
 }
 
-LiveSink::LiveSink() : ring_(new Entry[kRing]) {
+// ---------------------------------------------------------- concealment
+
+void Concealer::clear() {
+    hist_n_ = 0;
+    state_ = Off;
+    order_ = 0;
+    gain_ = 1;
+}
+
+void Concealer::remember(const float* x, int frames) {
+    const int n = std::min(frames, kFit);
+    for (int c = 0; c < 2; ++c) {
+        float* h = hist_[c];
+        std::memmove(h, h + n, sizeof(float) * static_cast<std::size_t>(kFit - n));
+        for (int i = 0; i < n; ++i) h[kFit - n + i] = x[2 * (frames - n + i) + c];
+    }
+    hist_n_ = std::min(kFit, hist_n_ + n);
+}
+
+double Concealer::dot(const double* a, const double* b, int n) {
+    double s[4] = {0, 0, 0, 0};                  // four sums, so that the products don't wait on one
+    int i = 0;
+    for (; i + 4 <= n; i += 4)
+        for (int k = 0; k < 4; ++k) s[k] += a[i + k] * b[i + k];
+    for (; i < n; ++i) s[0] += a[i] * b[i];
+    return (s[0] + s[1]) + (s[2] + s[3]);
+}
+
+void Concealer::fit() {
+    done_ = 0;
+    gain_ = 1;
+    order_ = 0;
+    const int n = hist_n_;
+    double ms = 0;
+    for (int c = 0; c < 2; ++c)
+        for (int i = kFit - std::min(n, kGuard); i < kFit; ++i) ms += static_cast<double>(hist_[c][i]) * hist_[c][i];
+    ms_ref_ = ms / (2.0 * std::max(1, std::min(n, kGuard)));
+    if (n < kMaxLag + 4 * kOrder || ms_ref_ < 1e-14) return;   // too little, or silence: silence
+    // One fit for both channels, to their mid (or their side, where that is
+    // the louder): it predicts each of them from its own past, at half the
+    // cost of a fit each.
+    double mid = 0, side = 0;
+    for (int i = kFit - n; i < kFit; ++i) {
+        const double m = 0.5 * (static_cast<double>(hist_[0][i]) + hist_[1][i]);
+        const double d = 0.5 * (static_cast<double>(hist_[0][i]) - hist_[1][i]);
+        mid += m * m;
+        side += d * d;
+    }
+    const double sign = side > mid ? -1.0 : 1.0;
+    double* x = x_ + kFit - n;
+    for (int i = 0; i < n; ++i)
+        x[i] = 0.5 * (static_cast<double>(hist_[0][kFit - n + i]) + sign * hist_[1][kFit - n + i]);
+    // The least-squares fit (the covariance method) over the samples
+    // themselves. From 60 ms it finds a steady tone's frequency far better
+    // than Burg's fit (a 440 Hz tone predicted for 80 ms ends about 3
+    // degrees off, against more than 90 with Burg's), so the audio that
+    // comes back is in phase with the prediction it is crossfaded from; over
+    // 30 ms the codec's small changes of level from frame to frame made a
+    // held tone fade by up to 1.5 dB in 80 ms, over 60 ms by 0.3. The lags
+    // further back hold a low sound (a kick's tail at 50 Hz) that the
+    // nearest 24 can't tell from the noise over it: those alone let it die
+    // away within 20 ms.
+    constexpr int p = kOrder;
+    const int rows = n - kMaxLag;
+    auto xx = [x](int i, int j) { return x[i] * x[j]; };
+    // R[i][j] = sum over t = kMaxLag..n-1 of x[t - lag(i)] x[t - lag(j)]:
+    // among the dense lags, the first row in full and the rest from the one
+    // above it, by the samples that enter and leave; the rest in full.
+    for (int j = 0; j < p; ++j) cov_[0][j] = dot(x + kMaxLag - 1, x + kMaxLag - lag(j), rows);
+    for (int i = 0; i + 1 < kDense; ++i)
+        for (int j = i; j + 1 < kDense; ++j)
+            cov_[i + 1][j + 1] = cov_[i][j] - xx(n - 2 - i, n - 2 - j) + xx(kMaxLag - 2 - i, kMaxLag - 2 - j);
+    for (int i = 1; i < p; ++i)
+        for (int j = std::max(i, kDense); j < p; ++j) cov_[i][j] = dot(x + kMaxLag - lag(i), x + kMaxLag - lag(j), rows);
+    double trace = 0;
+    for (int i = 0; i < p; ++i) {
+        rhs_[i] = dot(x + kMaxLag, x + kMaxLag - lag(i), rows);
+        trace += cov_[i][i];
+    }
+    // Cholesky, with the diagonal raised by 1e-4 of its mean: that keeps
+    // the poles the codec's noise makes inside the unit circle (with a
+    // billionth, a kick's tail grew a ring at 150 Hz by 20 dB in 80 ms).
+    const double load = 1e-4 * trace / p + 1e-30;
+    for (int i = 0; i < p; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            double v = (j < i ? cov_[j][i] : cov_[i][i] + load);   // the upper triangle holds R
+            for (int k = 0; k < j; ++k) v -= chol_[i][k] * chol_[j][k];
+            if (j < i) {
+                chol_[i][j] = v / chol_[j][j];
+            } else if (v > 0) {
+                chol_[i][i] = std::sqrt(v);
+            } else {
+                return;                          // silence
+            }
+        }
+    }
+    double* a = a_;
+    for (int i = 0; i < p; ++i) {                // L z = r, then L' a = z
+        double v = rhs_[i];
+        for (int k = 0; k < i; ++k) v -= chol_[i][k] * a[k];
+        a[i] = v / chol_[i][i];
+    }
+    for (int i = p - 1; i >= 0; --i) {
+        double v = a[i];
+        for (int k = i + 1; k < p; ++k) v -= chol_[k][i] * a[k];
+        a[i] = v / chol_[i][i];
+    }
+    for (int c = 0; c < 2; ++c) {                // y[t - 1 - j] at kRing - 1 - j
+        const float* h = hist_[c] + kFit - n;
+        for (int j = 0; j < kRing; ++j) y_[c][kRing - 1 - j] = j < n ? h[n - 1 - j] : 0.0;
+    }
+    at_ = 0;                                     // y_[c][(at_ - k) & (kRing - 1)] is y[t - k]
+    order_ = kOrder;
+}
+
+float Concealer::predict(int c) {
+    const double* a = a_;
+    double* y = y_[c];
+    double s = 0;
+    for (int i = 0; i < kOrder; ++i) s += a[i] * y[(at_ - lag(i)) & (kRing - 1)];
+    s = std::max(-4.0, std::min(4.0, s));
+    y[at_ & (kRing - 1)] = s;
+    return static_cast<float>(s);
+}
+
+void Concealer::next(float* out, int frames) {
+    if (state_ == Off) fit();
+    state_ = Concealing;
+    joined_ = 0;
+    if (order_ == 0 || done_ >= limit_ + kGuard + kGoesOn) {
+        std::memset(out, 0, sizeof(float) * 2 * static_cast<std::size_t>(frames));
+        remember(out, frames);
+        done_ += frames;
+        return;
+    }
+    double ms = 0;
+    for (int i = 0; i < frames; ++i) {
+        out[2 * i] = predict(0);
+        out[2 * i + 1] = predict(1);
+        at_ = (at_ + 1) & (kRing - 1);
+        ms += static_cast<double>(out[2 * i]) * out[2 * i] + static_cast<double>(out[2 * i + 1]) * out[2 * i + 1];
+    }
+    ms /= 2.0 * frames;
+    // Never above the level played last (0.5 dB of the guard's own
+    // ripple aside): the gain moves there over this block.
+    const double over = ms_ref_ * 1.122;
+    const float to = ms > over ? static_cast<float>(std::sqrt(over / ms)) : 1.0f;
+    for (int i = 0; i < frames; ++i) {
+        const float g = gain_ + (to - gain_) * static_cast<float>(i + 1) / frames;
+        out[2 * i] *= g;
+        out[2 * i + 1] *= g;
+    }
+    gain_ = to;
+    remember(out, frames);                       // the stream's best guess, heard or not
+    if (done_ + frames > limit_)
+        for (int i = 0; i < frames; ++i) {
+            const float e = ending(done_ + i);
+            out[2 * i] *= e;
+            out[2 * i + 1] *= e;
+        }
+    done_ += frames;
+}
+
+void Concealer::cut() {
+    if (state_ == Off) fit();
+    state_ = Concealing;
+    joined_ = 0;
+}
+
+void Concealer::recent(float* out, int frames) const {
+    for (int i = 0; i < frames; ++i) {
+        const int back = frames - i;             // 1: the newest
+        const bool have = back <= std::min(hist_n_, kFit);
+        out[2 * i] = have ? hist_[0][kFit - back] : 0.0f;
+        out[2 * i + 1] = have ? hist_[1][kFit - back] : 0.0f;
+    }
+}
+
+void Concealer::peek(float* out, int frames) {
+    const int at = at_;
+    const bool on = state_ != Off && order_ > 0 && done_ < limit_ + kGuard + kGoesOn;
+    for (int i = 0; i < frames; ++i) {
+        float e[2] = {0.0f, 0.0f};
+        if (on) {
+            e[0] = predict(0) * gain_;
+            e[1] = predict(1) * gain_;
+            at_ = (at_ + 1) & (kRing - 1);
+        }
+        out[2 * i] = e[0];
+        out[2 * i + 1] = e[1];
+    }
+    // What predict() wrote is written again, the same, when join() takes
+    // it; and what it overwrote is further back than the furthest lag.
+    at_ = at;
+}
+
+void Concealer::join(float* decoded, int frames) {
+    remember(decoded, frames);
+    if (state_ == Off) return;
+    state_ = Joining;
+    constexpr float kPi = 3.14159265359f;
+    for (int i = 0; i < frames; ++i) {
+        const int j = joined_ + i;
+        if (j >= kFade) break;
+        float e[2] = {0.0f, 0.0f};
+        if (order_ > 0 && done_ < limit_ + kGuard) {
+            const float g = gain_ * ending(done_++);
+            e[0] = predict(0) * g;
+            e[1] = predict(1) * g;
+            at_ = (at_ + 1) & (kRing - 1);
+        }
+        const float w = 0.5f - 0.5f * std::cos(kPi * (static_cast<float>(j) + 0.5f) / kFade);
+        for (int c = 0; c < 2; ++c) decoded[2 * i + c] = e[c] + w * (decoded[2 * i + c] - e[c]);
+    }
+    joined_ += frames;
+    if (joined_ >= kFade) state_ = Off;
+}
+
+// ------------------------------------------------------------------ sink
+
+LiveSink::LiveSink() : ring_(new Entry[kRing]), concealer_(new Concealer) {
     dec_mem_.reset(new unsigned char[static_cast<std::size_t>(opus_decoder_get_size(2))]);
     dec_ = reinterpret_cast<OpusDecoder*>(dec_mem_.get());
     opus_decoder_init(dec_, 48000, 2);
+    // The primer codes for the decoder's state only, so it may take its
+    // time over nothing but the pitch filter (which needs complexity 5)
+    // and the energies; its bitrate makes them as exact as a stream's.
+    enc_mem_.reset(new unsigned char[static_cast<std::size_t>(opus_encoder_get_size(2))]);
+    enc_ = reinterpret_cast<OpusEncoder*>(enc_mem_.get());
+    opus_encoder_init(enc_, 48000, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY);
+    opus_encoder_ctl(enc_, OPUS_SET_BITRATE(256000));
+    opus_encoder_ctl(enc_, OPUS_SET_COMPLEXITY(5));
+    opus_int32 la = 120;
+    if (opus_encoder_ctl(enc_, OPUS_GET_LOOKAHEAD(&la)) == OPUS_OK && la >= 0 && la <= 128) lookahead_ = la;
     sizesChanged();
 }
 
 LiveSink::~LiveSink() = default;
 
-void LiveSink::sizesChanged() { sizes_ = sinkSizes(latency_ms_, host_block_, host_rate_, block_); }
+void LiveSink::sizesChanged() {
+    sizes_ = sinkSizes(latency_ms_, host_block_, host_rate_, block_);
+    concealer_->setLimit(concealSamples());
+}
+
+int LiveSink::concealSamples() const {
+    return static_cast<int>((kLiveConcealBuffers * latency_ms_ + kLiveFadeMs + 10.0) * 48.0);
+}
 
 void LiveSink::configure(double latency_ms, int host_block, int host_rate) {
     if (latency_ms == latency_ms_ && host_block == host_block_ && host_rate == host_rate_) return;
@@ -84,13 +321,12 @@ void LiveSink::configure(double latency_ms, int host_block, int host_rate) {
     if (restart && phase_ != Idle && !stopping_) {   // 6.8: a new buffer buffers again
         phase_ = Buffering;
         waited_ = 0;
+        has_align_ = realign_ = false;          // and so has a new delay
         stats.active.store(false);
     }
 }
 
-void LiveSink::startTail() {
-    tail48_ = static_cast<int>((kLiveConcealBuffers * latency_ms_ + kLiveFadeMs + 10.0) * 48.0);
-}
+void LiveSink::startTail() { tail48_ = concealSamples(); }
 
 void LiveSink::reset() {
     // After a stream, what was decoded plays out, then the concealment
@@ -106,6 +342,7 @@ void LiveSink::reset() {
     far_ = false;
     if (!tail) fifo_n_ = fifo_at_ = 0;
     fill_ = -1;
+    has_align_ = realign_ = false;
     stats.active.store(false);
 }
 
@@ -123,6 +360,15 @@ void LiveSink::emptyFrom(std::int32_t seq) {
     newest_ = static_cast<std::int64_t>(seq) - 1;
     last_played_ = newest_;
     far_ = false;
+}
+
+void LiveSink::dropBefore(std::int64_t seq) {
+    for (std::int64_t s = next_; s < seq && s <= newest_ && s < next_ + kRing; ++s)
+        ring_[s & (kRing - 1)].state = Empty;
+    if (seq <= next_) return;
+    next_ = seq;
+    last_played_ = seq - 1;
+    if (newest_ < seq - 1) newest_ = seq - 1;
 }
 
 void LiveSink::take(std::int32_t seq, const SinkItem& it, std::int64_t now_ns) {
@@ -154,12 +400,15 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         block_ = it.block;
         sizesChanged();
         opus_decoder_ctl(dec_, OPUS_RESET_STATE);
+        fresh_ = it.seq == 0;                    // as its encoder began, unless it began before
+        concealer_->clear();                     // a new stream: nothing to go on from
         emptyFrom(it.seq);
         phase_ = Buffering;
         stopping_ = false;
         waited_ = 0;
         fifo_n_ = fifo_at_ = 0;
         fill_ = -1;
+        has_align_ = realign_ = false;          // a new stream finds its own delay
         stats.block.store(block_);
         stats.active.store(false);
         tail48_ = 0;
@@ -187,6 +436,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
     if (seq < next_) {                           // at or before the last block played
         if (last_played_ - seq < (1LL << 30)) return;   // old
         emptyFrom(seq);                          // the stream wrapped
+        has_align_ = realign_ = false;          // and its turns are counted afresh
     }
     if (phase_ == Dry) {                         // audio again after running dry
         if (stopping_) return;
@@ -194,6 +444,21 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         emptyFrom(seq);
         phase_ = Buffering;
         waited_ = 0;
+        // Back on the delay the stream had, so that it stays in time with
+        // the other players (16.6): what comes too late for its turn goes,
+        // the rest waits for its turn. Only a stream more than the capacity
+        // ahead of it buffers afresh.
+        realign_ = has_align_ && seq - turn() <= sizes_.capacity_blocks;
+        has_align_ = realign_;
+        late48_ = 0;
+    }
+    if (realign_ && seq < turn()) {              // too late for its turn
+        if (it.kind == SinkItem::Xrun) {         // but it still tells of the sender's gap (6.4)
+            if (played48_ - last_xrun48_ > 4800) stats.xrun_gaps.fetch_add(1);
+            last_xrun48_ = played48_;
+        }
+        dropBefore(static_cast<std::int64_t>(seq) + 1);
+        return;
     }
     if (seq <= newest_) {
         take(seq, it, now_ns);
@@ -216,12 +481,36 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
     emptyFrom(seq);
     phase_ = Buffering;
     waited_ = 0;
+    has_align_ = realign_ = false;
     take(seq, it, now_ns);
 }
 
-void LiveSink::conceal() {
-    int n = opus_decode_float(dec_, nullptr, 0, fifo_, block_, 0);
-    if (n != block_) std::memset(fifo_, 0, sizeof(float) * 2 * static_cast<std::size_t>(block_));
+void LiveSink::conceal() { concealer_->next(fifo_, block_); }
+
+// The audio comes back after concealment. The stream's encoder codes each
+// frame's energies from those of the frame before (and filters by the pitch
+// it found), so a decoder that only starts afresh decodes the first frames
+// far too loud or too soft: a burst of noise, and a held note that dips by
+// 8 dB. So the decoder is brought to the state it would have had if the
+// stream had been what the concealment guessed: an encoder of the sink's
+// own codes the last 1024 samples of that guess (CELT's longest pitch
+// period) and some, up to now and on by the encoder's lookahead, and the
+// decoder decodes them; then the block. After a short gap the guess is
+// what was heard; after a long one it is the prediction that went on
+// unheard, so that a held note comes back at its level (16.6).
+void LiveSink::prime() {
+    const int frame = block_;
+    const int frames = std::min(kMaxPrime / frame, (kPrimeHistory + 2 * lookahead_ + frame - 1) / frame);
+    const int total = frames * frame;
+    concealer_->recent(prime_, total - lookahead_);
+    concealer_->peek(prime_ + 2 * (total - lookahead_), lookahead_);
+    opus_encoder_ctl(enc_, OPUS_RESET_STATE);
+    opus_decoder_ctl(dec_, OPUS_RESET_STATE);
+    unsigned char packet[aoo::kMaxBlockBytes];
+    for (int k = 0; k < frames; ++k) {
+        const int n = opus_encode_float(enc_, prime_ + 2 * k * frame, frame, packet, sizeof(packet));
+        if (n <= 0 || opus_decode_float(dec_, packet, n, fifo_, frame, 0) < 0) break;
+    }
 }
 
 void LiveSink::decodeNext(std::int64_t now_ns) {
@@ -229,7 +518,25 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
     fifo_n_ = block_;
     if (phase_ == Buffering) {
         const int held = heldBlocks();
-        if (waited_ >= sizes_.latency48 && (held >= sizes_.latency_blocks || (stopping_ && held > 0))) {
+        if (realign_) {                          // after running dry: back on its delay
+            const std::int64_t due = turn();
+            dropBefore(std::min(due, newest_ + 1));   // what is too late for its turn goes
+            if (next_ == due && next_ <= newest_) {
+                realign_ = false;
+                phase_ = Playing;                // and the fill it keeps stays the one it settled at
+                stats.lost_at_active.store(stats.lost.load());
+                stats.resent_at_active.store(stats.resent.load());
+                stats.active_since_ns.store(now_ns);
+                stats.active.store(true);
+            } else if (newest_ < due && (late48_ += block_) >= sizes_.latency48) {
+                // Late for good (its sender's host stopped, say): it buffers
+                // afresh, on a delay of its own. The stream has jumped back,
+                // and like a jump ahead (5.9) that counts as an overrun.
+                stats.overruns.fetch_add(1);
+                realign_ = has_align_ = false;
+                waited_ = 0;
+            }
+        } else if (waited_ >= sizes_.latency48 && (held >= sizes_.latency_blocks || (stopping_ && held > 0))) {
             if (held > sizes_.latency_blocks) {  // more than the latency: the oldest go
                 const std::int64_t skip = held - sizes_.latency_blocks;
                 for (std::int64_t s = next_; s < next_ + skip; ++s) ring_[s & (kRing - 1)].state = Empty;
@@ -244,8 +551,9 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
             stats.resent_at_active.store(stats.resent.load());
             stats.active_since_ns.store(now_ns);
             stats.active.store(true);
-        } else {
-            if (waited_ >= 4 * sizes_.latency48) {   // gives up: an underrun, and waits again
+        }
+        if (phase_ == Buffering) {
+            if (!realign_ && waited_ >= 4 * sizes_.latency48) {   // gives up: an underrun, and waits again
                 stats.underruns.fetch_add(1);
                 waited_ = 0;
             }
@@ -282,12 +590,23 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
             conceal();
             break;
         }
+        align_ = played48_ - next_ * block_;
+        has_align_ = true;
         Entry& e = ring_[next_ & (kRing - 1)];
         if (e.seq == next_ && e.state == Full) {
+            if (concealer_->concealing() && !(fresh_ && next_ == 0)) prime();
+            fresh_ = false;
             int n = opus_decode_float(dec_, e.data, e.len, fifo_, block_, 0);
-            if (n < 0) conceal();
-            else if (n < block_)
-                std::memset(fifo_ + 2 * n, 0, sizeof(float) * 2 * static_cast<std::size_t>(block_ - n));
+            if (n < 0) {
+                conceal();
+            } else {
+                if (n < block_) std::memset(fifo_ + 2 * n, 0, sizeof(float) * 2 * static_cast<std::size_t>(block_ - n));
+                clampDecoded(fifo_, 2 * static_cast<std::size_t>(block_));
+                if (concealer_->concealing() || concealer_->joining())
+                    concealer_->join(fifo_, block_);
+                else
+                    concealer_->played(fifo_, block_);
+            }
         } else if (e.seq == next_ && e.state == XrunBlock) {
             conceal();
             if (played48_ - last_xrun48_ > 4800) stats.xrun_gaps.fetch_add(1);   // one gap per 100 ms
@@ -317,7 +636,9 @@ void LiveSink::hostGap(int host_frames, int host_rate) {
     next_ += n;
     last_played_ = next_ - 1;
     if (newest_ < next_ - 1) newest_ = next_ - 1;
+    align_ -= n * block_;                        // the time the host missed: the delay stays
     fill_ = -1;                                  // the clock estimate restarts
+    if (n > 0 && phase_ == Playing) concealer_->cut();   // the stream jumps: joined over
 }
 
 bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {

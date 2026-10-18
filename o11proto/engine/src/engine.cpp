@@ -371,7 +371,7 @@ void Engine::processUploadItem(LocalState& ls, int index, UploadBlock& b) {
             }
             ls.skipped = false;
             int kbps = room_kbps_.load() ? room_kbps_.load() : ls.s.bitrate;
-            if (!ls.enc || ls.enc->fourcc() != fourcc || ls.enc->rate() != b.rate ||
+            if (!ls.enc || b.fresh || ls.enc->fourcc() != fourcc || ls.enc->rate() != b.rate ||
                 ls.enc->channels() != b.channels || ls.enc->kbps() != kbps)
                 ls.enc = makeEncoder(fourcc, b.rate, b.channels, kbps);
             if (!ls.enc) {
@@ -884,19 +884,27 @@ void Engine::boundary(int sampleRate) {
     beat_len_ = std::max(1, len / std::max(1, active_bpi_.load()));
     next_beat_ = 0;
     beat_index_ = 0;
-    uploadBoundary();
     liveBoundary();
+    uploadBoundary();
     newIntervalStep();
 }
 
-// 6.3, local_mutex_ held.
+// 6.3, local_mutex_ held. While the room is Live nothing is uploaded: a
+// channel stops at the boundary where the room goes Live, with a silent
+// interval so that no one waits for its audio, and starts again at the
+// first boundary after the room left Live, with an interval that fades in
+// (engine_live.cpp).
 void Engine::uploadBoundary() {
     int maxchan = maxchan_.load();
+    const bool held = liveHoldsIntervals();
     for (auto& kv : locals_) {
         if (kv.first >= maxchan) continue;
         LocalState& ls = *kv.second;
         bool was = ls.transmitting;
-        ls.transmitting = ls.s.broadcast;
+        ls.transmitting = ls.s.broadcast && !held;
+        const int fade = std::max(1, static_cast<int>(kLiveResumeFadeSeconds * sample_rate_.load()));
+        ls.fade_in = ls.fade_len = ls.transmitting && ls.live_paused ? fade : 0;
+        ls.live_paused = ls.s.broadcast && held;
         std::lock_guard<std::mutex> ql(ls.qm);
         if (was && ls.queue.size() < static_cast<std::size_t>(kUploadQueueLimit)) {
             UploadBlock b;
@@ -1152,6 +1160,14 @@ void Engine::mixLocal(const float* const* in, int numIn, float* const* out, int 
                     }
                 } else {
                     std::copy(src1, src1 + len, b.data.begin());
+                }
+                // The first interval after the room left Live fades in: a
+                // raised cosine, flat at both ends.
+                b.fresh = ls.fade_in == ls.fade_len && ls.fade_in > 0;
+                for (int i = 0; i < len && ls.fade_in > 0; ++i, --ls.fade_in) {
+                    const double u = (static_cast<double>(ls.fade_len - ls.fade_in) + 0.5) / ls.fade_len;
+                    const float g = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * u));
+                    for (int c = 0; c < b.channels; ++c) b.data[static_cast<std::size_t>(i * b.channels + c)] *= g;
                 }
                 ls.queue.push_back(std::move(b));
             }

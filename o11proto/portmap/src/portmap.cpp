@@ -188,7 +188,8 @@ struct PortMapper::Impl {
         udpWarned = true;
         if (log)
             log("warning: Live: the router did not forward UDP port " + std::to_string(port) + " (" + why +
-                "), so players outside your network can't play Live with you; they still hear you through intervals");
+                "), so players outside your network can't play Live with you: while the room is Live they hear no "
+                "one, and no one hears them (!live off puts everyone on intervals)");
     }
 
     bool stopRequested() {

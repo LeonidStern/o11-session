@@ -46,10 +46,32 @@ std::string longBlockText(int host_block, int rate) {
            " samples or less plays well.";
 }
 
-// Live plays here: the room's switch, the Live client, a place among the
-// senders, and the host rendering in real time.
+// Live plays here: the room's switch, the Live client and the server's
+// answer to it, a place among the senders, and the host rendering in real
+// time. Else this engine plays the room on intervals: while the room is
+// Live there is no interval audio, so it hears no one.
 bool liveOn(const LiveLayer& L) {
-    return L.room_on.load() && L.running.load() && L.may_send.load() && !L.host_offline.load();
+    return L.room_on.load() && L.running.load() && L.serverAnswered() && L.may_send.load() &&
+           !L.host_offline.load();
+}
+
+// The advice's notices (live_room.h): whose trouble, and that it is over.
+std::string adviceText(o11proto::live::Advice a, const std::string& who, bool mine, int count) {
+    std::string s = a == o11proto::live::Advice::CantLive
+                        ? (mine ? std::string("Your client can't play Live, so while the room is Live you hear no one, "
+                                              "and no one hears you")
+                                : who + " can't play Live and isn't heard while the room is Live")
+                        : (mine ? std::string("Your connection has dropouts") : who + "'s connection has dropouts");
+    if (count > 1)
+        s += ", and " + std::to_string(count - 1) + (count == 2 ? " more player has" : " more players have") +
+             " trouble";
+    return s + ": Intervals may sound better (switch with /live off).";
+}
+
+std::string clearText(o11proto::live::Advice a, const std::string& who, bool mine) {
+    if (a == o11proto::live::Advice::CantLive)
+        return mine ? std::string("Your client can play Live now.") : who + " can play Live now.";
+    return mine ? std::string("Your connection is clean again.") : who + "'s connection is clean again.";
 }
 
 }  // namespace
@@ -109,6 +131,24 @@ bool Engine::userLive(int user) const {
 
 bool Engine::liveRoomLive() const { return live_->room_applied.load() == 1; }
 
+Engine::LiveAdvice Engine::liveAdviceReason() const {
+    const LiveLayer& L = *live_;
+    if (!L.has_msg || !L.msg.roomOn() || !L.has_room || !L.room.live || L.room.user.empty()) return LiveAdvice::None;
+    switch (L.room.advice) {
+    case live::Advice::Dropouts: return LiveAdvice::Dropouts;
+    case live::Advice::CantLive: return LiveAdvice::CantLive;
+    default: return LiveAdvice::None;
+    }
+}
+
+std::string Engine::liveAdviceUser() const {
+    return liveAdviceReason() == LiveAdvice::None ? std::string() : live_->room.user;
+}
+
+int Engine::liveAdviceCount() const {
+    return liveAdviceReason() == LiveAdvice::None ? 0 : std::max<int>(1, live_->room.count);
+}
+
 bool Engine::liveServerHas() const { return live_->has_msg && live_->msg.udpOpen(); }
 
 bool Engine::liveRoomSwitchOn() const { return live_->has_msg && live_->msg.roomOn(); }
@@ -128,21 +168,6 @@ int Engine::liveHeardMs() const {
     const std::size_t k = v.size() / 2;
     const double median = v.size() % 2 ? v[k] : (v[k - 1] + v[k]) / 2;
     return static_cast<int>(std::nearbyint(median));   // rounded as num() rounds
-}
-
-Engine::LiveReason Engine::liveRoomReason() const {
-    const LiveLayer& L = *live_;
-    if (liveRoomLive() || !L.has_msg || !L.msg.roomOn() || !L.has_room || L.room.live) return LiveReason::None;
-    switch (L.room.reason) {
-    case live::RoomReason::Dropouts: return LiveReason::Dropouts;
-    case live::RoomReason::CantLive: return LiveReason::CantLive;
-    case live::RoomReason::Joining: return LiveReason::Joining;
-    default: return LiveReason::None;
-    }
-}
-
-std::string Engine::liveRoomReasonUser() const {
-    return liveRoomReason() == LiveReason::None ? std::string() : live_->room.user;
 }
 
 // The one-way estimate of 6.10 for a slot, or -1 without a round trip.
@@ -189,7 +214,9 @@ void Engine::liveControl() {
                 L.retry_at = now + std::chrono::seconds(10);
                 if (!L.start_failed_said) {
                     L.start_failed_said = true;
-                    liveNotice("Live mode can't start here (" + err + "), so you hear everyone through intervals.", true);
+                    liveNotice("Live mode can't start here (" + err + "): while the room is Live you hear no one, "
+                               "and no one hears you.",
+                               true);
                 }
             }
         }
@@ -262,44 +289,53 @@ void Engine::liveControl() {
             !L.no_answer_said) {
             L.no_answer_said = true;
             liveNotice("Live: the server doesn't answer on UDP port " + p +
-                       ", so you hear everyone through intervals. A firewall or router may block UDP; whoever "
+                       ", so while the room is Live you hear no one, and no one hears you. A firewall or router "
+                       "may block UDP; whoever "
                        "hosts the server needs UDP port " + p + " forwarded too.", true);
         }
     }
 }
 
-// The room's switches as this engine plays them: a line when it goes Live
-// or back on intervals, and once per user who can't do Live. None when the
-// room's Live goes off: the server says that in the chat.
+// The room as this engine plays it: a line when it goes Live (none when the
+// room's Live goes off: the server says that in the chat), and the advice
+// (live_room.h): a line when it names someone (again when more players have
+// trouble), and when that player's trouble is over while they are still
+// here.
 void Engine::liveRoomNotices() {
     LiveLayer& L = *live_;
     const int applied = L.room_applied.load();
-    const std::string& u = L.room.user;
-    const bool reasoned = L.has_msg && L.msg.roomOn() && L.has_room && !L.room.live && !u.empty();
-    const bool mine = !u.empty() && u == client_.username();
-    const std::string who = liveDisplayName(u);
     if (applied != L.room_noticed) {
         if (applied == 1) {
             const int heard = liveHeardMs();
             liveNotice("The room is Live now" +
                            (heard >= 0 ? ", about " + std::to_string(heard) + " ms late." : std::string(".")),
                        false);
-            L.cant_said.clear();
-        } else if (reasoned && L.room.reason == live::RoomReason::Dropouts) {
-            liveNotice(mine ? std::string("The room is back on intervals: your connection had dropouts.")
-                            : "The room is back on intervals: " + who + "'s connection had dropouts.",
-                       false);
-        } else if (reasoned && L.room.reason == live::RoomReason::Joining) {
-            liveNotice("The room is back on intervals while " + who + " joins.", false);
         }
         L.room_noticed = applied;
     }
-    if (applied == 0 && reasoned && L.room.reason == live::RoomReason::CantLive && u != L.cant_said) {
-        L.cant_said = u;
-        liveNotice(mine ? std::string("The room is on intervals: your client can't do Live.")
-                        : "The room is on intervals: " + who + " can't do Live.",
-                   false);
+    const LiveAdvice a = liveAdviceReason();
+    const std::string u = liveAdviceUser();
+    const int count = liveAdviceCount();
+    const live::Advice reason = a == LiveAdvice::None ? live::Advice::None : L.room.advice;
+    if (u == L.advice_said && reason == L.advice_said_reason) {
+        if (count > L.advice_said_count && !u.empty())
+            liveNotice(adviceText(reason, liveDisplayName(u), u == client_.username(), count), false);
+        L.advice_said_count = count;
+        return;
     }
+    const std::string& was = L.advice_said;
+    if (!was.empty() && was != u && L.msg.roomOn()) {
+        bool here = was == client_.username();
+        {
+            std::lock_guard<std::mutex> lock(remote_mutex_);
+            for (auto& up : users_) here = here || up->name == was;
+        }
+        if (here) liveNotice(clearText(L.advice_said_reason, liveDisplayName(was), was == client_.username()), false);
+    }
+    if (!u.empty()) liveNotice(adviceText(reason, liveDisplayName(u), u == client_.username(), count), false);
+    L.advice_said = u;
+    L.advice_said_reason = reason;
+    L.advice_said_count = count;
 }
 
 // ------------------------------------------------------- `/live` (6.10, 6.11)
@@ -366,7 +402,8 @@ void Engine::liveStatus() {
                           "in real time.",
                           false);
     if (!L.running.load())
-        return liveNotice("Live is on in this room, but yours couldn't start, so you hear everyone through intervals.",
+        return liveNotice("Live is on in this room, but yours couldn't start, so you hear no one, and no one hears "
+                          "you.",
                           false);
 
     // The head line.
@@ -389,29 +426,28 @@ void Engine::liveStatus() {
         transmit = it != locals_.end() && it->second->s.broadcast;
     }
     if (!L.msg.maySend())
-        head += " The room has no room for more Live players, so you hear everyone, and they hear you, through intervals.";
+        head += " The room has no room for more Live players, so while it is Live you hear no one, and no one hears "
+                "you.";
     else if (!transmit)
         head += " Transmit is off, so you send nothing.";
     else if (!L.host_playing.load())
         head += " The host is stopped, so you send nothing until it plays.";
 
-    // The room's mode first (16.7): everyone plays Live, or everyone intervals.
-    const std::string& ru = L.room.user;
-    const bool mine = !ru.empty() && ru == client_.username();
-    const std::string who = liveDisplayName(ru);
+    // The room's mode first (16.7), and the advice.
     std::string room;
     if (liveRoomLive())
         room = "The room is Live.";
-    else if (L.has_room && L.room.live)
+    else if (L.has_room && L.room.live && liveOn(L))
         room = "The room goes Live at the next interval.";
-    else if (L.has_room && L.room.reason == live::RoomReason::Dropouts)
-        room = "The room is on intervals: " + (mine ? std::string("your") : who + "'s") + " connection had dropouts.";
-    else if (L.has_room && L.room.reason == live::RoomReason::CantLive)
-        room = "The room is on intervals: " + (mine ? std::string("your client") : who) + " can't do Live.";
-    else if (L.has_room && L.room.reason == live::RoomReason::Joining)
-        room = "The room is on intervals while " + who + " joins.";
+    else if (L.has_room && L.room.live)
+        room = "The room is Live, but Live can't play here, so you hear no one, and no one hears you.";
     else
-        room = "The room is on intervals until everyone's Live has sounded clean for a few seconds.";
+        room = "The room is on intervals.";
+    const LiveAdvice advice = liveAdviceReason();
+    if (advice != LiveAdvice::None) {
+        const std::string u = liveAdviceUser();
+        room += " " + adviceText(L.room.advice, liveDisplayName(u), u == client_.username(), liveAdviceCount());
+    }
     liveNotice(room, false);
     liveNotice(head, false);
 
@@ -419,19 +455,25 @@ void Engine::liveStatus() {
     struct Listed {
         std::string name;
         int slot;
-        bool sending;
+        bool sending, bound;
     };
     std::vector<Listed> listed;
     {
         std::lock_guard<std::mutex> lock(L.net_mutex);
-        for (const auto& p : L.peers) listed.push_back({p.name, p.slot, p.sending});
+        for (const auto& p : L.peers) listed.push_back({p.name, p.slot, p.sending, p.bound});
     }
     const TimePoint now = Clock::now();
     const std::int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    const std::string off = liveRoomLive() ? "not heard" : "intervals";   // while Live, no one's intervals
     for (const auto& p : listed) {
         std::string line = liveDisplayName(p.name) + ": ";
         if (p.slot < 0) {
-            line += "intervals (O11 Session hears 8 Live players at most).";
+            line += off + " (O11 Session hears 8 Live players at most).";
+            liveNotice(line, false);
+            continue;
+        }
+        if (!p.bound) {
+            line += off + " (their Live doesn't reach the server over UDP).";
             liveNotice(line, false);
             continue;
         }
@@ -446,9 +488,9 @@ void Engine::liveStatus() {
                 for (auto& up : users_)
                     if (up->name == p.name) live_now = up->live_now.load();
             }
-            line += live_now ? "live"
-                             : L.slot_health[p.slot].healthy ? "intervals, their real-time audio sounds clean"
-                                                             : "intervals, their real-time audio has dropouts";
+            line += live_now ? std::string("live")
+                             : off + (L.slot_health[p.slot].healthy ? ", their real-time audio sounds clean"
+                                                                    : ", their real-time audio has dropouts");
             double buffer = 0, network = 0, codec = 0;
             double oneway = liveOneWayMs(p.slot, &buffer, &network, &codec);
             if (oneway < 0) oneway = network + codec + buffer + 64.0 / sr * 1000.0;
@@ -489,7 +531,9 @@ void Engine::liveStatus() {
         }
     }
     for (const auto& n : others)
-        liveNotice(liveDisplayName(n) + ": intervals (not a Live player: an older client, or the room is full)", false);
+        liveNotice(liveDisplayName(n) + ": " + (liveRoomLive() ? "not heard while the room is Live" : "intervals") +
+                       " (not a Live player: an older client, or the room is full)",
+                   false);
 }
 
 // --------------------------------------------------------- audio context
@@ -519,7 +563,8 @@ void Engine::liveAudioBlock(const float* const* in, int numIn, int frames, int s
 }
 
 // 16.7: the mixer takes the room's latest mode at the first boundary half a
-// second after it came, for every user at once; before 8.2's steps.
+// second after it came, for every user at once; before 6.3's uploads (none
+// while the room is Live) and 8.2's steps.
 void Engine::liveBoundary() {
     LiveLayer& L = *live_;
     const std::uint64_t a = L.room_announce.load(std::memory_order_acquire);
@@ -538,6 +583,11 @@ void Engine::liveBoundary() {
         }
     }
 }
+
+// The room is Live, as this engine took it at its last boundary, and its
+// switch is still on: no interval audio is uploaded, even when Live can't
+// play here (the server relays none).
+bool Engine::liveHoldsIntervals() const { return live_->mix_mode && live_->room_on.load(); }
 
 // Channel 0's interval audio for `len` frames, as mixRemote() plays it but
 // before volume and pan: interleaved stereo into `dst`, silence when there
@@ -647,7 +697,8 @@ void lineUp(LiveMix& m, int in, int rate) {
 // over 20 ms on an equal-power curve, and while the room is Live a slot
 // without audio is concealed for kLiveConcealBuffers x B, then fades out,
 // and fades in again when its audio comes back. Interval audio is never
-// heard while the room is Live.
+// heard while the room is Live (and none is sent then): a user without a
+// slot here isn't heard.
 void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleRate) {
     LiveLayer& L = *live_;
     const bool any_solo = any_solo_.load();
@@ -746,8 +797,11 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                 }
             }
             m.w = (m.w + n) & R;
-            if (m.pos[0] <= 0) m.delay[0] = 0;   // silent paths can move without a sound
-            if (m.pos[1] <= 0) m.delay[1] = 0;
+            // Silent paths can move without a sound, but not the live one
+            // while the room is Live: a slot that fades out in a gap comes
+            // back on the delay it had (16.6), lined up as it was.
+            if (m.pos[0] <= 0) m.delay[0] = 0;
+            if (m.pos[1] <= 0 && !m.path_live) m.delay[1] = 0;
             if (m.pos[0] <= 0 || m.pos[1] <= 0) m.rho = 0;
             done += n;
         }

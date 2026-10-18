@@ -413,7 +413,7 @@ TEST(live_texts) {                                  // 6
     CHECK(h.until([&] { return !a.lastServerLine().empty(); }));
     const std::string bn = b.c.username(), cn = c.c.username(), on = old.c.username();
     CHECK_EQ(a.lastServerLine(), "[server] Live is off. Players who can play Live: " + an + " and " + bn +
-                                     ". Live has room for 2, so " + cn + " stays on intervals. Turn it on with !live on");
+                                     ". Live has room for 2, so " + cn + " isn't heard while it is on. Turn it on with !live on");
     // refusal 1
     LiveClient nv;
     REQUIRE(h.login(nv, "novote", true, "pw"));
@@ -424,8 +424,9 @@ TEST(live_texts) {                                  // 6
     old.chats.clear();
     a.c.say("!LIVE ON");
     const std::string onText = "[server] " + an + " turned Live on: O11 Session players now hear each other in "
-                               "real time. " + on + "'s client can't play Live and stays on intervals. Live has "
-                               "room for 2, so " + cn + " and " + nv.c.username() + " stay on intervals.";
+                               "real time. " + on + "'s client can't play Live, so " + on + " isn't heard until "
+                               "Live is off. Live has room for 2, so " + cn + " and " + nv.c.username() +
+                               " aren't heard while it is on.";
     CHECK(h.until([&] { return a.lastServerLine() == onText && old.lastServerLine() == onText; }));
     CHECK(h.until([&] { return a.last().roomOn() && b.last().roomOn() && c.last().roomOn(); }));
     CHECK(h.server.liveRoomOn());
@@ -454,7 +455,7 @@ TEST(live_texts) {                                  // 6
     a.chats.clear();
     a.c.say("!live on");
     CHECK(h.until([&] { return a.chatHas("The clients of " + on + " and " + old2.c.username() +
-                                         " can't play Live, so they stay on intervals."); }));
+                                         " can't play Live, so they aren't heard until Live is off."); }));
 }
 
 TEST(no_live_server) {                              // 6: answer 2

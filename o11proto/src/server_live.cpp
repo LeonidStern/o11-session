@@ -126,7 +126,7 @@ struct Server::Live {
         bool buckets = false;                  // filled at the first datagram that reaches the check
         double bytes = 0, dgrams = 0;
         TimePoint refill;
-        // the room's mode (live_room.h)
+        // the advice (live_room.h)
         TimePoint joined;
         bool was_bound = false;                // bound at some time since joining
         bool has_report = false;
@@ -152,11 +152,14 @@ struct Server::Live {
     std::uint64_t in = 0, out = 0;
     std::array<std::uint64_t, kReasons> dropped{};
     std::uint8_t buf[2048];
-    // The room's mode: worked out at every tick from the players' reports.
-    live::RoomRule rule;
-    TimePoint epoch = Clock::now();            // the rule's clock starts here
-    std::string reason_name;                   // the reason user's name, "" for none
+    // The advice: worked out at every tick from the players' reports.
+    live::RoomAdvice advice;
+    TimePoint epoch = Clock::now();            // the advice's clock starts here
+    std::string advice_name;                   // the advice's user name, "" for none
     bool logged_on = false;                    // the room's Live was on at the last log line
+    // No interval audio while the room is Live: since when it is.
+    bool noted_on = false;
+    TimePoint live_since;
 
     bool allowed() const { return cfg.mode != LiveMode::No; }
     bool open() const { return fd != kInvalidSocket; }
@@ -300,8 +303,36 @@ void Server::setLiveConfig(const LiveConfig& config) {
 bool Server::liveUdpOpen() const { return live_ && live_->open(); }
 std::uint16_t Server::liveUdpPort() const { return live_ ? live_->port : 0; }
 bool Server::liveRoomOn() const { return live_ && live_->roomOn(); }
-bool Server::liveRoomLive() const { return live_ && live_->rule.state().live; }
-std::string Server::liveRoomReasonUser() const { return live_ ? live_->reason_name : std::string(); }
+bool Server::liveRoomLive() const { return liveRoomOn(); }
+
+Server::IntervalTraffic Server::intervalTraffic() const {
+    IntervalTraffic t;
+    t.from_live = iv_from_live_.load();
+    t.from_others = iv_from_others_.load();
+    t.relayed = iv_relayed_.load();
+    t.refused = iv_refused_.load();
+    return t;
+}
+
+// While the room is Live there is no interval audio. Its Live players stop
+// uploading at the boundary where they go Live, the first after the room
+// message by half a second or more; an upload that begins more than an
+// interval after the room went Live is refused (from an older client, which
+// doesn't know). The ones before it are relayed to their end: what the
+// players play up to their switch, and over its crossfade.
+bool Server::liveRefusesUpload(TimePoint now) {
+    if (!live_) return false;
+    Live& L = *live_;
+    if (L.roomOn() != L.noted_on) {
+        L.noted_on = L.roomOn();
+        L.live_since = now;
+    }
+    if (!L.roomOn()) return false;
+    const double interval = 60.0 * std::max<int>(1, bpi_) / std::max<int>(1, bpm_);
+    return now - L.live_since > std::chrono::duration<double>(interval);
+}
+std::string Server::liveAdviceUser() const { return live_ ? live_->advice_name : std::string(); }
+int Server::liveAdviceCount() const { return live_ ? live_->advice.state().count : 0; }
 socket_t Server::liveSocket() const { return live_ ? live_->fd : kInvalidSocket; }
 
 int Server::livePollTimeout(int timeout_ms) const {
@@ -436,7 +467,7 @@ void Server::liveSendMessages() {
     }
 }
 
-// ------------------------------------------------------ the room's mode
+// ------------------------------------------------- the room and the advice
 
 // A Live client's report (0x85); other types the server doesn't know are ignored.
 void Server::liveClientMessage(Conn& c, const RawMessage& m) {
@@ -451,15 +482,16 @@ void Server::liveClientMessage(Conn& c, const RawMessage& m) {
     p.was_clean |= r.clean();
 }
 
-// The rule of live_room.h over the room's users, then the room message
-// (0x08) to every Live player whose last one differs.
+// The room's mode is its switch. The advice of live_room.h over the room's
+// users, then the room message (0x08) to every Live player whose last one
+// differs.
 void Server::liveRoomTick(TimePoint now) {
     Live& L = *live_;
     auto secs = [&](TimePoint t) { return std::chrono::duration<double>(t - L.epoch).count(); };
-    std::vector<live::RoomRule::Player> in;
+    std::vector<live::RoomAdvice::Player> in;
     for (Conn* o : loggedIn()) {
         if (o->hidden()) continue;
-        live::RoomRule::Player r;
+        live::RoomAdvice::Player r;
         r.id = static_cast<std::uint32_t>(o->id);
         auto it = L.players.find(o->id);
         if (it == L.players.end()) {           // no Live client
@@ -478,26 +510,31 @@ void Server::liveRoomTick(TimePoint now) {
         }
         in.push_back(r);
     }
-    const live::RoomRule::State before = L.rule.state();
-    const live::RoomRule::State& st = L.rule.update(secs(now), L.roomOn(), in);
+    const live::RoomAdvice::State before = L.advice.state();
+    const live::RoomAdvice::State& st = L.advice.update(secs(now), L.roomOn(), in);
     Conn* who = st.user ? connById(static_cast<int>(st.user)) : nullptr;
-    L.reason_name = who ? who->name : std::string();
-    if (st != before && (L.roomOn() || L.logged_on)) {
-        std::string s = "[live room] the room ";   // not "[live]": that is the traffic line
-        const std::string u = who ? displayName(who) : std::string("someone");
-        if (!L.roomOn()) s += "is on intervals: Live is off";
-        else if (st.live) s += "is Live";
-        else if (st.reason == live::RoomReason::Dropouts) s += "is on intervals: " + u + "'s connection had dropouts";
-        else if (st.reason == live::RoomReason::CantLive) s += "is on intervals: " + u + " can't do Live";
-        else if (st.reason == live::RoomReason::Joining) s += "is on intervals while " + u + " joins";
-        else s += "is on intervals";
-        log(s);
+    const std::string before_name = L.advice_name;
+    L.advice_name = who ? who->name : std::string();
+    liveRefusesUpload(now);                    // notes when the room went Live
+    if (L.roomOn() != L.logged_on) {           // not "[live]": that is the traffic line
+        log(L.roomOn() ? "[live room] the room is Live" : "[live room] the room is on intervals: Live is off");
         L.logged_on = L.roomOn();
     }
+    if (st != before && L.roomOn() && (st.advice != before.advice || L.advice_name != before_name)) {
+        const std::string u = who ? displayName(who) : std::string("someone");
+        const std::string more = st.count > 1 ? " (" + std::to_string(st.count) + " players have trouble)" : "";
+        if (st.advice == live::Advice::Dropouts)
+            log("[live room] advice: " + u + "'s connection has dropouts" + more);
+        else if (st.advice == live::Advice::CantLive)
+            log("[live room] advice: " + u + " can't play Live" + more);
+        else
+            log("[live room] advice: none, everyone's Live sounds clean");
+    }
     live::LiveRoom m;
-    m.live = st.live;
-    m.reason = st.reason;
-    m.user = L.reason_name;
+    m.live = L.roomOn();
+    m.advice = st.advice;
+    m.user = L.advice_name;
+    m.count = static_cast<std::uint16_t>(std::min(st.count, 0xffff));
     const std::vector<std::uint8_t> bytes = live::encode(m);
     for (auto& kv : L.players) {
         Live::Player& p = kv.second;
@@ -706,7 +743,7 @@ bool Server::liveCommand(Conn& c, const std::string& text) {
     }
     auto overText = [&](const char* tail) {
         return "Live has room for " + std::to_string(L.cfg.max_peers) + ", so " + joinNames(over) +
-               (over.size() == 1 ? " stays on intervals" : " stay on intervals") + tail;
+               (over.size() == 1 ? " isn't heard while it is on" : " aren't heard while it is on") + tail;
     };
 
     if (!(on || off) || on == L.room_on) {
@@ -727,9 +764,9 @@ bool Server::liveCommand(Conn& c, const std::string& text) {
     if (on) {
         s = "[server] " + who + " turned Live on: O11 Session players now hear each other in real time.";
         if (cant.size() == 1)
-            s += " " + cant[0] + "'s client can't play Live and stays on intervals.";
+            s += " " + cant[0] + "'s client can't play Live, so " + cant[0] + " isn't heard until Live is off.";
         else if (cant.size() > 1)
-            s += " The clients of " + joinNames(cant) + " can't play Live, so they stay on intervals.";
+            s += " The clients of " + joinNames(cant) + " can't play Live, so they aren't heard until Live is off.";
         if (!over.empty()) s += " " + overText(".");
     } else {
         s = "[server] " + who + " turned Live off: everyone hears each other through intervals again.";

@@ -7,6 +7,7 @@
 #define O11PROTO_SERVER_H
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -134,10 +135,22 @@ public:
     bool liveUdpOpen() const;
     std::uint16_t liveUdpPort() const;           // 0 while the UDP port is closed
     bool liveRoomOn() const;                     // allowed, UDP open and switched on
-    // The room's mode (live_room.h): Live for everyone, or intervals and
-    // the user that keeps it there ("" when none).
+    // The room's mode (live_room.h) follows its switch: Live while
+    // liveRoomOn(). The advice while it is Live: the user it names ("" when
+    // none) and how many players have trouble.
     bool liveRoomLive() const;
-    std::string liveRoomReasonUser() const;
+    std::string liveAdviceUser() const;
+    int liveAdviceCount() const;
+    // While the room is Live no interval audio is relayed: an upload that
+    // begins more than an interval after the room went Live is refused
+    // (server_live.cpp). The interval audio since the start, in bytes of
+    // UPLOAD_INTERVAL_WRITE received (from clients with Live, and from the
+    // others) and of DOWNLOAD_INTERVAL_WRITE sent, and the uploads refused.
+    // Safe to read from any thread.
+    struct IntervalTraffic {
+        std::uint64_t from_live = 0, from_others = 0, relayed = 0, refused = 0;
+    };
+    IntervalTraffic intervalTraffic() const;
 
 private:
     struct Channel {
@@ -251,11 +264,13 @@ private:
     void liveReadable();                         // takes every datagram waiting
     void liveTick(TimePoint now);                // freshness, the log line, SERVER_LIVE
     void liveSendMessages();                     // SERVER_LIVE to whoever needs a new one
-    void liveRoomTick(TimePoint now);            // the room's mode and SERVER_LIVE_ROOM
+    void liveRoomTick(TimePoint now);            // the advice and SERVER_LIVE_ROOM
     void liveJoined(Conn& c);                    // after the login sequence
     void liveLeft(Conn& c);
     bool liveCommand(Conn& c, const std::string& text);   // true: it was !live
     void liveClientMessage(Conn& c, const RawMessage& m);  // a type the server doesn't know otherwise
+    bool liveRefusesUpload(TimePoint now);       // an upload beginning now isn't relayed: the room is Live
+    std::atomic<std::uint64_t> iv_from_live_{0}, iv_from_others_{0}, iv_relayed_{0}, iv_refused_{0};
 };
 
 }  // namespace o11proto

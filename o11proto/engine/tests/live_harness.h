@@ -431,7 +431,8 @@ inline std::vector<ClickBlock> clickBlocks(const float* x, long from, long to, i
 
 // How far behind `ref` the sound in x[from, to) is, within [lo, hi]
 // frames: the lag with the best normalized correlation.
-inline long bestLag(const float* x, const std::function<float(long)>& ref, long from, long to, long lo, long hi) {
+inline long bestLag(const float* x, const std::function<float(long)>& ref, long from, long to, long lo, long hi,
+                    double* correlation = nullptr) {
     long best = lo;
     double best_c = -2;
     std::vector<float> r(static_cast<std::size_t>(to - from + hi - lo));
@@ -450,7 +451,77 @@ inline long bestLag(const float* x, const std::function<float(long)>& ref, long 
             best = d;
         }
     }
+    if (correlation) *correlation = best_c;
     return best;
+}
+
+// Steady tones in x[from, from + n): a least-squares fit of each frequency
+// with an envelope of its own (a polynomial in time of degree `degree`, so
+// that a fade or a slow change of phase is part of the tone); the
+// amplitudes at the middle and the RMS of what is left, the rest.
+inline void toneFit(const float* x, long from, int n, const std::vector<double>& hz, int rate, double* amp, double* rest,
+                    int degree = 2) {
+    const int q = degree + 1, p = 2 * q * static_cast<int>(hz.size());
+    std::vector<double> m(static_cast<std::size_t>(p * p), 0.0), v(static_cast<std::size_t>(p), 0.0), col(v);
+    auto basis = [&](int i) {
+        const double c = i - (n - 1) / 2.0, t = c / (n / 2.0);
+        for (std::size_t k = 0; k < hz.size(); ++k) {
+            const double ph = 2 * M_PI * hz[k] * c / rate;
+            double e = 1;
+            for (int j = 0; j < q; ++j, e *= t) {
+                col[2 * q * k + 2 * j] = std::cos(ph) * e;
+                col[2 * q * k + 2 * j + 1] = std::sin(ph) * e;
+            }
+        }
+    };
+    for (int i = 0; i < n; ++i) {
+        basis(i);
+        for (int r = 0; r < p; ++r) {
+            v[static_cast<std::size_t>(r)] += col[static_cast<std::size_t>(r)] * x[from + i];
+            for (int c = 0; c < p; ++c) m[static_cast<std::size_t>(r * p + c)] += col[static_cast<std::size_t>(r)] * col[static_cast<std::size_t>(c)];
+        }
+    }
+    for (int c = 0; c < p; ++c) {                // Gauss-Jordan with partial pivoting
+        int piv = c;
+        for (int r = c + 1; r < p; ++r)
+            if (std::fabs(m[static_cast<std::size_t>(r * p + c)]) > std::fabs(m[static_cast<std::size_t>(piv * p + c)])) piv = r;
+        for (int k = 0; k < p; ++k) std::swap(m[static_cast<std::size_t>(c * p + k)], m[static_cast<std::size_t>(piv * p + k)]);
+        std::swap(v[static_cast<std::size_t>(c)], v[static_cast<std::size_t>(piv)]);
+        const double d = m[static_cast<std::size_t>(c * p + c)];
+        if (std::fabs(d) < 1e-12) continue;
+        for (int k = 0; k < p; ++k) m[static_cast<std::size_t>(c * p + k)] /= d;
+        v[static_cast<std::size_t>(c)] /= d;
+        for (int r = 0; r < p; ++r) {
+            const double f = r == c ? 0.0 : m[static_cast<std::size_t>(r * p + c)];
+            if (f == 0) continue;
+            for (int k = 0; k < p; ++k) m[static_cast<std::size_t>(r * p + k)] -= f * m[static_cast<std::size_t>(c * p + k)];
+            v[static_cast<std::size_t>(r)] -= f * v[static_cast<std::size_t>(c)];
+        }
+    }
+    double e2 = 0;
+    for (int i = 0; i < n; ++i) {
+        basis(i);
+        double y = 0;
+        for (int r = 0; r < p; ++r) y += col[static_cast<std::size_t>(r)] * v[static_cast<std::size_t>(r)];
+        e2 += (x[from + i] - y) * (x[from + i] - y);
+    }
+    for (std::size_t k = 0; k < hz.size(); ++k) amp[k] = std::hypot(v[2 * q * k], v[2 * q * k + 1]);
+    *rest = std::sqrt(e2 / n);
+}
+
+// The delay of a steady sine, sin(2 pi hz n / rate) where it is played,
+// in x[from, to): from its phase (a Hann window), in frames from 0 up to
+// its period. A delay longer by whole periods looks the same.
+inline double sineDelay(const float* x, long from, long to, double hz, int rate) {
+    const double w = 2 * M_PI * hz / rate;
+    double s = 0, c = 0;
+    for (long n = from; n < to; ++n) {
+        const double win = 0.5 - 0.5 * std::cos(2 * M_PI * (static_cast<double>(n - from) + 0.5) / (to - from));
+        s += win * x[n] * std::sin(w * static_cast<double>(n));
+        c += win * x[n] * std::cos(w * static_cast<double>(n));
+    }
+    const double wd = std::atan2(-c, s);         // A sin(w (n - d)) = A (sin wn cos wd - cos wn sin wd)
+    return (wd < 0 ? wd + 2 * M_PI : wd) / w;
 }
 
 // ------------------------------------------------------------ WAV

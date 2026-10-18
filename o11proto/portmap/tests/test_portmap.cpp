@@ -401,8 +401,8 @@ TEST(live_upnp_udp_refused) {
     CHECK(holds(fake, "upnp TCP 2049 2049 127.0.0.1 3600 O11 Session"));
     CHECK_EQ(fake.countMappings("upnp UDP"), 0);
     CHECK_EQ(log.count("warning: Live: the router did not forward UDP port 2049 (UPnP: the router forwards it to "
-                       "another machine), so players outside your network can't play Live with you; they still "
-                       "hear you through intervals"),
+                       "another machine), so players outside your network can't play Live with you: while the "
+                       "room is Live they hear no one, and no one hears them (!live off puts everyone on intervals)"),
              1);
     CHECK(log.lastPortmap().find("people can connect to 93.184.216.34:2049") != std::string::npos);
     pm.stop();

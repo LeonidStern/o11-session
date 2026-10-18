@@ -7,10 +7,12 @@
 // interval late.
 //
 // The cases: both hear each other live at low latency; `!live off` brings
-// the intervals back at once, and `!live on` brings Live back at a boundary;
-// a sender's stall of 1.5 s and packet loss put the room on intervals at
-// the next boundary (16.7: the room plays one way for everyone), and Live
-// comes back after the settle time; `/live buffer 60` raises the delay.
+// the intervals back (the mixer at once, their audio from the players' first
+// interval after Live), and `!live on` brings Live back at a boundary;
+// a sender's stall of 1.5 s and packet loss leave the room Live (16.7: its
+// switch alone sets its mode) and give both players advice naming the
+// sender, which clears once it has been clean for 10 s; `/live buffer 60`
+// raises the delay.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -86,7 +88,7 @@ struct LiveRoom {
     std::atomic<bool> audio_stop{false};
     // The machine's own hiccups: a wake more than 10 ms late. After one the
     // host catches up, which plays the listeners' buffers faster than the
-    // audio can arrive, so Live may fall back; the checks that need a steady
+    // audio can arrive, so there may be dropouts; the checks that need a steady
     // stream are made only when there was none.
     std::atomic<long> late_us{0}, late_blocks{0}, slow_us{0};
     std::atomic<long> hiccup_frame{-1};
@@ -338,8 +340,8 @@ TEST(both_hear_each_other_live) {
     }
     if (r.calmSince(from)) {                     // a steady stream stays live
         CHECK(r.side[0].e.userLive(0) && r.side[1].e.userLive(0));
-        CHECK(r.side[1].findNotice("is back on intervals").empty());
-        CHECK(r.side[0].findNotice("is back on intervals").empty());
+        CHECK(r.side[1].findNotice("Intervals may sound better").empty());   // no advice
+        CHECK(r.side[0].findNotice("Intervals may sound better").empty());
     }
 }
 
@@ -373,7 +375,7 @@ TEST(live_off_falls_back_at_once) {
     CHECK(!r.boundaryIn(1, b));                  // in the middle of the interval
     r.wait(2.5);
     CHECK(r.peak(1, b * kBlock, 2.5) > 0.3f);    // the intervals play
-    CHECK(r.side[1].findNotice("is back on intervals", seen).empty());   // no line when the room's Live went off
+    CHECK(r.side[1].findNotice("Intervals may sound better", seen).empty());   // no advice when the room went off
     CHECK(!r.side[1].e.userLive(0) && !r.side[0].e.userLive(0));
     std::printf("    %s\n", r.side[1].findNotice("Live", seen).c_str());
 
@@ -387,30 +389,58 @@ TEST(live_off_falls_back_at_once) {
     std::printf("    bob hears alice live again %.1f s after !live on\n", r.secondsOf(on - again));
 }
 
-TEST(sender_stall_falls_back_at_boundary) {
+// The room's mode is its switch alone (16.7): a stall or loss gives advice,
+// to both players, and the room stays Live.
+struct StaysLive {
+    LiveRoom& r;
+    bool stayed = true;
+    // The room is still Live for both, and each still hears the other live.
+    void look() {
+        for (Side& s : r.side) stayed = stayed && s.e.liveRoomLive() && s.e.userLive(0);
+    }
+    bool advised(int s) const {
+        return r.side[s].e.liveAdviceReason() == Engine::LiveAdvice::Dropouts &&
+               r.side[s].e.liveAdviceUser().find("alice") == 0;   // alice@127.0.0.x
+    }
+    bool none(int s) const { return r.side[s].e.liveAdviceReason() == Engine::LiveAdvice::None; }
+    bool until(const std::function<bool()>& pred, double seconds) {
+        return r.until([&] { look(); return pred(); }, seconds);
+    }
+};
+
+TEST(sender_stall_gives_advice_and_stays_live) {
     LiveRoom r;
     REQUIRE(r.connect());
     REQUIRE(r.liveAndCalm(20));
-    const std::size_t seen = r.side[1].noticeCount();
+    StaysLive w{r};
+    const std::size_t seen[2] = {r.side[0].noticeCount(), r.side[1].noticeCount()};
     const long block = r.frames.load() / kBlock;
+    const Server::IntervalTraffic t0 = r.server.intervalTraffic();
     r.side[0].stall.store(kRate * 3 / 2 / kBlock);   // alice's host doesn't call for 1.5 s
-    REQUIRE(r.until([&] { return !r.side[1].e.userLive(0); }, 6));
-    const long b = r.switchFrom(1, block, true);
-    REQUIRE(b > 0);
-    std::printf("    bob back on intervals %.0f ms after the stall began\n", r.secondsOf(b - block) * 1000);
-    CHECK(r.boundaryIn(1, b));
-    CHECK(r.until(
-        [&] { return !r.side[1].findNotice("The room is back on intervals: alice's connection had dropouts.", seen).empty(); },
+    REQUIRE(w.until([&] { return w.advised(1) && w.advised(0); }, 6));
+    std::printf("    the advice names alice %.0f ms after the stall began (%d with trouble)\n",
+                r.secondsOf(r.frames.load() / kBlock - block) * 1000, r.side[1].e.liveAdviceCount());
+    CHECK(r.side[1].e.liveAdviceCount() >= 1);
+    CHECK(w.until(
+        [&] {
+            return !r.side[1].findNotice("alice's connection has dropouts", seen[1]).empty() &&
+                   !r.side[0].findNotice("Your connection has dropouts", seen[0]).empty();
+        },
         1));
-    // Live again later, from a boundary, after the settle time: the stall's
-    // 1.5 s, 1 s of playing well and 5 s of settling at the least.
-    REQUIRE(r.until([&] { return r.side[1].e.userLive(0); }, 25));
-    r.wait(0.1);                                 // the audio thread has recorded the switch
-    const long on = r.switchFrom(1, b, false);
-    REQUIRE(on > 0);
-    std::printf("    bob hears alice live again %.1f s after the stall began\n", r.secondsOf(on - block));
-    CHECK(r.boundaryIn(1, on));
-    CHECK(r.secondsOf(on - block) >= 6.5);
+    const std::string said = r.side[1].findNotice("alice's connection has dropouts", seen[1]);
+    std::printf("    %s\n", said.c_str());
+    const std::string tail = ": Intervals may sound better (switch with /live off).";
+    CHECK(said.size() > tail.size() && said.compare(said.size() - tail.size(), tail.size(), tail) == 0);
+    // It clears once alice has been clean for 10 s: the stall's 1.5 s and 10 s at the least.
+    REQUIRE(w.until([&] { return w.none(1) && w.none(0); }, 25));
+    const double cleared = r.secondsOf(r.frames.load() / kBlock - block);
+    std::printf("    the advice clears %.1f s after the stall began\n", cleared);
+    CHECK(cleared >= 11.5);
+    CHECK(w.until([&] { return !r.side[1].findNotice("alice's connection is clean again.", seen[1]).empty(); }, 1));
+    CHECK(w.stayed);                             // the room stayed Live throughout
+    const Server::IntervalTraffic t1 = r.server.intervalTraffic();
+    CHECK_EQ(t1.from_live - t0.from_live, 0u);   // and no interval audio was sent or relayed
+    CHECK_EQ(t1.relayed - t0.relayed, 0u);
     // Spec test 43: after the stall the buffer figure is still at most B + a frame + a host block.
     r.wait(0.2);
     const std::size_t at = r.side[1].noticeCount();
@@ -423,34 +453,33 @@ TEST(sender_stall_falls_back_at_boundary) {
     CHECK(buffer >= 20 && buffer <= 31);
 }
 
-TEST(packet_loss_falls_back_at_boundary) {
+TEST(packet_loss_gives_advice_and_stays_live) {
     LiveRoom r;
     REQUIRE(r.connect());
     REQUIRE(r.liveAndCalm(20));
+    StaysLive w{r};
     const std::size_t seen = r.side[1].noticeCount();
     const long block = r.frames.load() / kBlock;
+    const Server::IntervalTraffic t0 = r.server.intervalTraffic();
     r.side[1].e.setLiveTestLoss(0.4);            // bob loses 40 % of what reaches him over UDP
-    REQUIRE(r.until([&] { return !r.side[1].e.userLive(0); }, 5));
-    const long b = r.switchFrom(1, block, true);
-    REQUIRE(b > 0);
-    std::printf("    bob back on intervals %.0f ms after the loss began\n", r.secondsOf(b - block) * 1000);
-    CHECK(r.boundaryIn(1, b));
     // Bob can't tell his own loss from alice's: with one other player, he names her.
-    CHECK(r.until(
-        [&] { return !r.side[1].findNotice("The room is back on intervals: alice's connection had dropouts.", seen).empty(); },
-        1));
-    r.wait(2.5);
-    CHECK(r.peak(1, b * kBlock, 2.5) > 0.3f);    // the intervals play
-    CHECK(!r.side[0].e.userLive(0));             // for alice too: the room plays one way
+    REQUIRE(w.until([&] { return w.advised(1) && w.advised(0); }, 5));
+    std::printf("    the advice names alice %.0f ms after the loss began\n",
+                r.secondsOf(r.frames.load() / kBlock - block) * 1000);
+    CHECK(w.until([&] { return !r.side[1].findNotice("alice's connection has dropouts", seen).empty(); }, 1));
+    w.until([] { return false; }, 2.5);          // the loss goes on, and the room stays Live
+    CHECK(w.advised(1));
     const long healed = r.frames.load() / kBlock;
     r.side[1].e.setLiveTestLoss(0);
-    REQUIRE(r.until([&] { return r.side[1].e.userLive(0); }, 25));
-    r.wait(0.1);                                 // the audio thread has recorded the switch
-    const long on = r.switchFrom(1, healed, false);
-    REQUIRE(on > 0);
-    std::printf("    bob hears alice live again %.1f s after the loss ended\n", r.secondsOf(on - healed));
-    CHECK(r.boundaryIn(1, on));
-    CHECK(r.secondsOf(on - healed) >= 5.0);      // the settle time
+    REQUIRE(w.until([&] { return w.none(1) && w.none(0); }, 25));
+    const double cleared = r.secondsOf(r.frames.load() / kBlock - healed);
+    std::printf("    the advice clears %.1f s after the loss ended\n", cleared);
+    CHECK(cleared >= 10.0);                      // 10 s clean
+    CHECK(w.until([&] { return !r.side[1].findNotice("alice's connection is clean again.", seen).empty(); }, 1));
+    CHECK(w.stayed);
+    const Server::IntervalTraffic t1 = r.server.intervalTraffic();
+    CHECK_EQ(t1.from_live - t0.from_live, 0u);
+    CHECK_EQ(t1.relayed - t0.relayed, 0u);
 }
 
 TEST(jitter_buffer_setting_takes_effect) {
@@ -475,10 +504,10 @@ TEST(jitter_buffer_setting_takes_effect) {
     CHECK(before.size() >= 10 && after.size() >= 10);
     CHECK(rise >= 28 && rise <= 52);             // 40 ms more, as spec test 38 has 20 ms more give 12-28
     const bool calm = r.calmSince(changed);
-    if (calm) {                                  // the buffer change is a gap, not a fall back (6.5)
+    if (calm) {                                  // the buffer change is a gap, not trouble (6.5)
         CHECK(r.side[1].e.userLive(0));
-        CHECK(r.side[1].findNotice("is back on intervals", seen).empty());
-        if (!r.side[1].findNotice("is back on intervals", seen).empty()) {
+        CHECK(r.side[1].findNotice("Intervals may sound better", seen).empty());
+        if (!r.side[1].findNotice("Intervals may sound better", seen).empty()) {
             std::lock_guard<std::mutex> lock(r.side[1].m);
             for (std::size_t i = seen; i < r.side[1].notices.size(); ++i) std::printf("    [bob] %s\n", r.side[1].notices[i].c_str());
         }
