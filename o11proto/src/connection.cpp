@@ -1,11 +1,22 @@
 // o11proto - non-blocking framed TCP connection, on an Asio socket.
 #include "o11proto/connection.h"
 
+#include <array>
 #include <cstring>
 
 #include "socket_compat.h"
 
 namespace o11proto {
+
+namespace {
+// The first `n` buffers of an array, as an Asio buffer sequence.
+struct BufferSpan {
+    const asio::const_buffer* first;
+    std::size_t n;
+    const asio::const_buffer* begin() const { return first; }
+    const asio::const_buffer* end() const { return first + n; }
+};
+}  // namespace
 
 std::string maskAddress(const std::string& ip) {
     std::size_t dot = ip.rfind('.');
@@ -117,17 +128,30 @@ bool Connection::nextMessage(RawMessage& out, bool& error) {
 bool Connection::flush() {
     if (!isOpen()) return false;
     asio::ip::tcp::socket& s = net_->socket;
+    // Up to kGather queued messages go in one send (a gathering write), not
+    // one each: the same bytes in the same order, in fewer system calls.
+    constexpr std::size_t kGather = 16;
     while (!outq_.empty()) {
-        const auto& front = outq_.front();
+        std::array<asio::const_buffer, kGather> bufs;
+        std::size_t count = 0;
+        for (auto it = outq_.begin(); it != outq_.end() && count < kGather; ++it, ++count) {
+            const std::size_t off = count == 0 ? out_off_ : 0;
+            bufs[count] = asio::buffer(it->data() + off, it->size() - off);
+        }
         asio::error_code ec;                             // Asio's sends never raise SIGPIPE
-        const std::size_t n = s.write_some(asio::buffer(front.data() + out_off_, front.size() - out_off_), ec);
+        std::size_t n = s.write_some(BufferSpan{bufs.data(), count}, ec);
         if (ec) {
             if (compat::wouldBlock(ec)) return true;
             if (ec == asio::error::interrupted) continue;
             return false;
         }
-        out_off_ += n;
-        if (out_off_ >= front.size()) {
+        while (n > 0 && !outq_.empty()) {
+            const std::size_t left = outq_.front().size() - out_off_;
+            if (n < left) {
+                out_off_ += n;
+                break;
+            }
+            n -= left;
             outq_.pop_front();
             out_off_ = 0;
         }
