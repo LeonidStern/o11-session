@@ -516,8 +516,10 @@ void O11Editor::layoutRoom(juce::Rectangle<float> pane)
   place(m_roomTitle, x0, y, x0 + 60, y + LABEL_H);
   place(m_roomCount, x0 + 60, y, x1, y + LABEL_H);
   y += LABEL_H + 5;
-  // BPM, and the DAW's tempo at the right of its label: (o) Live 120.00
-  const float syncTextW = std::min(colW - 40, textWidth(m_fonts.label, "Host 888.88") + 2);
+  // BPM, and the DAW's tempo at the right of its label: (o) Ableton 120.00
+  const float syncTextW = std::min(colW - textWidth(m_fonts.label, "BPM") - 14,
+                                   textWidth(m_fonts.label, m_syncChip + " 888.88") + 2);
+  m_syncTextW = syncTextW;
   place(m_bpmLabel, x0, y, x0 + colW - syncTextW - 10, y + LABEL_H);
   place(m_syncLed, x0 + colW - syncTextW - 10, y, x0 + colW - syncTextW - 4, y + LABEL_H);
   place(m_syncText, x0 + colW - syncTextW, y, x0 + colW, y + LABEL_H);
@@ -699,7 +701,15 @@ void O11Editor::updateTransport(const Snapshot &s)
   // Sync: the host's tempo, green when it is the room's, amber when not, grey while Sync is
   // off; "Link" while the host follows the room through Link
   const std::string chip = s.linkLeads ? "Link" : s.hostChip.empty() ? "DAW" : s.hostChip;
-  setLabel(m_syncText, chip + " " + uitext::bpmBoxText(s.hostTempo));
+  if (chip != m_syncChip)
+  {
+    m_syncChip = chip;
+    layoutRoom(m_room->getBounds().toFloat());
+  }
+  // "Ableton 120.00", or "Ableton 120" where the panel is too narrow for it
+  std::string syncText = chip + " " + uitext::bpmBoxText(s.hostTempo);
+  if (s.hostTempo > 0 && textWidth(m_fonts.label, syncText) + 2 > m_syncTextW) syncText = chip + " " + bpmText(s.hostTempo);
+  setLabel(m_syncText, syncText);
   const bool known = s.hostTempo > 0 && connected && s.bpm > 0 && m_sync->value();
   const bool differ = known && fabs(s.hostTempo - s.bpm) > BarSync::SAME_TEMPO;
   m_syncLed->setColor(differ ? Colors::amber() : Colors::green(), known);

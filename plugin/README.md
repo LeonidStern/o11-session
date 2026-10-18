@@ -106,7 +106,7 @@ Everything the old plug-in did on its own, in the same way:
   Link's beat or tempo makes the plug-in stop leading (contested) until Sync
   goes off and on. Out of a room, or with Sync off, the plug-in isn't in
   Link. The chat says when Live follows the room, and once that Link sees no
-  other app ("Turn on Link in Live ..."); the Sync chip shows "Link", and the
+  other app ("Turn on Link in Ableton ..."); the Sync chip shows "Link", and the
   Sync button's tooltip, the footer and the tempo note say what Link does.
   `status` reports `link`, `peers`, `linktempo`, `leads`, `linkaligned`,
   `linkerr`, `latency`, `jumps`, `steps` and `restores`, as before. The
@@ -149,7 +149,7 @@ Everything the old plug-in did on its own, in the same way:
     and the port's state ("Only your network can join" behind carrier-grade
     NAT).
 
-  The transport bar names the host shortly: "Live", "Bitwig", "Cubase",
+  The transport bar names the host shortly: "Ableton", "Bitwig", "Cubase",
   "REAPER", or "DAW" when the host doesn't say or the name doesn't fit. Text is
   in Inter, embedded in the plug-in. The chat commands (`chat`, `chatlog`)
   still work for tests and automation; `users` also says each channel's level
