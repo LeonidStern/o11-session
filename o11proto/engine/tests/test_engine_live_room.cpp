@@ -965,15 +965,24 @@ TEST(listening_file) {
     // Each gap starts a 16th after a beat, where alice plays no hit and her
     // kick (and, on the beats with one, her snare) is decaying.
     const long beat = 4 * drums.step, mid = drums.step;
-    long gap_at[5] = {};
+    long gap_at[5] = {}, conceal_at[5] = {-1, -1, -1, -1, -1};
+    const int alice_at_carl = userIndex(r[2], "alice");
     for (int k = 0; k < 5; ++k) {
         const long t = live_at + static_cast<long>((1.5 + 2.0 * k) * o.rate);
         waitUntil(t + ((mid - t) % beat + beat) % beat);
         const long f = r.frames.load();
         gap_at[k] = f;
         r[0].e.setLiveTestSendGap(gaps[k]);
-        ev.push_back({f, "a " + std::to_string(gaps[k]) + " ms gap in alice's packets (sent now, heard about " + late +
-                             " ms later)"});
+        ev.push_back({f, "a " + std::to_string(gaps[k]) + " ms gap in alice's packets (the ones she sends from now are "
+                             "lost; carl hears the players about " + late + " ms late)"});
+        // Where carl's concealment of it begins, to the frame (his engine
+        // counts the same frames as r.frames).
+        waitUntil(f + (gaps[k] + 100) * ms);
+        const long c = alice_at_carl >= 0 ? r[2].e.liveTestConcealedFrom(alice_at_carl) : -1;
+        if (c > f && c < f + 100 * ms) {
+            conceal_at[k] = c;
+            ev.push_back({c, "the gap reaches carl: his concealment of alice begins"});
+        }
     }
     // dave, a client without Live, joins: the room stays Live, and carl is
     // advised. Just before the boundary 2.5 s later (where the room used to
@@ -1034,20 +1043,22 @@ TEST(listening_file) {
                         "440 Hz and a quiet 3520 Hz (-20 dB), bob 660 Hz, each at about -12 dBFS, from a 50 ms\n"
                         "fade-in at the players' frame 0 on, without a break; carl sends nothing. The room is at\n"
                         "%d bpm, the timeline is the drum file's (live-transitions.wav). A slot without audio is\n"
-                        "concealed for %.0f x B = %.0f ms, then fades out over %.0f ms; every switch crossfades over\n"
-                        "%.0f ms. While the room is Live there is no interval audio: after !live off nothing is\n"
-                        "heard until the players' first interval after Live comes in, faded in. The first sample is\n"
-                        "frame %ld of the players' clock. Times in seconds from the start.\n\n",
+                        "concealed for %.0f x B = %.0f ms from where carl's concealment begins (\"the gap reaches\n"
+                        "carl\"), then fades out over %.0f ms; every switch crossfades over %.0f ms. While the room\n"
+                        "is Live there is no interval audio: after !live off nothing is heard until the players'\n"
+                        "first interval after Live comes in, faded in. The first sample is frame %ld of the\n"
+                        "players' clock. Times in seconds from the start.\n\n",
                      wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
                      kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
     else
         std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is 909-style drums, synthesized,\n"
                         "at %d bpm, one bar per interval: alice plays the kick and the snare, bob the closed and open\n"
                         "hi-hats and the clap; carl sends nothing. A slot without audio is concealed for %.0f x B =\n"
-                        "%.0f ms, then fades out over %.0f ms; every switch crossfades over %.0f ms. While the room is\n"
-                        "Live there is no interval audio: after !live off nothing is heard until the players' first\n"
-                        "interval after Live comes in, faded in. The first sample is frame %ld of the players' clock.\n"
-                        "Times in seconds from the start.\n\n",
+                        "%.0f ms from where carl's concealment begins (\"the gap reaches carl\"), then fades out over\n"
+                        "%.0f ms; every switch crossfades over %.0f ms. While the room is Live there is no interval\n"
+                        "audio: after !live off nothing is heard until the players' first interval after Live comes\n"
+                        "in, faded in. The first sample is frame %ld of the players' clock. Times in seconds from the\n"
+                        "start.\n\n",
                      wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
                      kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
     for (const Event& e : ev) std::fprintf(f, "%7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
@@ -1055,14 +1066,15 @@ TEST(listening_file) {
     std::printf("    wrote %s (%.1f s) and %s:\n", wav.c_str(), double(end - start) / o.rate, txt.c_str());
     for (const Event& e : ev) std::printf("      %7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
 
-    // Where carl hears each gap (16.6): the packets lost are the ones sent
-    // in it, and a block goes a few ms after it was played, so alice's
-    // concealment begins about `d` - 8 ms after the gap was set (give or
-    // take a block), and her audio comes back the gap's length later, on
-    // the delay it had. Each check takes in 10 ms either side of that.
+    // Where carl hears each gap (16.6): where his engine says its
+    // concealment began; else, as the packets lost are the ones sent in it
+    // and a block goes a few ms after it was played, about `d` - 8 ms after
+    // the gap was set (give or take a block). Her audio comes back the
+    // gap's length later, on the delay it had. Each check takes in 10 ms
+    // either side of that.
     const float* x = r[2].heard.get();
     const double hold_ms = kLiveConcealBuffers * r[2].e.liveBufferInUseMs();
-    auto concealedAt = [&](int k, long d) { return gap_at[k] + d - 8 * ms; };
+    auto concealedAt = [&](int k, long d) { return conceal_at[k] >= 0 ? conceal_at[k] : gap_at[k] + d - 8 * ms; };
 
     if (tones) {
         // A steady tone goes on through a gap: through one of up to 4 x B
@@ -1123,6 +1135,34 @@ TEST(listening_file) {
             CHECK(lo >= -1.0 && hi <= 1.0);
             CHECK(worst <= -40.0);
         }
+        // Every gap longer than 4 x B is held for the same time from where
+        // carl's concealment of it began (16.8): his 440 Hz (its envelope over
+        // 1/220 s, which takes out the 660 and 3520 Hz) falls to half its
+        // level the same time after that, within 0.1 ms.
+        const int K = o.rate / 220;
+        auto env440 = [&](long f) {
+            double re = 0, im = 0;
+            for (int i = 0; i < K; ++i) {
+                const long n = f - K / 2 + i;
+                const double ph = 2 * M_PI * 440.0 * static_cast<double>(n % o.rate) / o.rate;
+                re += x[n] * std::cos(ph);
+                im -= x[n] * std::sin(ph);
+            }
+            return 2 * std::hypot(re, im) / K;
+        };
+        double held_lo = 1e9, held_hi = -1e9;
+        for (int k = 0; k < 5; ++k) {
+            if (gaps[k] <= hold_ms || conceal_at[k] < 0) continue;
+            if (!r.calm(conceal_at[k] - 200 * ms, conceal_at[k] + 300 * ms)) continue;
+            const double ref = env440(conceal_at[k] - 20 * ms);
+            long f = conceal_at[k] + static_cast<long>(hold_ms - 10) * ms;
+            while (f < conceal_at[k] + static_cast<long>(hold_ms + 40) * ms && env440(f) >= 0.5 * ref) ++f;
+            const double held = r.ms(f - conceal_at[k]);
+            held_lo = std::min(held_lo, held), held_hi = std::max(held_hi, held);
+            std::printf("    the %3d ms gap: carl's 440 Hz is down 6 dB %.2f ms after his concealment began (the fade "
+                        "starts %.0f ms after it)\n", gaps[k], held, hold_ms);
+        }
+        if (held_hi >= held_lo) CHECK(held_hi - held_lo <= 0.1);
         // After a gap each player plays on the delay it had before it
         // (16.6), so the two stay in time: each one's delay, from the phase
         // of its tone over 800 ms before the gap and 800 ms from half a

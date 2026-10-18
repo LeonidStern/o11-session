@@ -103,10 +103,13 @@ void clampDecoded(float* s, std::size_t n);
 // live and interval audio, and every fade of the live audio alone, takes
 // kLiveFadeMs. A slot that has no audio (lost, stopped or timed out) is
 // concealed for kLiveConcealBuffers times the buffer in use (B) before it
-// fades out: 80 ms at the default 20 ms. This is a time of its own, not the
-// 4 x B after which buffering counts an underrun.
+// fades out: 80 ms at the default 20 ms, from the frame where the
+// concealment began (LiveSink::quietFrom()). This is a time of its own, not
+// the 4 x B after which buffering counts an underrun.
 constexpr double kLiveFadeMs = 20.0;
 constexpr double kLiveConcealBuffers = 4.0;
+// The concealment goes on for this much more than the mixer's hold and fade.
+constexpr double kLiveConcealSpareMs = 10.0;
 
 // The concealment (16.6). Where a slot has no audio of its stream (a block
 // lost for good, an xrun block, the stream dry or buffering again, the time
@@ -214,6 +217,11 @@ public:
     // 10 ms, at most `max`; returns how many were written to `seqs`.
     int dueRequests(std::int64_t now_ns, std::int32_t* seqs, int max);
 
+    // Of the last render's frames: the first that played the stream's own
+    // audio (decoded, not concealment), -1 for none, and the one where the
+    // concealment it ends with began (`frames` when it ends with audio).
+    int firstReal() const { return first_real_; }
+    int quietFrom() const { return quiet_from_; }
     bool hasStream() const { return phase_ != Idle; }
     bool playing() const { return phase_ == Playing; }
     bool tailing() const { return phase_ == Idle && tail48_ > 0; }
@@ -271,7 +279,10 @@ private:
     SinkSizes sizes_;
     float fifo_[2 * 480];                       // decoded 48 kHz frames
     int fifo_n_ = 0, fifo_at_ = 0;
+    bool fifo_real_ = false;                    // the queue holds a decoded block, not concealment
     float x_[4][2] = {};                        // the cubic resampler's window
+    bool xr_[4] = {};                           // and whether each of its samples was the stream's own
+    int first_real_ = -1, quiet_from_ = 0;
     double t_ = 0;                              // its position between x_[1] and x_[2]
     double fill_ = -1;                          // smoothed buffer fill, seconds; -1: a new estimate
     double fill_ref_ = -1;                      // the fill it keeps, once settled

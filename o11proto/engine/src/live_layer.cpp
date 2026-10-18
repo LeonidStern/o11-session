@@ -86,6 +86,8 @@ LiveLayer::LiveLayer() {
         queue[s].reset(new Spsc<SinkItem, 256>);
         sinks[s].reset(new LiveSink);
         outbuf_[s].reset(new float[2 * kLiveMaxHostBlock]());
+        concealed_from[s].store(-1);
+        quiet_run_[s] = 1 << 29;
     }
     src_.history.reset(new Source::Sent[kHistory]);
     std::uint32_t seed[2] = {0, 0};
@@ -772,6 +774,8 @@ void LiveLayer::encodeAndSend(TimePoint now) {
 void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int frames, int rate) {
     const std::int64_t now = steadyNs(Clock::now());
     if (rate <= 0 || frames <= 0) return;
+    const std::int64_t block0 = frames_;
+    frames_ += frames;
     host_rate.store(rate);
     // H: the longest host block of the last 30 s (6.8)
     if (frames >= longest_) {
@@ -864,12 +868,22 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
         }
         k.configure(latency, longest_, rate);
         if (gap > 0) k.hostGap(gap, rate);
-        avail_[s] = real_[s] = false;
+        avail_[s] = false;
+        quiet0_[s] = std::min(quiet_run_[s], 1 << 29);
+        first_real_[s] = -1;
+        quiet_from_[s] = 0;
+        quiet_run_[s] = quiet0_[s] + frames;     // unless it plays its stream's audio
         if (frames > kLiveMaxHostBlock) continue;
         // Also while Live is off: a stream that was just dropped conceals
         // on, so that the mixer can fade it out (16.8).
         avail_[s] = k.render(outbuf_[s].get(), frames, rate, now) && !host_offline.load();
-        real_[s] = avail_[s] && k.playing();
+        if (avail_[s] && k.firstReal() >= 0) {
+            first_real_[s] = k.firstReal();
+            quiet_from_[s] = k.quietFrom();
+            quiet_run_[s] = frames - quiet_from_[s];
+        }
+        if (first_real_[s] >= 0 ? quiet_from_[s] < frames : quiet0_[s] == 0)   // its audio ends here
+            concealed_from[s].store(block0 + (first_real_[s] >= 0 ? quiet_from_[s] : 0));
         if (!on) continue;
         std::int32_t seqs[16];
         const int n = k.dueRequests(now, seqs, 16);

@@ -150,6 +150,9 @@ struct LiveLayer {
     std::atomic<std::uint32_t> gen[kLiveSlots]{};   // bumped by control: a slot's new peer or a dropped source
     std::atomic<int> latency_ms{kLiveDefaultBufferMs};   // B, control -> audio
     std::atomic<int> host_block{0}, host_rate{0};        // H and sr, audio -> control
+    // The host frame (from the first block) where each slot's audio last
+    // went into concealment, -1 for never: audio -> a test.
+    std::atomic<std::int64_t> concealed_from[kLiveSlots];
     std::atomic<std::int64_t> last_block_end_ns{0};      // audio -> network (6.3, item 6)
     std::atomic<bool> sending{false};                    // the source's gate is open (audio -> control)
     // The room's mode: control announces (a count and the mode in bit 0,
@@ -168,7 +171,12 @@ struct LiveLayer {
     // Captures channel 0 (l and r, or null without input) and plays the sinks.
     void audioBlock(const float* l, const float* r, bool transmit, int frames, int rate);
     bool available(int s) const { return avail_[s]; }
-    bool real(int s) const { return real_[s]; }  // the slot played its stream's audio, not concealment
+    // Host frames since slot s last played its stream's own audio (not
+    // concealment or silence), as of frame i of this host block, counting i.
+    int quietAt(int s, int i) const {
+        if (first_real_[s] < 0 || i < first_real_[s]) return quiet0_[s] + i + 1;
+        return i < quiet_from_[s] ? 0 : i + 1 - quiet_from_[s];
+    }
     const float* out(int s) const { return outbuf_[s].get(); }
     // The mixer's room state (engine_live.cpp).
     std::uint64_t mix_announce = 0;             // the announcement it took last
@@ -270,7 +278,9 @@ private:
     // audio context
     std::uint32_t audio_gen_[kLiveSlots] = {};
     bool avail_[kLiveSlots] = {};
-    bool real_[kLiveSlots] = {};
+    int quiet0_[kLiveSlots] = {}, first_real_[kLiveSlots] = {}, quiet_from_[kLiveSlots] = {};
+    int quiet_run_[kLiveSlots] = {};            // quietAt() after the block
+    std::int64_t frames_ = 0;                   // host frames since the first block
     std::unique_ptr<float[]> outbuf_[kLiveSlots];
     bool gate_open_ = false;
     std::int64_t expect_ns_ = 0, prev_start_ns_ = 0, prev_dur_ns_ = 0;

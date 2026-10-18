@@ -123,6 +123,13 @@ void Engine::setLiveTestLoss(double fraction) { live_->setTestLoss(fraction); }
 
 void Engine::setLiveTestSendGap(int ms) { live_->setTestSendGap(ms); }
 
+long Engine::liveTestConcealedFrom(int user) const {
+    std::lock_guard<std::mutex> lock(remote_mutex_);
+    RemoteUser* u = userAt(user);
+    if (!u || u->live_want < 0) return -1;
+    return static_cast<long>(live_->concealed_from[u->live_want].load());
+}
+
 bool Engine::userLive(int user) const {
     std::lock_guard<std::mutex> lock(remote_mutex_);
     RemoteUser* u = userAt(user);
@@ -695,8 +702,9 @@ void lineUp(LiveMix& m, int in, int rate) {
 // audio and its slot's live audio, with channel 0's settings, into its
 // pair. The path the room's mode picks is heard; each switch crossfades
 // over 20 ms on an equal-power curve, and while the room is Live a slot
-// without audio is concealed for kLiveConcealBuffers x B, then fades out,
-// and fades in again when its audio comes back. Interval audio is never
+// without audio is concealed for kLiveConcealBuffers x B (to the frame,
+// from where its concealment is heard), then fades out, and fades in again
+// when its audio comes back. Interval audio is never
 // heard while the room is Live (and none is sent then): a user without a
 // slot here isn't heard.
 void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleRate) {
@@ -705,6 +713,7 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
     const int offset = remote_offset_.load();
     const float step = static_cast<float>(1000.0 / (kLiveFadeMs * sampleRate));
     const int hold = static_cast<int>(kLiveConcealBuffers * L.latency_ms.load() * sampleRate / 1000.0);
+    const int spare = static_cast<int>(kLiveConcealSpareMs * sampleRate / 1000.0);
     constexpr int R = LiveMix::kRing - 1;
     constexpr float kPi = 3.14159265359f, kHalfPi = 1.57079632679f;
     for (auto& up : users_) {
@@ -747,13 +756,20 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                 std::fill(m.lbuf, m.lbuf + 2 * n, 0.0f);
             }
             const bool slot_ok = u.live_slot >= 0 && L.gen[u.live_slot].load() == u.live_gen;
-            m.quiet = slot_ok && L.real(u.live_slot) ? 0 : std::min(m.quiet, 1 << 29) + n;
             const bool live = L.mix_live;
             if (live != m.path_live) {
                 m.path_live = live;
                 lineUp(m, live ? LiveMix::kLive : LiveMix::kIntervals, sampleRate);
             }
-            const float target[2] = {live ? 0.0f : 1.0f, live && slot_ok && m.quiet <= hold ? 1.0f : 0.0f};
+            // The hold counts from the frame where the slot's concealment
+            // began, and the live path is heard m.delay[1] frames after it
+            // is written: so every gap is held for the same time.
+            const int keep = hold + std::min(m.delay[1], spare);
+            const int quiet0 = std::min(m.quiet, 1 << 29);
+            const auto quietAt = [&](int i) {
+                return slot_ok ? L.quietAt(u.live_slot, at + done + i) : quiet0 + i + 1;
+            };
+            float target[2] = {live ? 0.0f : 1.0f, 0.0f};
             for (int k = 0; k < n; ++k) {
                 const int f = (m.w + k) & R;
                 m.ring[0][2 * f] = m.ibuf[2 * k];
@@ -762,6 +778,7 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                 m.ring[1][2 * f + 1] = m.lbuf[2 * k + 1];
             }
             for (int i = 0; i < n; ++i) {
+                target[1] = live && slot_ok && quietAt(i) <= keep ? 1.0f : 0.0f;
                 float g[2];
                 for (int p = 0; p < 2; ++p) {
                     float& q = m.pos[p];
@@ -796,6 +813,7 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                     pk1 = std::max(pk1, std::fabs(rv));
                 }
             }
+            m.quiet = quietAt(n - 1);
             m.w = (m.w + n) & R;
             // Silent paths can move without a sound, but not the live one
             // while the room is Live: a slot that fades out in a gap comes
