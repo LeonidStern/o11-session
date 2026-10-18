@@ -900,14 +900,15 @@ also be run against the reference server)**
   changes; tests 13.16 and 13.17.
 - **2c** (2026-10-18): each Opus stream begins with a 240-sample pre-roll
   inside its pre-skip, and the padding's fit is Burg's (6.4); the crossfade
-  is a raised cosine (8.3); decoders decode on demand, one packet or frame
-  a step (8.1); test 18. Live mode (16) as the engine plays it now: the
-  room's one mode with no interval audio while Live and the health report
-  and advice in place of per-player switching; all to all; the automatic
-  jitter buffer; concealment by prediction with a primed decoder; the sink
-  back on its delay after a gap, the host's schedule and path changes; the
-  two-path mixer; the per-user counters and events; the network thread's
-  scheduling and wake; `/live`'s texts; the tests.
+  is a raised cosine (8.3); decoders decode on demand, one packet or frame a
+  step (8.1); test 18. Live mode (16) as the engine plays it now: the room's
+  one mode with no interval audio while Live and the health report and
+  advice in place of per-player switching; all to all, make before break
+  while a new path opens; the automatic jitter buffer; concealment by
+  prediction with a primed decoder; the sink back on its delay after a gap,
+  the host's schedule and path changes; the two-path mixer; the per-user
+  counters and events; the network thread's scheduling and wake; `/live`'s
+  texts; the tests.
 - **1a** (2026-10-17): clarifications after the first implementation: exact
   boundary semantics (4.4), exact resampler positions and undithered exact
   values (6.4), playback phase reset (8.5), tests 13.3, 13.10 and 13.13
@@ -1059,14 +1060,25 @@ off for its engines.
   starts a new stream.
 - `process()` copies the signal in chunks of at most 64 frames into the
   capture queue and wakes the network thread. That thread resamples it to 48
-  kHz (cubic interpolation, when the host rate isn't 48 kHz) and encodes each
-  frame with libopus (stereo, 48 kHz, restricted low delay, the room's
+  kHz (cubic interpolation, when the host rate isn't 48 kHz) and encodes
+  each frame with libopus (stereo, 48 kHz, restricted low delay, the room's
   bitrate clamped to 32-510 kbps, the room's frame size or 240; libopus's
   defaults otherwise). Each packet goes as binary `/data` (flags `0x01`,
   rate 48000.0) to each listed peer directly where the pair's path is up,
   through the relay to a bound peer without a path, and to no one whose path
-  isn't up while the room is direct only; when no peer would get it
-  directly it goes once to destination 0 (PROTOCOL.md 15.10).
+  isn't up while the room is direct only (but for make before break, below);
+  when no peer would get it directly it goes once to destination 0
+  (PROTOCOL.md 15.10).
+- **Make before break.** The source keeps, for each peer, the run of
+  packets the relay has carried to it (to that peer, or to destination 0
+  while it is bound; a run ends after 250 ms with none). While the room is
+  direct only, a bound peer whose run has lasted 1 s or more, up to the
+  packet before, and whose new path is opening (listed, never answered, not
+  yet unreachable) still gets each packet through the relay, addressed to
+  it; the first packet after its path is up goes directly, and if the path
+  becomes unreachable nothing more goes to it. The packets a peer gets by
+  the relay between its `0x07` listing and its path's are no such run, so a
+  pair whose path never opens still can't hear each other.
 - `/start` goes to each listed peer with the first packet of a stream, to a
   peer listed mid-stream at once, and on a start request; a peer no longer
   listed gets a `/stop`. The source keeps 512 sent blocks (at least 1 s) for
@@ -1402,6 +1414,7 @@ speed correction is one pair; `end`, `fallback` (the buffer now, ms) and
 | host schedule | tolerance max(1 ms, half a block), at most 1 s behind |
 | host-gap threshold | max(20 ms, 2*H* / *sr*), early below 90 %, reported ≤ 0.5 s |
 | path change | 100 ms more room for ≥ 1 s; a change after 4 blocks in a row |
+| make before break | a relay run of ≥ 1 s, broken by 250 ms without a packet |
 | decoded sample clamp | −2.0..+2.0 |
 | failed start retry / no-answer line | 10 s / 5 s |
 | "The room is Live now" waits | ≤ 1.5 s (`kLiveNoticeWaitMs`) |
@@ -1460,8 +1473,11 @@ speed correction is one pair; `end`, `fallback` (the buffer now, ms) and
   each playing a steady sine: all to all on loopback; a pair without a path
   can't hear each other and gets the advice; the relay fallback takes the
   room to the relay and `!live direct` back; a forced relay with and without
-  the fallback. Over whole spans, across the route changes, each listener's
-  output stays within 1 dB of the span's RMS every 10 ms, with no
-  near-silence over 1 ms and no step over 1.5 times a steady mix's largest.
+  the fallback (once it is turned off, the player's path with one of the
+  others is blocked for 1.5 s with `setLiveTestBlockPeer()`, and the pair
+  hears each other by the relay, make before break, until it opens). Over
+  whole spans, across the route changes, each listener's output stays within
+  1 dB of the span's RMS every 10 ms, with no near-silence over 1 ms and no
+  step over 1.5 times a steady mix's largest.
 - The harness (`live_harness.h`) and its hiccup rules are in
   `engine/NOTES.md`.
