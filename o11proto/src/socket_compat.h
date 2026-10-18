@@ -226,29 +226,6 @@ inline int poll(pollfd* fds, std::size_t n, int timeout_ms) {
 #endif
 }
 
-// Windows only: WSAPoll on Windows before 10 version 2004 never reports a
-// failed non-blocking connect (no POLLERR/POLLHUP), so the client also asks
-// select()'s exceptfds, where Winsock has always reported it. Returns true
-// and the error when the connect has failed; always false on POSIX, where
-// poll() reports it.
-inline bool connectFailed(socket_t s, int& err) {
-#ifdef _WIN32
-    fd_set ex;
-    FD_ZERO(&ex);
-    FD_SET(s, &ex);
-    timeval zero{};
-    if (::select(0, nullptr, nullptr, &ex, &zero) <= 0 || !FD_ISSET(s, &ex)) return false;
-    err = 0;
-    socklen_t len = sizeof(err);
-    if (getOpt(s, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err == 0) err = WSAECONNREFUSED;
-    return true;
-#else
-    (void)s;
-    (void)err;
-    return false;
-#endif
-}
-
 // The error of the last raw socket call on this thread.
 inline int lastError() {
 #ifdef _WIN32
@@ -264,15 +241,6 @@ inline bool isWouldBlock(int err) {
     return err == WSAEWOULDBLOCK;
 #else
     return err == EAGAIN || err == EWOULDBLOCK;
-#endif
-}
-
-// A non-blocking connect() that is still in progress.
-inline bool isInProgress(int err) {
-#ifdef _WIN32
-    return err == WSAEWOULDBLOCK;
-#else
-    return err == EINPROGRESS;
 #endif
 }
 
