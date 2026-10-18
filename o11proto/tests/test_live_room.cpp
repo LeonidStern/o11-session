@@ -79,14 +79,37 @@ TEST(room_message) {
     m.user = "carol";
     m.count = 2;
     const Bytes b = live::encode(m);
-    CHECK(b == Bytes({2, 1, 2, 0, 'c', 'a', 'r', 'o', 'l', 0, 2, 0}));
+    CHECK(b == Bytes({3, 1, 2, 0, 'c', 'a', 'r', 'o', 'l', 0, 2, 0, 0, 0, 0, 0, 0, 0}));
     live::LiveRoom d;
-    CHECK(live::decode(b, d) && d.live && d.advice == Advice::CantLive && d.user == "carol" && d.count == 2);
+    CHECK(live::decode(b, d) && d.live && d.advice == Advice::CantLive && d.user == "carol" && d.count == 2 &&
+          d.route == live::RoomRoute::None);
     live::LiveRoom off;
-    CHECK(live::encode(off) == Bytes({2, 0, 0, 0, 0, 0, 0}));
+    CHECK(live::encode(off) == Bytes({3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
     CHECK(live::decode(Bytes({2, 1, 0, 0}), d) && d.live && d.user.empty() && d.count == 0);   // no name at all
     CHECK(live::decode(Bytes({2, 1, 1, 0, 'x', 0}), d) && d.advice == Advice::Dropouts && d.count == 1);   // no count
-    CHECK(live::decode(Bytes({3, 1, 1, 0, 'x', 0, 5, 0, 9, 9}), d) && d.count == 5 && d.user == "x");   // later: read as 2
+    // Version 3's route: the room on the relay since a and b had no path,
+    // and everyone can connect directly again.
+    live::LiveRoom relay;
+    relay.live = true;
+    relay.route = live::RoomRoute::Relay;
+    relay.relay_fallback = true;
+    relay.direct_possible = true;
+    relay.why = live::RelayWhy::NoPath;
+    relay.why_a = "a";
+    relay.why_b = "bc";
+    const Bytes rb = live::encode(relay);
+    CHECK(rb == Bytes({3, 1, 0, 0, 0, 0, 0, 2, 3, 1, 0, 'a', 0, 'b', 'c', 0}));
+    CHECK(live::decode(rb, d) && d.route == live::RoomRoute::Relay && d.direct_possible && d.relay_fallback &&
+          d.why == live::RelayWhy::NoPath && d.why_a == "a" && d.why_b == "bc");
+    CHECK(live::decode(Bytes({3, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0}), d) && d.route == live::RoomRoute::Direct &&
+          !d.relay_fallback && !d.direct_possible && d.why_a.empty() && d.why_b.empty());   // no names at all
+    CHECK(live::decode(Bytes({3, 1, 0, 0, 0, 0, 0, 7, 0, 9, 0}), d) && d.route == live::RoomRoute::None &&
+          d.why == live::RelayWhy::None);        // unknown route and reason
+    CHECK(live::decode(Bytes({3, 1, 1, 0, 'x', 0, 5, 0, 2, 1}), d) && d.count == 5 &&
+          d.route == live::RoomRoute::None);     // the route cut short: none
+    CHECK(live::decode(Bytes({4, 1, 1, 0, 'x', 0, 5, 0, 2, 0, 3, 0, 'y', 0, 0, 9, 9}), d) && d.count == 5 &&
+          d.user == "x" && d.route == live::RoomRoute::Relay && d.why == live::RelayWhy::RelayOnly &&
+          d.why_a == "y" && d.why_b.empty());    // later: read as 3
     // Version 1: the reason said why the room was on intervals; 3 (joining) is none now.
     CHECK(live::decode(Bytes({1, 0, 2, 0, 'c', 'a', 'r', 'o', 'l', 0}), d) && !d.live &&
           d.advice == Advice::CantLive && d.user == "carol" && d.count == 1);
@@ -228,10 +251,11 @@ struct Room {
     std::thread thread;
     std::atomic<bool> stop{false};
     std::vector<Client*> clients;
-    Room() {
+    explicit Room(bool relay_fallback = false) {
         ServerConfig cfg;
         cfg.port = 0;
         cfg.allow_anonymous = true;
+        cfg.live.relay_fallback = relay_fallback;
         cfg.anonymous_privs = kPrivChat | kPrivVote;
         cfg.live.mode = LiveMode::On;
         CHECK(server.start(cfg));
@@ -261,7 +285,7 @@ struct Player {
     Client c;
     live::Transport t;
     std::vector<live::LiveRoom> rooms;         // every room message
-    bool login(Room& r, const std::string& name, bool live = true) {
+    bool login(Room& r, const std::string& name, bool live = true, bool direct = false) {
         r.clients.push_back(&c);
         c.on_message = [this](const RawMessage& m) {
             live::LiveRoom lr;
@@ -271,6 +295,7 @@ struct Player {
         o.username = "anonymous:" + name;
         o.codec_caps = kCapOpus;
         o.live = live;
+        o.live_direct = direct;
         ChannelInfoRecord ch;
         ch.name = "ch0";
         c.setChannels({ch});
@@ -294,6 +319,22 @@ struct Player {
         c.sendRaw(live::kMsgClientLiveReport, live::encode(r));
     }
     std::uint32_t id() const { return c.liveMessage().peer_id; }
+    // CLIENT_LIVE_PATHS: how its paths to these peers stand.
+    void paths(const std::vector<std::pair<std::uint32_t, live::PathState>>& states, bool relay_only = false) {
+        live::PathsReport m;
+        m.flags = relay_only ? live::kPathsRelayOnly : 0;
+        for (const auto& st : states) {
+            live::PathsReport::Entry e;
+            e.id = st.first;
+            e.state = st.second;
+            m.peers.push_back(e);
+        }
+        c.sendRaw(live::kMsgClientLivePaths, live::encode(m));
+    }
+    bool route(live::RoomRoute rt, bool possible = false, live::RelayWhy why = live::RelayWhy::None) const {
+        return !rooms.empty() && rooms.back().route == rt && rooms.back().direct_possible == possible &&
+               rooms.back().why == why;
+    }
     bool last(bool live, Advice advice = Advice::None, const std::string& user = "", int count = 0) const {
         return !rooms.empty() && rooms.back().live == live && rooms.back().advice == advice &&
                rooms.back().user == user && rooms.back().count == count;
@@ -378,6 +419,102 @@ TEST(server_room_messages) {
                     2000));
     a.t.stop();
     b.t.stop();
+}
+
+// All-to-all, direct only (the default): a pair of bound senders without
+// a direct path is "can't play Live" for both, the earlier named, and the
+// room's route stays Direct.
+TEST(server_room_direct_only) {
+    using live::PathState;
+    using live::RoomRoute;
+    Room r;
+    Player a, b, c;
+    REQUIRE(a.login(r, "a", true, true));
+    REQUIRE(b.login(r, "b", true, true));
+    REQUIRE(c.login(r, "c", true, true));
+    REQUIRE(a.bind() && b.bind() && c.bind());
+    REQUIRE(r.until([&] { return a.route(RoomRoute::Direct) && c.route(RoomRoute::Direct); }, 2000));
+    CHECK(!c.rooms.back().relay_fallback);
+    a.paths({{b.id(), PathState::Opening}, {c.id(), PathState::Up}});
+    r.until([] { return false; }, 200);
+    CHECK(c.last(true));                           // opening is no one's trouble
+    a.paths({{b.id(), PathState::Down}, {c.id(), PathState::Up}});
+    const std::string an = a.c.username();
+    REQUIRE(r.until([&] { return c.last(true, Advice::CantLive, an, 2) && b.last(true, Advice::CantLive, an, 2); },
+                    2000));
+    CHECK(c.route(RoomRoute::Direct));
+    c.c.say("!live direct");                       // no such command here
+    r.until([] { return false; }, 300);
+    CHECK(c.route(RoomRoute::Direct) && c.last(true, Advice::CantLive, an, 2));
+    a.t.stop();
+    b.t.stop();
+    c.t.stop();
+}
+
+// The backend option relay_fallback: Direct until a pair of bound senders
+// has no direct path, then Relay for everyone, with the advice once every
+// pair has one again, until `!live direct`.
+TEST(server_room_relay_fallback) {
+    using live::PathState;
+    using live::RelayWhy;
+    using live::RoomRoute;
+    Room r(true);
+    Player a, b, c, old;
+    REQUIRE(a.login(r, "a", true, true));
+    REQUIRE(b.login(r, "b", true, true));
+    REQUIRE(c.login(r, "c", true, true));
+    REQUIRE(a.bind() && b.bind() && c.bind());
+    auto all = [&](RoomRoute rt, bool possible = false, RelayWhy why = RelayWhy::None) {
+        return r.until([&] { return a.route(rt, possible, why) && b.route(rt, possible, why) && c.route(rt, possible, why); },
+                       2000);
+    };
+    CHECK(all(RoomRoute::Direct));
+    CHECK(c.rooms.back().relay_fallback);
+    // Opening paths are no one's trouble.
+    a.paths({{b.id(), PathState::Opening}, {c.id(), PathState::Up}});
+    r.until([] { return false; }, 200);
+    CHECK(all(RoomRoute::Direct));
+    // a's path to b is unreachable: everyone through the relay, naming them.
+    a.paths({{b.id(), PathState::Down}, {c.id(), PathState::Up}});
+    REQUIRE(all(RoomRoute::Relay, false, RelayWhy::NoPath));
+    const std::string an = a.c.username(), bn = b.c.username();
+    CHECK(c.rooms.back().why_a == an && c.rooms.back().why_b == bn);
+    // !live direct is refused while that is so.
+    c.c.say("!live direct");
+    r.until([] { return false; }, 300);
+    CHECK(all(RoomRoute::Relay, false, RelayWhy::NoPath));
+    // Up again, as both of each pair report it: the advice, and the room
+    // stays on the relay.
+    a.paths({{b.id(), PathState::Up}, {c.id(), PathState::Up}});
+    b.paths({{a.id(), PathState::Up}, {c.id(), PathState::Up}});
+    r.until([] { return false; }, 300);
+    CHECK(all(RoomRoute::Relay, false, RelayWhy::NoPath));   // c hasn't said yet
+    c.paths({{a.id(), PathState::Up}, {b.id(), PathState::Up}});
+    REQUIRE(all(RoomRoute::Relay, true, RelayWhy::NoPath));
+    r.until([] { return false; }, 300);
+    CHECK(all(RoomRoute::Relay, true, RelayWhy::NoPath));
+    b.c.say("!live direct");
+    REQUIRE(all(RoomRoute::Direct));
+    // A client that sends through the relay only.
+    b.paths({{a.id(), PathState::Down}, {c.id(), PathState::Down}}, true);
+    REQUIRE(all(RoomRoute::Relay, false, RelayWhy::RelayOnly));
+    CHECK(a.rooms.back().why_a == bn && a.rooms.back().why_b.empty());
+    b.paths({{a.id(), PathState::Up}, {c.id(), PathState::Up}});
+    REQUIRE(all(RoomRoute::Relay, true, RelayWhy::RelayOnly));
+    a.c.say("!live direct");
+    REQUIRE(all(RoomRoute::Direct));
+    // A sender without bit 17, once bound; the advice once it leaves.
+    REQUIRE(old.login(r, "old"));
+    CHECK(all(RoomRoute::Direct));                 // not bound yet: no one's trouble
+    REQUIRE(old.bind());
+    REQUIRE(all(RoomRoute::Relay, false, RelayWhy::NoDirect));
+    CHECK(a.rooms.back().why_a == old.c.username());
+    old.t.stop();
+    old.c.disconnect();
+    REQUIRE(all(RoomRoute::Relay, true, RelayWhy::NoDirect));
+    a.t.stop();
+    b.t.stop();
+    c.t.stop();
 }
 
 TEST_MAIN()

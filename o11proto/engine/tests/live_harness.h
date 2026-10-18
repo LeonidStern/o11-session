@@ -70,6 +70,7 @@ struct Options {
     int bpm = 120, bpi = 4;                      // 2 s intervals
     bool live_on = true;
     bool live_server = true;                     // false: a server without Live (LiveMode::No)
+    bool relay_fallback = false;                 // the server's backend option (LiveConfig)
 };
 
 struct Room {
@@ -119,6 +120,7 @@ struct Room {
         cfg.bpm = static_cast<std::uint16_t>(opt.bpm);
         cfg.bpi = static_cast<std::uint16_t>(opt.bpi);
         cfg.live.mode = !opt.live_server ? LiveMode::No : opt.live_on ? LiveMode::On : LiveMode::Yes;
+        cfg.live.relay_fallback = opt.relay_fallback;
         bool ok = server.start(cfg);
         // Live's UDP port has the TCP port's number, which another program on
         // the machine may hold: then another port.

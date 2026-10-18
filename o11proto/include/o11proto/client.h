@@ -45,6 +45,7 @@ public:
         bool send_keepalives = true;                   // false only for tests
         bool auto_subscribe = false;                   // subscribe to every user seen (mask ~0)
         bool live = false;                             // set client_caps bit 16: Live mode (PROTOCOL.md 15)
+        bool live_direct = false;                      // with `live`, bit 17 too: Live's direct paths (0x09)
     };
 
     struct RemoteChannel {

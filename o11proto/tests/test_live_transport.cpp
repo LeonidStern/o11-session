@@ -92,10 +92,12 @@ Bytes dataFrom(std::uint32_t origin, std::size_t payload, std::uint8_t fill = 0x
 struct Inbox {
     std::mutex m;
     std::vector<std::pair<std::uint32_t, Bytes>> got;
+    int directs = 0;                           // of them, from the sender directly
     void wire(live::Transport& t) {
-        t.on_data = [this](std::uint32_t from, const std::uint8_t* p, std::size_t n) {
+        t.on_data = [this](std::uint32_t from, const std::uint8_t* p, std::size_t n, bool direct) {
             std::lock_guard<std::mutex> lock(m);
             got.emplace_back(from, Bytes(p, p + n));
+            if (direct) ++directs;
         };
     }
     std::size_t size() {
@@ -422,7 +424,8 @@ TEST(client_drop_rules) {                      // 4.2's list, and replies that a
     // Data that passes.
     r.send(dataFrom(9, 1));
     r.send(dataFrom(9, 1452, 0x42));
-    // A datagram from another port of the server's address: refused by connect().
+    // A datagram from another port of the server's address: not the relay's,
+    // nor a peer's (no path, no pair key).
     FakeRelay other;
     other.peer = r.peer;
     other.send(dataFrom(9, 20));
@@ -520,7 +523,7 @@ TEST(stop_ends_the_callbacks) {                // what an owner relies on, throu
     std::atomic<bool> pour{true}, stopped{false};   // before t: its callbacks use them until it stops
     std::atomic<int> late{0}, data{0}, closings{0};
     live::Transport t;
-    t.on_data = [&](std::uint32_t, const std::uint8_t*, std::size_t) {
+    t.on_data = [&](std::uint32_t, const std::uint8_t*, std::size_t, bool) {
         late.fetch_add(stopped.load() ? 1 : 0);
         data.fetch_add(1);
     };

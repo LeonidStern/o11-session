@@ -147,6 +147,7 @@ void Engine::connect(const std::string& host, std::uint16_t port, const std::str
     o.login_when_licence_refused = true;
     o.auto_subscribe = false;
     o.live = live_enabled_.load();
+    o.live_direct = true;                       // Live is all-to-all where the server has the paths (0x09)
     client_.setChannels(channelList());
     if (!client_.connect(host, port, o)) {
         std::lock_guard<std::mutex> lock(text_mutex_);

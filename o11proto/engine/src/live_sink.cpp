@@ -51,6 +51,7 @@ void SinkStats::clear(std::uint32_t g) {
     speed_moved_ns.store(0);
     speed_ppm.store(0);
     fell_back.store(false);
+    route.store(0);
     for (Event& e : events) e.mark.store(0);
     events_n.store(0);
     gen.store(g);
@@ -372,6 +373,8 @@ void LiveSink::reset() {
     if (!tail) fifo_n_ = fifo_at_ = 0;
     fill_ = fill_ref_ = -1;
     has_align_ = realign_ = false;
+    path_room_ = false;
+    path_ns_ = 0;
     stats.active.store(false);
 }
 
@@ -452,6 +455,8 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         fifo_n_ = fifo_at_ = 0;
         fill_ = fill_ref_ = -1;
         has_align_ = realign_ = false;          // a new stream finds its own delay
+        path_room_ = false;
+        path_ns_ = 0;
         stats.block.store(block_);
         stats.active.store(false);
         tail48_ = 0;
@@ -470,6 +475,9 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         return;
     case SinkItem::Reset:
         reset();
+        return;
+    case SinkItem::Path:
+        pathChanged(it.seq, it.len != 0, now_ns);
         return;
     case SinkItem::Data:
     case SinkItem::Xrun:
@@ -502,7 +510,9 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         // the other players (16.6): what comes too late for its turn goes,
         // the rest waits for its turn. Only a stream more than the capacity
         // ahead of it buffers afresh.
-        realign_ = has_align_ && seq - turn() <= room();
+        // Just after a path change the stream may come later for good:
+        // it buffers afresh at the new delay.
+        realign_ = has_align_ && seq - turn() <= room() && !(path_ns_ != 0 && now_ns - path_ns_ < kPathWindowNs);
         if (!realign_) event(now_ns, LiveEventKind::Rebuffer, seq);
         has_align_ = realign_;
         late48_ = 0;
@@ -545,6 +555,14 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
     has_align_ = realign_ = false;
     owed48_ = 0;                                 // buffering afresh gives the buffer in use
     take(seq, it, now_ns);
+}
+
+void LiveSink::pathChanged(int route, bool change, std::int64_t now_ns) {
+    stats.route.store(static_cast<std::uint8_t>(route), std::memory_order_relaxed);
+    event(now_ns, LiveEventKind::Route, route);
+    if (!change) return;
+    path_ns_ = now_ns;
+    path_room_ = true;
 }
 
 void LiveSink::conceal() {
@@ -864,6 +882,9 @@ bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
             if (speed < 0 && owed48_ > 0) owed48_ = std::max(0.0, owed48_ + speed * frames * 48000.0 / rate);
         }
         stats.fill_us.store(fill_ >= 0 ? static_cast<std::int32_t>(std::lround(fill_ * 1e6)) : -1);
+        // The room a path change gave lasts until what it brought fits.
+        if (path_room_ && now_ns - path_ns_ >= 1000000000LL && heldBlocks() < sizes_.capacity_blocks)
+            path_room_ = false;
     } else {
         stats.fill_us.store(-1);
     }

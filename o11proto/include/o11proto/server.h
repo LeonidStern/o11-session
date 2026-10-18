@@ -58,6 +58,13 @@ struct LiveConfig {
     int max_peers = 8;                         // senders per room, 1-64
     int announce_port = 0;                     // UDP port announced instead of the real one; 0 = the real one
     bool strict_address = true;                // UDP must come from the player's TCP address
+    // All-to-all (live_room.h): off, Live goes only directly between the
+    // players, and a pair without a direct path is "can't play Live"
+    // advice; on, the room goes through the relay for everyone once a pair
+    // has no direct path, until `!live direct`. A backend option, off by
+    // default; NINJAM_LIVE_RELAY_FALLBACK (1 or 0) overrides it when the
+    // UDP port opens.
+    bool relay_fallback = false;
     // Test hooks; the environment variables NINJAM_LIVE_FRESH_SECONDS and
     // NINJAM_LIVE_STATS_SECONDS (decimal seconds, above 0) override them
     // when the UDP port opens.
@@ -151,6 +158,10 @@ public:
         std::uint64_t from_live = 0, from_others = 0, relayed = 0, refused = 0;
     };
     IntervalTraffic intervalTraffic() const;
+    // The Live data datagrams the relay has copied to players since the
+    // start (all-to-all leaves it the pairs without a direct path). Safe to
+    // read from any thread.
+    std::uint64_t liveDataRelayed() const { return live_relayed_.load(); }
 
 private:
     struct Channel {
@@ -271,6 +282,7 @@ private:
     void liveClientMessage(Conn& c, const RawMessage& m);  // a type the server doesn't know otherwise
     bool liveRefusesUpload(TimePoint now);       // an upload beginning now isn't relayed: the room is Live
     std::atomic<std::uint64_t> iv_from_live_{0}, iv_from_others_{0}, iv_relayed_{0}, iv_refused_{0};
+    std::atomic<std::uint64_t> live_relayed_{0};
 };
 
 }  // namespace o11proto

@@ -65,6 +65,18 @@ std::string joinNames(const std::vector<std::string>& v) {
     return s;
 }
 
+// Why the room's Live goes through the relay, of the users named `a` and
+// `b`: as it is now, or since it was.
+std::string whyText(live::RelayWhy w, const std::string& a, const std::string& b, bool now) {
+    switch (w) {
+    case live::RelayWhy::NoPath: return a + " and " + b + (now ? " can't reach each other directly" : " had no direct path");
+    case live::RelayWhy::NoDirect: return a + "'s client doesn't send directly";
+    case live::RelayWhy::RelayOnly: return a + "'s client sends through the relay only";
+    case live::RelayWhy::None: break;
+    }
+    return "nothing";
+}
+
 // A number rounded as printf rounds it (ties to even).
 std::string rounded(double v) {
     char buf[32];
@@ -97,6 +109,13 @@ LiveConfig sanitize(LiveConfig c, const std::function<void(const std::string&)>&
     return c;
 }
 
+// A backend option: "1" on, "0" off, else `fallback`.
+bool envFlag(const char* name, bool fallback) {
+    const char* v = std::getenv(name);
+    if (!v || (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0)) return fallback;
+    return v[0] == '1';
+}
+
 // The test hooks: a decimal number of seconds above 0, else `fallback`.
 double envSeconds(const char* name, double fallback) {
     const char* v = std::getenv(name);
@@ -115,6 +134,11 @@ struct Server::Live {
         std::uint64_t key = 0;                 // 0: none (yet): not known to the relay
         std::uint32_t tcp_ip = 0;              // network order
         bool channels = false;                 // maxchan > 0; else a listener only
+        bool direct = false;                   // client_caps bit 17: sends to the others directly where it can
+        udp::Addr lan;                         // its LAN address (0x86), ip 0 for none
+        std::vector<std::uint8_t> last_paths;  // the last 0x09 sent
+        bool relay_only = false;               // its latest CLIENT_LIVE_PATHS (0x87): through the relay only
+        std::map<int, live::PathState> path_states;   // and its paths to the others, by peer id
         bool told = false;                     // has had a Live message
         std::vector<std::uint8_t> last;        // the last Live message sent
         // relay
@@ -141,6 +165,15 @@ struct Server::Live {
     socket_t fd = kInvalidSocket;
     std::uint16_t port = 0;
     std::uint8_t secret[16] = {};
+    std::uint8_t path_secret[16] = {};         // the pairs' keys (0x09)
+    bool paths_ok = false;                     // path_secret was drawn
+    // The room's route (live_room.h): Direct until a pair has no direct
+    // path, then Relay until `!live direct`; Direct again once the room has
+    // no Live player.
+    live::RoomRoute route = live::RoomRoute::Direct;
+    live::RelayWhy why = live::RelayWhy::None;
+    std::string why_a, why_b;                  // the user names it gives
+    bool possible_logged = false;              // "everyone can connect directly again" was logged
     bool random_warned = false;
     bool dirty = true;                         // the Live messages must be worked out again
     // By peer id, which is the connection id: ids count up as connections
@@ -165,6 +198,58 @@ struct Server::Live {
     bool open() const { return fd != kInvalidSocket; }
     bool roomOn() const { return allowed() && open() && room_on; }
     bool isSender(int id) const { return std::find(senders.begin(), senders.end(), id) != senders.end(); }
+    bool hasPaths() const { return allowed() && open() && paths_ok; }
+    // What the bound senders' paths say now: the first trouble that takes
+    // the room to the relay (a sender that can't send directly, or a pair
+    // either of whose two reports its path unreachable), and whether every
+    // pair's path is up as both of its players report it.
+    struct RouteCheck {
+        live::RelayWhy why = live::RelayWhy::None;
+        int a = 0, b = 0;
+        bool all_up = true;
+        std::map<int, int> no_path;            // each sender's pairs without a path
+    };
+    RouteCheck checkRoute() const {
+        RouteCheck r;
+        std::vector<int> in;                   // the bound senders that send directly
+        for (int id : senders) {
+            auto it = players.find(id);
+            if (it == players.end() || !it->second.bound) continue;
+            const Player& p = it->second;
+            const live::RelayWhy w = !p.direct ? live::RelayWhy::NoDirect
+                                     : p.relay_only ? live::RelayWhy::RelayOnly
+                                                    : live::RelayWhy::None;
+            if (w == live::RelayWhy::None) {
+                in.push_back(id);
+                continue;
+            }
+            r.all_up = false;
+            if (r.why == live::RelayWhy::None) {
+                r.why = w;
+                r.a = id;
+            }
+        }
+        auto state = [&](int of, int to) {
+            const auto& m = players.at(of).path_states;
+            auto it = m.find(to);
+            return it == m.end() ? live::PathState::Opening : it->second;
+        };
+        for (std::size_t i = 0; i < in.size(); ++i)
+            for (std::size_t j = i + 1; j < in.size(); ++j) {
+                const live::PathState x = state(in[i], in[j]), y = state(in[j], in[i]);
+                if (x == live::PathState::Up && y == live::PathState::Up) continue;
+                r.all_up = false;
+                if (x != live::PathState::Down && y != live::PathState::Down) continue;
+                ++r.no_path[in[i]];
+                ++r.no_path[in[j]];
+                if (r.why == live::RelayWhy::None) {
+                    r.why = live::RelayWhy::NoPath;
+                    r.a = in[i];
+                    r.b = in[j];
+                }
+            }
+        return r;
+    }
     Player* known(std::uint32_t id) {          // a player the relay takes datagrams from
         if (!allowed() || !open() || id == 0 || id > 0x7fffffffu) return nullptr;
         auto it = players.find(static_cast<int>(id));
@@ -181,8 +266,13 @@ struct Server::Live {
     void opened(socket_t s, std::uint16_t p) {
         fd = s;
         port = p;
-        for (auto& kv : players) kv.second.bound = kv.second.has_local = kv.second.buckets = false;
+        for (auto& kv : players) {
+            kv.second.bound = kv.second.has_local = kv.second.buckets = false;
+            kv.second.path_states.clear();     // new keys: every path opens again
+        }
+        paths_ok = live::systemRandom(path_secret, sizeof(path_secret));   // new keys for every pair
         cfg.fresh_seconds = envSeconds("NINJAM_LIVE_FRESH_SECONDS", cfg.fresh_seconds);
+        cfg.relay_fallback = envFlag("NINJAM_LIVE_RELAY_FALLBACK", cfg.relay_fallback);
         cfg.stats_seconds = envSeconds("NINJAM_LIVE_STATS_SECONDS", cfg.stats_seconds);
         stats_since = next_fresh_check = Clock::now();
         in = out = 0;
@@ -294,6 +384,7 @@ void Server::setLiveConfig(const LiveConfig& config) {
         }
     } else {
         L.cfg.fresh_seconds = envSeconds("NINJAM_LIVE_FRESH_SECONDS", L.cfg.fresh_seconds);
+        L.cfg.relay_fallback = envFlag("NINJAM_LIVE_RELAY_FALLBACK", L.cfg.relay_fallback);
         L.cfg.stats_seconds = envSeconds("NINJAM_LIVE_STATS_SECONDS", L.cfg.stats_seconds);
     }
     if (!L.room_chosen) L.room_on = L.cfg.mode == LiveMode::On;
@@ -348,6 +439,7 @@ void Server::liveJoined(Conn& c) {
     Live::Player p;
     udp::parseIPv4(c.addr, p.tcp_ip);
     p.channels = c.maxchan > 0;
+    p.direct = (c.caps & live::kCapLiveDirect) != 0;
     p.joined = Clock::now();
     live_->players[c.id] = std::move(p);
     live_->dirty = true;
@@ -465,13 +557,71 @@ void Server::liveSendMessages() {
         p.told = true;
         send(*c, live::kMsgServerLive, bytes);
     }
+
+    // 0x09: to each sender with bit 17, the other senders with bit 17,
+    // where their hellos come from and their LAN, and each pair's key.
+    // After 0x07, so that a client knows the ids first. Without Live (or
+    // when it stops sending) a client that had records gets none.
+    for (auto& kv : L.players) {
+        const int id = kv.first;
+        Live::Player& p = kv.second;
+        Conn* c = connById(id);
+        if (!c || !c->logged_in || p.key == 0 || !p.direct) continue;
+        live::LivePaths m;
+        const bool on = L.allowed() && L.open() && L.paths_ok;
+        if (on && L.isSender(id) && !p.relay_only) {
+            for (int sid : L.senders) {
+                if (sid == id) continue;
+                const Live::Player& q = L.players[sid];
+                if (!q.direct || q.relay_only || !connById(sid)) continue;   // through the relay
+                live::PathRecord r;
+                r.id = static_cast<std::uint32_t>(sid);
+                r.key = live::pairKey(L.path_secret, static_cast<std::uint32_t>(id), r.id);
+                if (q.bound) {
+                    r.public_ip = q.addr.ip;
+                    r.public_port = ntohs(q.addr.port);
+                }
+                r.lan_ip = q.lan.ip;
+                r.lan_port = ntohs(q.lan.port);
+                m.peers.push_back(r);
+            }
+        }
+        if (!on && p.last_paths.empty()) continue;   // never told: nothing to take back
+        std::vector<std::uint8_t> bytes = live::encode(m);
+        if (bytes == p.last_paths) continue;
+        p.last_paths = bytes;
+        send(*c, live::kMsgServerLivePaths, bytes);
+    }
 }
 
 // ------------------------------------------------- the room and the advice
 
 // A Live client's report (0x85); other types the server doesn't know are ignored.
 void Server::liveClientMessage(Conn& c, const RawMessage& m) {
-    if (!live_ || m.type != live::kMsgClientLiveReport) return;
+    if (!live_) return;
+    if (m.type == live::kMsgClientLiveLan) {   // its LAN address, for the others' 0x09
+        auto it = live_->players.find(c.id);
+        live::LiveLan lan;
+        if (it == live_->players.end() || !it->second.direct || !live::decode(m.payload, lan)) return;
+        udp::Addr a;
+        a.ip = lan.ip;
+        a.port = htons(lan.port);
+        if (a.ip == 0 || a.port == 0 || udp::isBroadcastOrMulticast(a.ip)) a = udp::Addr();
+        if (a.ip != it->second.lan.ip || a.port != it->second.lan.port) live_->dirty = true;
+        it->second.lan = a;
+        return;
+    }
+    if (m.type == live::kMsgClientLivePaths) {   // how its direct paths stand, for the room's route
+        auto it = live_->players.find(c.id);
+        live::PathsReport r;
+        if (it == live_->players.end() || !it->second.direct || !live::decode(m.payload, r)) return;
+        if (it->second.relay_only != r.relayOnly()) live_->dirty = true;   // the 0x09s: listed or not
+        it->second.relay_only = r.relayOnly();
+        it->second.path_states.clear();
+        for (const auto& e : r.peers) it->second.path_states[static_cast<int>(e.id)] = e.state;
+        return;
+    }
+    if (m.type != live::kMsgClientLiveReport) return;
     auto it = live_->players.find(c.id);
     live::LiveReport r;
     if (it == live_->players.end() || !live::decode(m.payload, r)) return;
@@ -488,6 +638,7 @@ void Server::liveClientMessage(Conn& c, const RawMessage& m) {
 void Server::liveRoomTick(TimePoint now) {
     Live& L = *live_;
     auto secs = [&](TimePoint t) { return std::chrono::duration<double>(t - L.epoch).count(); };
+    const Live::RouteCheck rc = L.hasPaths() ? L.checkRoute() : Live::RouteCheck();
     std::vector<live::RoomAdvice::Player> in;
     for (Conn* o : loggedIn()) {
         if (o->hidden()) continue;
@@ -507,6 +658,8 @@ void Server::liveRoomTick(TimePoint now) {
             r.report = p.report;
             r.was_clean = p.was_clean;
             r.joined = secs(p.joined);
+            auto np = rc.no_path.find(o->id);   // direct only: the pairs it can't play Live with
+            if (!L.cfg.relay_fallback && np != rc.no_path.end()) r.no_path = np->second;
         }
         in.push_back(r);
     }
@@ -535,6 +688,42 @@ void Server::liveRoomTick(TimePoint now) {
     m.advice = st.advice;
     m.user = L.advice_name;
     m.count = static_cast<std::uint16_t>(std::min(st.count, 0xffff));
+
+    // The route: to the relay for everyone once a pair has no direct path
+    // while the room is Live, and back only with `!live direct`.
+    if (L.players.empty() || !L.cfg.relay_fallback) {   // a new room starts direct; without the option it stays so
+        L.route = live::RoomRoute::Direct;
+        L.why = live::RelayWhy::None;
+        L.why_a.clear();
+        L.why_b.clear();
+    }
+    if (L.hasPaths()) {
+        m.relay_fallback = L.cfg.relay_fallback;
+        auto nameOf = [&](int id) {
+            Conn* o = id ? connById(id) : nullptr;
+            return o ? o->name : std::string();
+        };
+        if (L.cfg.relay_fallback && L.route == live::RoomRoute::Direct && L.roomOn() && rc.why != live::RelayWhy::None) {
+            L.route = live::RoomRoute::Relay;
+            L.why = rc.why;
+            L.why_a = nameOf(rc.a);
+            L.why_b = nameOf(rc.b);
+            L.possible_logged = false;
+            log("[live room] Live goes through the relay for everyone now: " +
+                whyText(rc.why, L.why_a, L.why_b, false));
+        }
+        m.route = L.route;
+        if (L.route == live::RoomRoute::Relay) {
+            m.why = L.why;
+            m.why_a = L.why_a;
+            m.why_b = L.why_b;
+            m.direct_possible = rc.why == live::RelayWhy::None && rc.all_up;
+            if (m.direct_possible != L.possible_logged) {
+                L.possible_logged = m.direct_possible;
+                if (m.direct_possible) log("[live room] advice: everyone can connect directly again");
+            }
+        }
+    }
     const std::vector<std::uint8_t> bytes = live::encode(m);
     for (auto& kv : L.players) {
         Live::Player& p = kv.second;
@@ -590,11 +779,19 @@ void Server::liveReadable() {
             drop(kWrongAddress);
             continue;
         }
-        // 6: the rate limit, charged once per datagram that gets this far
+        // 6: the rate limit, charged once per datagram that gets this far.
+        // A player that sends to each of the others on its own (bit 17, to
+        // those it can't reach directly) may send as many times the stream:
+        // the buckets are that many times larger, and a datagram to
+        // destination 0 costs that many, which leaves the copies the relay
+        // makes where they were.
         const TimePoint now = Clock::now();
         const double fps = 48000.0 / L.cfg.frame;
-        const double byte_rate = 2.0 * (L.cfg.kbps * 1000.0 / 8.0 + fps * 64.0) + 8000.0;
-        const double dgram_rate = 2.0 * fps + 50.0;
+        int others = static_cast<int>(L.senders.size()) - (L.isSender(static_cast<int>(sender)) ? 1 : 0);
+        const double scale = std::max(1, others);
+        const double cost = d[3] == live::kTypeData && dest == 0 ? scale : 1.0;
+        const double byte_rate = scale * (2.0 * (L.cfg.kbps * 1000.0 / 8.0 + fps * 64.0) + 8000.0);
+        const double dgram_rate = scale * (2.0 * fps + 50.0);
         if (!p->buckets) {
             p->buckets = true;
             p->bytes = byte_rate * 0.25;
@@ -605,12 +802,12 @@ void Server::liveReadable() {
             p->dgrams = std::min(dgram_rate * 0.25, p->dgrams + dt * dgram_rate);
         }
         p->refill = now;
-        if (p->bytes < static_cast<double>(n) || p->dgrams < 1.0) {
+        if (p->bytes < cost * static_cast<double>(n) || p->dgrams < cost) {
             drop(kOverRate);
             continue;
         }
-        p->bytes -= static_cast<double>(n);
-        p->dgrams -= 1.0;
+        p->bytes -= cost * static_cast<double>(n);
+        p->dgrams -= cost;
 
         // Sends from `src` when known; once more from where the routing
         // table chooses when that address is gone.
@@ -655,7 +852,7 @@ void Server::liveReadable() {
                 drop(kUnverified);
                 continue;
             }
-            if (!p->bound) L.dirty = true;
+            if (!p->bound || p->addr.ip != from.ip || p->addr.port != from.port) L.dirty = true;   // and 0x09
             p->bound = true;
             p->was_bound = true;
             p->addr = from;
@@ -685,8 +882,10 @@ void Server::liveReadable() {
         const std::size_t flen = n - (live::kClientHeader - live::kServerHeader);
         auto copyTo = [&](Live::Player& to) {
             bool gone;
+            const std::uint64_t out0 = L.out;
             sendFrom(fwd, flen, to.addr, to.local, to.has_local, gone);
             if (gone) to.has_local = false;     // until its next verified hello
+            if (L.out != out0) live_relayed_.fetch_add(1, std::memory_order_relaxed);
         };
         if (dest != 0) {
             Live::Player* to = dest != sender && L.isSender(static_cast<int>(dest)) ? L.known(dest) : nullptr;
@@ -717,8 +916,10 @@ bool Server::liveCommand(Conn& c, const std::string& text) {
     if (!live_) return false;
     Live& L = *live_;
     std::string arg = lowerCopy(trimBlanks(text.substr(a + 5)));
-    bool on = arg == "on", off = arg == "off";
-    if ((on || off) && !(c.privs & kPrivVote)) {
+    // `!live direct` only with the backend option relay_fallback, and it is
+    // shown nowhere.
+    bool on = arg == "on", off = arg == "off", direct = arg == "direct" && L.cfg.relay_fallback;
+    if ((on || off || direct) && !(c.privs & kPrivVote)) {
         sendServerMsg(c, "[server] you don't have permission to change the room's audio");
         return true;
     }
@@ -741,6 +942,33 @@ bool Server::liveCommand(Conn& c, const std::string& text) {
         Conn* o = connById(kv.first);
         if (o && kv.second.channels && !L.isSender(kv.first)) over.push_back(o->name);
     }
+    // `!live direct`: the room's route back to all-to-all, while no pair is
+    // known to have no direct path.
+    if (direct) {
+        if (!L.hasPaths() || L.route != live::RoomRoute::Relay) {
+            sendServerMsg(c, L.hasPaths() ? "[server] Live already goes directly between the players."
+                                          : "[server] Live goes through the server here.");
+            return true;
+        }
+        const Live::RouteCheck rc = L.checkRoute();
+        if (rc.why != live::RelayWhy::None) {
+            auto nameOf = [&](int id) {
+                Conn* o = id ? connById(id) : nullptr;
+                return o ? displayName(o) : std::string("someone");
+            };
+            sendServerMsg(c, "[server] Live stays on the server's relay: " + whyText(rc.why, nameOf(rc.a), nameOf(rc.b), true) +
+                                 ".");
+            return true;
+        }
+        L.route = live::RoomRoute::Direct;
+        L.why = live::RelayWhy::None;
+        L.why_a.clear();
+        L.why_b.clear();
+        L.possible_logged = false;
+        sendServerMsg(c, "[server] Live goes directly between the players again.");
+        log("[live room] " + c.name + " switched Live to direct");
+        return true;
+    }
     auto overText = [&](const char* tail) {
         return "Live has room for " + std::to_string(L.cfg.max_peers) + ", so " + joinNames(over) +
                (over.size() == 1 ? " isn't heard while it is on" : " aren't heard while it is on") + tail;
@@ -752,6 +980,12 @@ bool Server::liveCommand(Conn& c, const std::string& text) {
         s += senders.empty() ? "Nobody here can play Live yet. "
                              : "Players who can play Live: " + joinNames(senders) + ". ";
         if (!over.empty()) s += overText(". ");
+        if (L.hasPaths() && L.route == live::RoomRoute::Relay) {
+            const Live::RouteCheck rc = L.checkRoute();
+            s += "It goes through the server's relay";
+            if (L.why != live::RelayWhy::None) s += " since " + whyText(L.why, L.why_a, L.why_b, false);
+            s += rc.why == live::RelayWhy::None && rc.all_up ? ". Everyone can connect directly again. " : ". ";
+        }
         s += L.room_on ? "Turn it off with !live off" : "Turn it on with !live on";
         sendServerMsg(c, s);
         return true;

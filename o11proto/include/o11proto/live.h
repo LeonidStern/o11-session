@@ -19,6 +19,10 @@ namespace live {
 // ---------------------------------------------------------------- TCP side
 
 constexpr std::uint32_t kCapLive = 0x10000;        // client_caps bit 16
+// client_caps bit 17: the client sends Live directly to the other players
+// where it can (all-to-all, the paths of 0x09), through the relay where it
+// can't. Read with bit 16 only.
+constexpr std::uint32_t kCapLiveDirect = 0x20000;
 constexpr std::uint8_t kMsgServerLive = 0x07;      // SERVER_LIVE, server -> client
 constexpr std::uint8_t kServerLiveVersion = 1;
 constexpr std::size_t kServerLiveFixed = 32;       // fixed_len: where the peer list starts
@@ -39,6 +43,14 @@ constexpr std::uint8_t kMagic1 = 'L';
 constexpr std::uint8_t kUdpVersion = 1;
 constexpr std::uint8_t kTypeHello = 1;             // HELLO, HELLO_ACK
 constexpr std::uint8_t kTypeData = 2;
+// Between two players directly (the paths of 0x09): the client header with
+// the pair's key and the receiver's id as destination; data (type 2) as
+// to the relay, probes and their replies of kProbeSize bytes: u64 timestamp
+// at 20 (the prober's, echoed), u8 candidate at 28 (which of the
+// receiver's addresses it went to, echoed), 3 zero bytes.
+constexpr std::uint8_t kTypeProbe = 3;
+constexpr std::uint8_t kTypeProbeReply = 4;
+constexpr std::size_t kProbeSize = 32;
 constexpr std::size_t kClientHeader = 20;          // magic, version, type, sender_id, key, dest_id
 constexpr std::size_t kServerHeader = 8;           // magic, version, type, from_id
 constexpr std::size_t kHelloSize = 40;
@@ -64,6 +76,17 @@ constexpr int kCookieEpochSeconds = 30;
 constexpr int kMaxCopies = 64;                     // copies of one datagram
 constexpr int kRelaySocketBuffer = 1 << 20;        // 1 MiB
 constexpr int kClientSocketBuffer = 256 << 10;     // 256 KiB
+
+// The direct paths (all-to-all): a pair is up on a probe reply and
+// unreachable after kPathDeadMs without one; probes every kProbeFastMs
+// while it opens (the first kPathOpenMs) and while a path that was up
+// misses its replies (kPathSuspectMs since the last), else every
+// kProbeIntervalMs, which keeps the routers' mappings open.
+constexpr int kProbeIntervalMs = 2000;
+constexpr int kProbeFastMs = 250;
+constexpr int kPathOpenMs = 2000;
+constexpr int kPathSuspectMs = 3000;
+constexpr int kPathDeadMs = 10000;
 
 inline bool validFrame(int frame) { return frame == 120 || frame == 240 || frame == 480; }
 
@@ -99,6 +122,87 @@ std::vector<std::uint8_t> encode(const ServerLive& m);
 // list ends at the first record without 6 bytes left or without a NUL, and
 // after 256 records; records with id 0 or the receiver's own id are skipped.
 bool decode(const std::vector<std::uint8_t>& p, ServerLive& out);
+
+// ---------------------------------------------------------------- 0x09
+
+// SERVER_LIVE_PATHS, server -> client, to a client with bits 16 and 17
+// that may send: where the room's other senders with bit 17 can be reached
+// directly, and the key of each pair. Header: u8 version 1, u8 fixed_len 8,
+// u16 record size (24), 4 reserved bytes; then records: u32 peer id, u64
+// pair key, the public IPv4 (network order; the address its hellos come
+// from, 0 while it isn't bound) and u16 port, the LAN IPv4 and u16 port it
+// reported (0 for none). Ports little-endian, as on every other field.
+constexpr std::uint8_t kMsgServerLivePaths = 0x09;
+constexpr std::uint8_t kLivePathsVersion = 1;
+constexpr std::size_t kLivePathsFixed = 8;
+constexpr std::size_t kLivePathRecord = 24;
+
+struct PathRecord {
+    std::uint32_t id = 0;
+    std::uint64_t key = 0;                         // the pair's key: this receiver and `id`
+    std::uint32_t public_ip = 0;                   // network order, as udp::Addr
+    std::uint16_t public_port = 0;                 // host order
+    std::uint32_t lan_ip = 0;
+    std::uint16_t lan_port = 0;
+};
+struct LivePaths {
+    std::uint8_t version = kLivePathsVersion;
+    std::vector<PathRecord> peers;
+};
+std::vector<std::uint8_t> encode(const LivePaths& m);
+// False (ignore it) for a payload under 8 bytes, version 0, fixed_len below
+// 8 or beyond the payload, or a record size below 24. Records follow to the
+// end, at most 256; ones with id 0 or key 0 are skipped.
+bool decode(const std::vector<std::uint8_t>& p, LivePaths& out);
+
+// CLIENT_LIVE_LAN, client -> server, after the first 0x09 of each Live
+// client: its socket's LAN address, for the others on its network. u8
+// version 1, u8 0, u16 port, the IPv4 (network order; 0 for none).
+constexpr std::uint8_t kMsgClientLiveLan = 0x86;
+constexpr std::size_t kLiveLanSize = 8;
+struct LiveLan {
+    std::uint32_t ip = 0;                          // network order
+    std::uint16_t port = 0;                        // host order
+};
+std::vector<std::uint8_t> encode(const LiveLan& m);
+bool decode(const std::vector<std::uint8_t>& p, LiveLan& out);   // under 8 bytes or version 0: false
+
+// CLIENT_LIVE_PATHS, client -> server, from a client with bit 17 that has
+// had a 0x09, whenever it changes: how its direct path to each peer of its
+// latest 0x09 stands, for the room's route (live_room.h). u8 version 1, u8
+// flags (kPathsRelayOnly: it sends through the relay only, a test
+// setting), u16 count, then count records of 8 bytes: u32 peer id, u8
+// state (PathState), 3 zero bytes. At most kMaxPeerRecords records.
+constexpr std::uint8_t kMsgClientLivePaths = 0x87;
+constexpr std::uint8_t kLivePathsReportVersion = 1;
+constexpr std::size_t kLivePathsReportFixed = 4;
+constexpr std::size_t kLivePathsReportRecord = 8;
+constexpr std::uint8_t kPathsRelayOnly = 0x01;
+// Opening: no probe answered yet (within kPathDeadMs of its first address);
+// Up: answered within kPathDeadMs (also while suspect); Down: unreachable.
+enum class PathState : std::uint8_t { Opening = 0, Up = 1, Down = 2 };
+struct PathsReport {
+    std::uint8_t flags = 0;
+    struct Entry {
+        std::uint32_t id = 0;
+        PathState state = PathState::Opening;
+        bool operator==(const Entry& o) const { return id == o.id && state == o.state; }
+    };
+    std::vector<Entry> peers;
+    bool relayOnly() const { return (flags & kPathsRelayOnly) != 0; }
+    bool operator==(const PathsReport& o) const { return flags == o.flags && peers == o.peers; }
+    bool operator!=(const PathsReport& o) const { return !(*this == o); }
+};
+std::vector<std::uint8_t> encode(const PathsReport& m);
+// False (ignore it) under 4 bytes or with version 0. Records follow to the
+// count or the end, at most 256; a state above 2 reads as Opening, id 0 is
+// skipped.
+bool decode(const std::vector<std::uint8_t>& p, PathsReport& out);
+
+// The key of the pair a, b (in either order): SipHash-2-4 keyed with the
+// server's path secret over the smaller id and the larger (u32 LE each),
+// never 0. Only the two players and the server know it.
+std::uint64_t pairKey(const std::uint8_t secret[16], std::uint32_t a, std::uint32_t b);
 
 // ---------------------------------------------------------------- cookie
 

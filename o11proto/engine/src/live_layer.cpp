@@ -29,6 +29,24 @@ std::int32_t nextId(std::uint32_t& x) {
     return static_cast<std::int32_t>(x);
 }
 
+// A stream's blocks come by another path once this many in a row did.
+constexpr int kPathRun = 4;
+
+std::vector<o11proto::live::Transport::PathPeer> pathPeers(const o11proto::live::LivePaths& m) {
+    std::vector<o11proto::live::Transport::PathPeer> v;
+    for (const auto& r : m.peers) {
+        o11proto::live::Transport::PathPeer p;
+        p.id = r.id;
+        p.key = r.key;
+        p.public_ip = r.public_ip;
+        p.public_port = r.public_port;
+        p.lan_ip = r.lan_ip;
+        p.lan_port = r.lan_port;
+        v.push_back(p);
+    }
+    return v;
+}
+
 }  // namespace
 
 // --------------------------------------------------------------- helpers
@@ -98,7 +116,9 @@ LiveLayer::LiveLayer() {
     }
     src_.next_stream = seed[0] & 0x7fffffffu;
     src_.next_format = seed[1] & 0x7fffffffu;
-    transport_.on_data = [this](std::uint32_t from, const std::uint8_t* p, std::size_t n) { onData(from, p, n); };
+    transport_.on_data = [this](std::uint32_t from, const std::uint8_t* p, std::size_t n, bool direct) {
+        onData(from, p, n, direct);
+    };
     transport_.on_tick = [this] { onTick(); };
     transport_.on_closing = [this] { onClosing(); };
 }
@@ -141,6 +161,8 @@ bool LiveLayer::start(const std::string& a, std::uint16_t p, std::string& error)
     id = msg.peer_id;
     key = msg.key;
     if (!transport_.start(o, error)) return false;
+    if (has_paths) transport_.setPaths(pathPeers(paths));   // the new socket's paths open afresh
+    lan_sent = false;                           // and its LAN address goes to the server
     running.store(true);
     return true;
 }
@@ -177,6 +199,10 @@ void LiveLayer::forget() {
     start_failed_said = no_answer_said = offer_said = false;
     started_at = retry_at = TimePoint{};
     buffer_changed = false;
+    has_paths = lan_sent = false;
+    paths = o11proto::live::LivePaths();
+    paths_sent.clear();
+    transport_.setRoomRoute(true, false);       // until the new room's message says
     std::lock_guard<std::mutex> lock(net_mutex);
     peers.clear();
     net_room_on = false;
@@ -271,7 +297,48 @@ void LiveLayer::apply(const o11proto::live::ServerLive& m) {
         for (const auto& p : peers)
             if (p.id == net[s].peer) slot_name[s] = p.name;
     }
+    applyBlocked();                             // the test hook's names, as ids
     transport_.wake();                          // its /starts and /stops go out at once
+}
+
+void LiveLayer::applyPaths(const o11proto::live::LivePaths& m) {
+    paths = m;
+    has_paths = true;
+    if (transport_.running()) transport_.setPaths(pathPeers(m));
+}
+
+bool LiveLayer::pathsReport(std::vector<std::uint8_t>* bytes) {
+    if (!has_paths || !running.load()) return false;
+    o11proto::live::PathsReport r;
+    r.flags = force_relay.load() ? o11proto::live::kPathsRelayOnly : 0;
+    r.peers = transport_.pathStates();
+    std::vector<std::uint8_t> b = o11proto::live::encode(r);
+    if (b == paths_sent) return false;
+    paths_sent = b;
+    *bytes = std::move(b);
+    return true;
+}
+
+std::uint32_t LiveLayer::peerId(const std::string& name) {
+    std::lock_guard<std::mutex> lock(net_mutex);
+    for (const auto& p : peers)
+        if (p.name == name) return p.id;
+    return 0;
+}
+
+void LiveLayer::setTestBlocked(const std::string& name, bool on) {
+    std::lock_guard<std::mutex> lock(net_mutex);
+    auto it = std::find(blocked_names_.begin(), blocked_names_.end(), name);
+    if (on && it == blocked_names_.end()) blocked_names_.push_back(name);
+    if (!on && it != blocked_names_.end()) blocked_names_.erase(it);
+    applyBlocked();
+}
+
+void LiveLayer::applyBlocked() {
+    std::vector<std::uint32_t> ids;
+    for (const auto& p : peers)
+        if (std::find(blocked_names_.begin(), blocked_names_.end(), p.name) != blocked_names_.end()) ids.push_back(p.id);
+    transport_.setTestBlocked(ids);
 }
 
 int LiveLayer::slotOf(const std::string& name) const {
@@ -379,6 +446,13 @@ o11proto::live::LiveReport LiveLayer::report(TimePoint now) {
 void LiveLayer::applyRoom(const o11proto::live::LiveRoom& m, TimePoint now) {
     room = m;
     has_room = true;
+    // The room's route, at once (a listener takes either way): directly
+    // where each pair's path is up, and only there; with the server's relay
+    // fallback, through the relay to the others, or for everyone while the
+    // room is on the relay. A server without the paths sends no route.
+    using o11proto::live::RoomRoute;
+    transport_.setRoomRoute(m.route == RoomRoute::None || m.relay_fallback, m.route == RoomRoute::Relay);
+    transport_.wake();
     room_due_ns.store(steadyNs(now) + 500000000LL);
     room_announce.store(((++room_seq) << 1) | (m.live ? 1u : 0u), std::memory_order_release);
 }
@@ -405,12 +479,12 @@ void LiveLayer::pushItem(int s, SinkItem::Kind kind, std::int32_t seq, const std
     it->seq = seq;
     it->len = static_cast<std::uint16_t>(len);
     it->block = static_cast<std::uint16_t>(block);
-    if (len) std::memcpy(it->data, data, len);
+    if (len && data) std::memcpy(it->data, data, len);   // a Path item's len is a flag
     queue[s]->push();
 }
 
 // 6.3, the receive filter.
-void LiveLayer::onData(std::uint32_t from, const std::uint8_t* p, std::size_t n) {
+void LiveLayer::onData(std::uint32_t from, const std::uint8_t* p, std::size_t n, bool direct) {
     std::lock_guard<std::mutex> lock(net_mutex);
     if (!net_room_on || n == 0 || n > aoo::kMaxMessage) return;
     const TimePoint now = Clock::now();
@@ -420,7 +494,7 @@ void LiveLayer::onData(std::uint32_t from, const std::uint8_t* p, std::size_t n)
     if (p[0] & 0x80) {                          // binary: /data and the resend request only
         if (n < 4 || p[1] != 0 || p[2] != aoo::kId || p[3] != aoo::kId) return;
         if (p[0] == aoo::kTypeSink) {
-            if (slot >= 0 && host) sinkData(slot, p, n, now);
+            if (slot >= 0 && host) sinkData(slot, p, n, now, direct);
         } else if (p[0] == aoo::kTypeSource) {
             if (peer) sourceRequest(*peer, p, n, now);
         }
@@ -435,7 +509,7 @@ void LiveLayer::onData(std::uint32_t from, const std::uint8_t* p, std::size_t n)
     }
 }
 
-void LiveLayer::sinkData(int s, const std::uint8_t* p, std::size_t n, TimePoint now) {
+void LiveLayer::sinkData(int s, const std::uint8_t* p, std::size_t n, TimePoint now, bool direct) {
     aoo::Block b;
     if (!aoo::parseData(p, n, b)) return;
     NetSlot& ns = net[s];
@@ -452,6 +526,15 @@ void LiveLayer::sinkData(int s, const std::uint8_t* p, std::size_t n, TimePoint 
     if (!ns.got_data) {                         // the first ping goes with the first block
         ns.got_data = true;
         ns.last_ping = TimePoint{};
+    }
+    // The path the blocks come by: the stream's first, then a change once
+    // kPathRun in a row came by the other (a suspect path sends both ways).
+    const int path = direct ? 1 : 2;
+    ns.path_run = path == ns.path_seen ? ns.path_run + 1 : 1;
+    ns.path_seen = path;
+    if (ns.path == 0 || (ns.path != path && ns.path_run >= kPathRun)) {
+        pushItem(s, SinkItem::Path, path, nullptr, ns.path != 0 ? 1 : 0, ns.block);
+        ns.path = path;
     }
     pushItem(s, b.xrun ? SinkItem::Xrun : SinkItem::Data, b.seq, b.data, b.xrun ? 0 : b.len, ns.block);
 }
@@ -685,7 +768,7 @@ void LiveLayer::drainCapture(TimePoint now) {
                     h.seq = src_.seq;
                     h.when = now;
                     h.len = static_cast<std::uint16_t>(aoo::writeXrun(h.bytes, src_.stream, src_.seq));
-                    send(0, h.bytes, h.len);
+                    sendAudio(h.bytes, h.len);
                     src_.seq = src_.seq >= aoo::kMaxSequence ? 0 : src_.seq + 1;
                     src_.sent48 += src_.frame;
                 }
@@ -767,9 +850,31 @@ void LiveLayer::encodeAndSend(TimePoint now) {
     h.when = now;
     h.len = static_cast<std::uint16_t>(aoo::writeData(h.bytes, src_.stream, src_.seq, 48000.0, pkt,
                                                       static_cast<std::size_t>(n)));
-    send(0, h.bytes, h.len);                    // once, to the room (5.8)
+    sendAudio(h.bytes, h.len);
     src_.seq = src_.seq >= aoo::kMaxSequence ? 0 : src_.seq + 1;
     src_.sent48 += src_.frame;
+}
+
+// All-to-all: a block once to each listed peer, directly where the pair's
+// path is up, through the relay to a peer without a path (its
+// destination, while bound), and not at all to one whose path isn't up in
+// a room that is direct only. When everything would go through the relay,
+// once to the room (5.8): one datagram, and an older server does the same.
+void LiveLayer::sendAudio(const std::uint8_t* p, std::size_t n) {
+    using Route = o11proto::live::Transport::Route;
+    bool any = false;
+    for (const auto& q : peers) {
+        const Route r = transport_.route(q.id);
+        any = any || r == Route::Direct || r == Route::Off;
+    }
+    if (!any) {
+        send(0, p, n);
+        return;
+    }
+    for (const auto& q : peers) {
+        const Route r = transport_.route(q.id);
+        if (r == Route::Direct || (r == Route::Relay && q.bound)) send(q.id, p, n);
+    }
 }
 
 // ======================================================== audio context

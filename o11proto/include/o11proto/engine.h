@@ -55,6 +55,29 @@ inline void panGains(float pan, float* left, float* right) {
     *right = pan < 0 ? 1.0f + pan : 1.0f;
 }
 
+// How Live's audio goes (all-to-all, Engine::liveRoomRoute(), and a
+// stream's LiveCounters::route): directly between the players, or through
+// the server's relay; None without Live, or with a server without the
+// direct paths.
+enum class LiveRoute : std::uint8_t { None = 0, Direct = 1, Relay = 2 };
+const char* liveRouteName(LiveRoute route);       // "none", "direct", "relay"
+// Why the room's Live goes through the relay (o11proto/live_room.h).
+enum class LiveRelayReason : std::uint8_t {
+    None = 0,
+    NoPath,                                      // the pair user_a, user_b had no direct path
+    NoDirectClient,                              // user_a's client doesn't send directly
+    RelayOnly,                                   // user_a's client sends through the relay only (its test setting)
+};
+struct LiveRoomRoute {
+    LiveRoute route = LiveRoute::None;
+    LiveRelayReason reason = LiveRelayReason::None;   // while Relay
+    std::string user_a, user_b;                  // the users the reason names ("" for none)
+    // While Relay: every pair of the room's Live players has a direct path
+    // again, so `!live direct` (Engine::setLiveRoomDirect()) would take the
+    // room back to all-to-all. Advice, as the trouble advice is.
+    bool direct_possible = false;
+};
+
 // Live, per user, for a UI or a log (Engine::liveUserCounters(),
 // Engine::liveUserEvents()): what the user's stream did here since the
 // user's Live slot got its stream. Blocks are the stream's frames (5 ms at
@@ -84,6 +107,7 @@ struct LiveCounters {
     // fell back to the larger automatic one (Engine::setLiveBufferMs()).
     int buffer_ms = -1;
     bool fell_back = false;
+    LiveRoute route = LiveRoute::None;           // the path the stream's blocks come by now (None before one)
 };
 enum class LiveEventKind : std::uint8_t {
     None = 0,
@@ -102,6 +126,7 @@ enum class LiveEventKind : std::uint8_t {
     SpeedOff,                                    // and has been back for 1 s (value: the furthest it went, ppm)
     End,                                         // the stream ended or went
     Fallback,                                    // the automatic buffer fell back (value: the buffer now, ms)
+    Route,                                       // the blocks come by this path now (value: a LiveRoute; first with the stream)
 };
 const char* liveEventName(LiveEventKind kind);   // "late", "lost", ...
 struct LiveEvent {
@@ -306,6 +331,37 @@ public:
     // back until the user's stream starts again). Any context.
     int liveUserBufferInUseMs(int user) const;
     bool liveUserBufferFellBack(int user) const;
+    // All-to-all (16.x), the room's route, from the latest room message
+    // (control context). Direct: every player sends to each other player
+    // directly, and only directly; a pair whose path doesn't hold (the
+    // probe rule: no answer for 10 s) can't hear each other, and the
+    // server's advice names one of them as can't play Live. A player who
+    // can't send directly (an older client, or setLiveTestForceRelay()) is
+    // heard and hears through the relay. None with a server without the
+    // paths.
+    // With the server's backend option LiveConfig::relay_fallback, the room
+    // goes Relay instead, everyone through the relay, once a pair has no
+    // direct path or a player can't send directly, and stays so until
+    // setLiveRoomDirect() (it sends `!live direct`, shown nowhere), which
+    // the server takes while no pair is known to have no path;
+    // direct_possible advises it. A room with no Live player starts Direct.
+    LiveRoomRoute liveRoomRoute() const;
+    std::string liveRoomRouteText() const;      // one line for a log: "direct", "relay: alice and bob ..."
+    void setLiveRoomDirect();
+    // Per user (any context): whether the direct path to this user holds
+    // now (a probe answered within 10 s), and the latest answered probe's
+    // round trip on it, ms (-1 for none).
+    bool liveUserHasDirectPath(int user) const;
+    double liveUserProbeRttMs(int user) const;
+    // Test hooks, any context. setLiveTestForceRelay() (for benchmarks):
+    // this engine sends and takes Live through the relay only and tells the
+    // server so (its CLIENT_LIVE_PATHS): the others then reach it through
+    // the relay too (with relay_fallback, the room goes to the relay).
+    // Nothing else on the wire says so. setLiveTestBlockPeer(): nothing goes directly
+    // between this engine and the user of this name, as on a network that
+    // stops letting it through: the probe rule finds it.
+    void setLiveTestForceRelay(bool on);
+    void setLiveTestBlockPeer(const std::string& name, bool blocked);
     void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
     void setLiveTestSendGap(int ms);            // test hook: the Live data sent in the next `ms` is lost
     void setLiveTestSendHold(int ms);           // test hook: ... is held back, then sent all at once

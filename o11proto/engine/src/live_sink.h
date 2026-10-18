@@ -49,7 +49,9 @@ private:
 
 // Network thread -> audio context, one queue per slot.
 struct SinkItem {
-    enum Kind : std::uint8_t { Start, Data, Xrun, Stop, Reset };
+    // Path: the stream's blocks come by another path now (seq: 1 directly,
+    // 2 through the relay; len 1 for a change, 0 for the stream's first).
+    enum Kind : std::uint8_t { Start, Data, Xrun, Stop, Reset, Path };
     Kind kind = Data;
     std::uint32_t gen = 0;                      // the slot's generation it belongs to
     std::int32_t seq = 0;                       // Start: the start sequence
@@ -103,6 +105,7 @@ struct SinkStats {
     // fell back to the larger one (the automatic buffer, 6.8).
     std::atomic<std::int32_t> buffer_ms{0};
     std::atomic<bool> fell_back{false};
+    std::atomic<std::uint8_t> route{0};         // the path its blocks come by: 0 none yet, 1 directly, 2 the relay
     // The latest events, a ring that `events_n` counts. Each entry is
     // marked with its number + 1, 0 while it is written: a reader takes an
     // entry whose mark is the same before and after it read it (readEvent()).
@@ -316,10 +319,21 @@ private:
     int behindBlocks() const { return (behind48_ + block_ / 2) / block_; }
     // How many blocks from next_ it may hold: the capacity, and what came
     // while the host was behind.
+    // And after a path change (all-to-all), what a shorter path brings
+    // early, until the speed has played the fill back into the capacity.
     std::int64_t room() const {
-        const int extra = behind48_ > 0 ? (behind48_ + block_ - 1) / block_ + 1 : 0;
+        int extra = behind48_ > 0 ? (behind48_ + block_ - 1) / block_ + 1 : 0;
+        if (path_room_) extra += (kPathRoom48 + block_ - 1) / block_;
         return std::min(kRing - 2, sizes_.capacity_blocks + extra);
     }
+    // A path change (SinkItem::Path): a shorter path brings the blocks
+    // early, which the room above takes and the speed then plays back to
+    // the fill it keeps; a longer one brings them late, and a stream that
+    // runs dry within kPathWindowNs of the change buffers afresh at the new
+    // path's delay, instead of dropping the late blocks to keep the old one.
+    static constexpr int kPathRoom48 = 4800;    // 100 ms
+    static constexpr std::int64_t kPathWindowNs = 2000000000LL;
+    void pathChanged(int route, bool change, std::int64_t now_ns);
     void decodeNext(std::int64_t now_ns);       // one block into the 48 kHz queue
     void conceal();
     // Concealment heard in place of the stream's audio: a new concealment
@@ -395,6 +409,8 @@ private:
     double fill_ref_ = -1;
     double fill_age_ = 0;                       // seconds of this estimate
     int behind48_ = 0;                          // hostBehind()
+    bool path_room_ = false;                    // room() for a path change
+    std::int64_t path_ns_ = 0;                  // when the path last changed, 0 for never
     std::int64_t last_ns_ = 0;                  // the steady clock at the last apply() or render()
     bool speed_on_ = false;                     // the speed is off the clock's own
     double speed_peak_ = 0;                     // the furthest it went this time (a ratio - 1)
