@@ -345,8 +345,11 @@ Live mixer to `mixLive()`, which plays both its paths.
   intervals: the advice names it) deviations.
 - **All to all** (PROTOCOL.md 15.10): the source sends to each peer
   directly where the pair's path is up, through the relay to a peer without
-  paths, and not at all where the room is direct only and the path isn't up;
-  once to destination 0 when no peer would get it directly.
+  paths, and not at all where the room is direct only and the path isn't up
+  (but for make before break: a peer the relay has carried the stream to
+  for 1 s or more keeps getting it that way while its new path opens,
+  ENGINE.md 16.5); once to destination 0 when no peer would get it
+  directly.
 - **The automatic jitter buffer** (Live 6.8, whose setting defaults to 20
   ms): each stream starts at 10 ms and falls back to 20 ms at its second late
   dropout within 10 s, for the stream's life; a fixed setting (`/live buffer
