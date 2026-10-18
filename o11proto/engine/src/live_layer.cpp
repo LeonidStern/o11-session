@@ -788,11 +788,11 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
     host_block.store(longest_);
     // Host gaps (6.9), reported at the first block that doesn't arrive early.
     const std::int64_t dur = static_cast<std::int64_t>(frames) * 1000000000LL / rate;
+    const bool early = prev_dur_ns_ > 0 && now - prev_start_ns_ < prev_dur_ns_ * 9 / 10;
     int gap = 0;
     if (expect_ns_ != 0) {
         const std::int64_t threshold =
             std::max<std::int64_t>(20000000LL, 2LL * longest_ * 1000000000LL / rate);
-        const bool early = prev_dur_ns_ > 0 && now - prev_start_ns_ < prev_dur_ns_ * 9 / 10;
         if (!early) {
             const std::int64_t late = now - expect_ns_;
             if (late > threshold && late_pending_) {
@@ -809,6 +809,31 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
     } else {
         expect_ns_ = now;
     }
+    // How far this block is behind the host's schedule. A host whose
+    // blocks stall and then come back to back to catch up plays the stream
+    // time it missed late: until it has caught up, each sink holds the
+    // stream that arrived meanwhile, which is no later for that (LiveSink::
+    // hostBehind()). The schedule holds from a late block through the
+    // early ones after it; a block on time, or a second late one that isn't
+    // early (the host didn't catch up: a host gap, or a hiccup under the
+    // threshold), takes it up afresh from now.
+    std::int64_t behind = 0;
+    if (sched_ns_ != 0) {
+        sched_ns_ += prev_dur_ns_;
+        behind = now - sched_ns_;
+        const std::int64_t tolerance = std::max<std::int64_t>(1000000LL, prev_dur_ns_ / 2);
+        if (behind > tolerance && gap == 0 && (early || !sched_late_)) {
+            sched_late_ = true;
+            behind = std::min<std::int64_t>(behind, 1000000000LL);
+        } else {
+            sched_ns_ = now;
+            sched_late_ = false;
+            behind = 0;
+        }
+    } else {
+        sched_ns_ = now;
+    }
+    const int behind48 = static_cast<int>(behind * 48000 / 1000000000LL);
     prev_start_ns_ = now;
     prev_dur_ns_ = dur;
     expect_ns_ += dur;
@@ -864,6 +889,10 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
             k.stats.clear(g);
             audio_gen_[s] = g;
         }
+        // A host gap first: what came while the host was away is skipped,
+        // which leaves room for what came since.
+        if (gap > 0) k.hostGap(gap, rate);
+        k.hostBehind(behind48);
         for (int i = 0; i < 256; ++i) {
             SinkItem* it = queue[s]->front();
             if (!it) break;
@@ -871,7 +900,6 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
             queue[s]->pop();
         }
         k.configure(latency, longest_, rate);
-        if (gap > 0) k.hostGap(gap, rate);
         avail_[s] = false;
         quiet0_[s] = std::min(quiet_run_[s], 1 << 29);
         first_real_[s] = -1;

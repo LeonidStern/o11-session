@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #include "o11proto/connection.h"
 #include "o11proto/realtime.h"
@@ -26,6 +27,8 @@ struct Transport::Impl {
     std::atomic<double> loss{0};                   // the test hook
     std::uint32_t rng = 0x9e3779b9u;              // and its generator
     std::atomic<std::int64_t> gap_until_ns{0};     // the send gap's end (steady clock)
+    std::atomic<std::int64_t> hold_until_ns{0};    // the send hold's end, and what it holds (network thread)
+    std::vector<std::vector<std::uint8_t>> held;
     // wake(): a non-blocking pipe, open for the transport's life (the audio
     // thread may write while the network thread stops), and a flag so that
     // it is written once until the network thread has woken.
@@ -108,6 +111,10 @@ void Transport::setTestSendGap(int ms) {
     const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
     impl_->gap_until_ns.store(now + static_cast<std::int64_t>(ms) * 1000000);
 }
+void Transport::setTestSendHold(int ms) {
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+    impl_->hold_until_ns.store(now + static_cast<std::int64_t>(ms) * 1000000);
+}
 
 bool Transport::start(const Options& o, std::string& error) {
     stop();
@@ -180,9 +187,19 @@ bool Transport::send(std::uint32_t dest, const std::uint8_t* payload, std::size_
     putLE32(d + 16, dest);
     std::memcpy(d + kClientHeader, payload, len);
     const std::int64_t gap = m.gap_until_ns.load(std::memory_order_relaxed);
-    if (gap != 0 &&
-        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count() < gap)
-        return true;                           // the test's gap
+    const std::int64_t hold = m.hold_until_ns.load(std::memory_order_relaxed);
+    if (gap != 0 || hold != 0) {
+        const std::int64_t now =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+        if (now < gap) return true;            // the test's gap
+        if (now < hold) {                      // the test's hold
+            if (m.held.size() < 1024) m.held.emplace_back(d, d + kClientHeader + len);
+            return true;
+        }
+        for (const auto& h : m.held)
+            if (compat::send(m.fd, h.data(), h.size(), 0) >= 0) sent_.fetch_add(1);
+        m.held.clear();
+    }
     if (compat::send(m.fd, d, kClientHeader + len, 0) < 0) return false;
     sent_.fetch_add(1);
     return true;

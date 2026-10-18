@@ -66,6 +66,10 @@ public:
     // `ms` milliseconds are dropped (send() still returns true), as a gap
     // on the way to the relay would. Hellos still go out.
     void setTestSendGap(int ms);
+    // Test hook, any thread: the data datagrams send() is given in the next
+    // `ms` milliseconds are held back, then sent all at once, in order, with
+    // the first one after that time: a link that queues through an outage.
+    void setTestSendHold(int ms);
     // Any thread, the audio thread too (it doesn't block: one write to a
     // pipe at most, until the network thread has woken): runs a pass soon,
     // for what was just queued for on_tick. Does nothing on Windows, whose

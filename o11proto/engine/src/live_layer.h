@@ -102,6 +102,7 @@ struct LiveLayer {
         transport_.setTestReceiveLoss(f);
     }
     void setTestSendGap(int ms) { transport_.setTestSendGap(ms); }
+    void setTestSendHold(int ms) { transport_.setTestSendHold(ms); }
     live::Transport::Timing networkTiming() const { return transport_.timing(); }
 
     o11proto::live::ServerLive msg;
@@ -286,6 +287,10 @@ private:
     bool gate_open_ = false;
     std::int64_t expect_ns_ = 0, prev_start_ns_ = 0, prev_dur_ns_ = 0;
     bool late_pending_ = false;
+    // The host's schedule: when this block is due on it, held through a
+    // late block and the blocks that catch up on it (audioBlock()).
+    std::int64_t sched_ns_ = 0;
+    bool sched_late_ = false;
     int longest_ = 0;
     std::int64_t longest_seen_ns_ = 0;
 

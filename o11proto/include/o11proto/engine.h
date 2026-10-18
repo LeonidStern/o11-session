@@ -218,8 +218,18 @@ public:
     bool liveServerHas() const;
     bool liveRoomSwitchOn() const;
     int liveHeardMs() const;
+    // For a UI or a log, per user: how full the jitter buffer of this
+    // user's Live stream is now (its fill smoothed over 0.5 s, which its
+    // speed keeps at the level buffering gave), and how late this listener
+    // hears the user now (the one-way estimate of 6.10 with that fill in
+    // place of what the buffer held when playback started), in ms; -1
+    // while the user's stream isn't playing here (or, for the second,
+    // without a round trip yet).
+    double liveUserBufferMs(int user) const;
+    double liveUserHeardMs(int user) const;
     void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
     void setLiveTestSendGap(int ms);            // test hook: the Live data sent in the next `ms` is lost
+    void setLiveTestSendHold(int ms);           // test hook: ... is held back, then sent all at once
     // Test hook: the frame (counted from this engine's first process()
     // block) where this user's live audio last went into concealment, -1
     // for never.

@@ -123,6 +123,8 @@ void Engine::setLiveTestLoss(double fraction) { live_->setTestLoss(fraction); }
 
 void Engine::setLiveTestSendGap(int ms) { live_->setTestSendGap(ms); }
 
+void Engine::setLiveTestSendHold(int ms) { live_->setTestSendHold(ms); }
+
 std::string Engine::liveTestTiming() const {
     const live::Transport::Timing t = live_->networkTiming();
     char b[256];
@@ -213,6 +215,38 @@ double Engine::liveOneWayMs(int slot, double* buffer_ms, double* network_ms, dou
     if (codec_ms) *codec_ms = codec;
     if (rtt < 0) return -1;
     return network + codec + buffer + 64.0 / h * 1000.0;
+}
+
+double Engine::liveUserBufferMs(int user) const {
+    int slot = -1;
+    std::uint32_t g = 0;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u || u->live_want < 0) return -1;
+        slot = u->live_want;
+        g = u->live_want_gen;
+    }
+    const LiveLayer& L = *live_;
+    const SinkStats& st = L.sinks[slot]->stats;
+    if (L.gen[slot].load() != g || st.gen.load() != g || !st.active.load()) return -1;
+    const std::int32_t us = st.fill_us.load();
+    return us < 0 ? -1 : us / 1000.0;
+}
+
+double Engine::liveUserHeardMs(int user) const {
+    const double fill = liveUserBufferMs(user);
+    if (fill < 0) return -1;
+    int slot = -1;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u || u->live_want < 0) return -1;
+        slot = u->live_want;
+    }
+    double buffer = 0;
+    const double oneway = liveOneWayMs(slot, &buffer, nullptr, nullptr);
+    return oneway < 0 ? -1 : oneway - buffer + fill;
 }
 
 void Engine::liveControl() {
