@@ -9,6 +9,7 @@
 #include <random>
 #include <sstream>
 
+#include "o11proto/live.h"
 #include "o11proto/sha1.h"
 #include "socket_compat.h"
 
@@ -782,6 +783,12 @@ void Server::handleUploadBegin(Conn& c, const std::vector<std::uint8_t>& p) {
     std::vector<std::uint8_t> silent = encode(silence);
 
     bool is_silence = guidIsZero(ub.guid);
+    // A Live room has no interval audio (a silent interval still goes: it
+    // tells the others none is due).
+    if (!is_silence && ub.fourcc != 0 && liveRefusesUpload(Clock::now())) {
+        iv_refused_.fetch_add(1);
+        return;
+    }
     std::uint32_t need = codecCapForFourcc(ub.fourcc);
     bool relayed = need == 0 || (cfg_.allow_codecs & need) != 0;
     std::string key = lower(c.name);
@@ -823,13 +830,17 @@ void Server::handleUploadBegin(Conn& c, const std::vector<std::uint8_t>& p) {
 void Server::handleUploadWrite(Conn& c, const std::vector<std::uint8_t>& p) {
     IntervalWrite w;
     if (!decode(p, w)) return;
+    ((c.caps & live::kCapLive) ? iv_from_live_ : iv_from_others_).fetch_add(p.size());
     auto it = transfers_.find(w.guid);
     if (it == transfers_.end()) return;
     if (it->second.uploader != c.id) return;    // only the uploader may write
     it->second.last = Clock::now();
     for (int id : it->second.receivers) {
         Conn* o = connById(id);
-        if (o && o->logged_in) send(*o, kMsgDownloadWrite, p);   // payload forwarded untouched
+        if (o && o->logged_in) {
+            send(*o, kMsgDownloadWrite, p);     // payload forwarded untouched
+            iv_relayed_.fetch_add(p.size());
+        }
     }
     if (w.last()) transfers_.erase(it);
 }

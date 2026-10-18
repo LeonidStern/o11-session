@@ -32,6 +32,7 @@ constexpr int kPrebufferBytes = 8192;
 constexpr int kFirstWriteThreshold = 8192;
 constexpr int kLaterWriteThreshold = 2048;
 constexpr int kCrossfadeFrames = 128;
+constexpr double kLiveResumeFadeSeconds = 0.02;   // the first interval uploaded after the room left Live fades in
 constexpr int kDropoutSlackFrames = 64;          // late data this close to the interval's end is no dropout (8.7)
 
 // Settings of a local channel (ENGINE.md 5.1).
@@ -190,14 +191,23 @@ public:
     void setLiveHostState(bool playing, bool offline);   // the host's transport and offline rendering
     bool liveRunning() const;                   // the Live client (its UDP socket) runs
     bool userLive(int user) const;              // this user's channel 0 is heard live now
-    // The room plays one way for everyone (o11proto/live_room.h): Live, or
-    // intervals. liveRoomLive() is the mode this engine plays now, taken at
-    // an interval boundary; while on intervals, liveRoomReason() and
-    // liveRoomReasonUser() say why and whose ("" when no one's).
-    enum class LiveReason { None, Dropouts, CantLive, Joining };
+    // The room has one mode for everyone, set by its `!live` switch alone
+    // (o11proto/live_room.h): Live, with no interval audio at all (none is
+    // uploaded or relayed), or intervals. liveRoomLive() says this engine
+    // plays the room Live now (taken at an interval boundary, and false at
+    // once when the switch goes off or Live can't play here). A player who
+    // can't play Live neither hears nor is heard while the room is Live.
+    // Then the server's advice says who has trouble: liveAdviceReason() why
+    // (dropouts, or can't play Live), liveAdviceUser() whose (the worst, or
+    // the first; "" with no advice) and liveAdviceCount() how many players
+    // have trouble, the one named among them (0 with no advice). A UI may
+    // suggest switching the room to intervals then; notices say when the
+    // advice appears and clears.
+    enum class LiveAdvice { None, Dropouts, CantLive };
     bool liveRoomLive() const;
-    LiveReason liveRoomReason() const;
-    std::string liveRoomReasonUser() const;
+    LiveAdvice liveAdviceReason() const;
+    std::string liveAdviceUser() const;
+    int liveAdviceCount() const;
     // For a UI, from the control context: the latest SERVER_LIVE says the
     // server has Live with its UDP port open (liveServerHas()) and the
     // room's `!live` switch is on (liveRoomSwitchOn()); liveHeardMs() is
@@ -216,11 +226,14 @@ private:
         enum Kind { Audio, End, Silence } kind = Audio;
         int channels = 1;
         int rate = 48000;
+        bool fresh = false;                     // after a pause (the room was Live): a new encoder, nothing carried over
         std::vector<float> data;                // interleaved
     };
     struct LocalState {
         LocalChannel s;
         bool transmitting = false;              // audio context
+        bool live_paused = false;               // audio context: not transmitting while the room is Live
+        int fade_in = 0, fade_len = 0;          // audio context: the interval fades in (frames to go, of)
         std::atomic<float> peak[2]{{0.0f}, {0.0f}};
         std::mutex qm;                          // upload queue
         std::vector<UploadBlock> queue;
@@ -278,9 +291,9 @@ private:
         std::uint32_t submask = 0;
         std::array<RemoteChannel, kMaxChannels> ch;
         // Live mode: the user's slot as the control context sees it (and
-        // its generation, or -1), the one the mixer plays, taken at a
-        // boundary, and channel 0's two paths in the mixer (null until the
-        // server has Live).
+        // its generation; -1 when it has none here or its player can't do
+        // Live), the one the mixer plays, taken at a boundary, and channel
+        // 0's two paths in the mixer (null until the server has Live).
         int live_want = -1;
         std::uint32_t live_want_gen = 0;
         int live_slot = -1;
@@ -388,7 +401,8 @@ private:
     void liveNotice(const std::string& text, bool error);
     double liveOneWayMs(int slot, double* buffer_ms, double* network_ms, double* codec_ms) const;
     void liveAudioBlock(const float* const* in, int numIn, int frames, int sampleRate);   // process()
-    void liveBoundary();                        // boundary(), before newIntervalStep()
+    void liveBoundary();                        // boundary(), before uploadBoundary() and newIntervalStep()
+    bool liveHoldsIntervals() const;            // audio context: the room is Live, so nothing is uploaded
     void mixLive(float* const* out, int numOut, int len, int at, int sampleRate);   // channel 0 of Live users
     void liveIntervalAudio(RemoteUser& u, int len, int sampleRate, float* dst);
     std::atomic<bool> live_enabled_{true};

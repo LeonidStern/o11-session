@@ -165,7 +165,9 @@ void LiveLayer::forget() {
     report_ever = false;
     report_at = TimePoint{};
     room_noticed = 0;
-    cant_said.clear();
+    advice_said.clear();
+    advice_said_reason = o11proto::live::Advice::None;
+    advice_said_count = 0;
     room_due_ns.store(0);
     room_announce.store((++room_seq) << 1, std::memory_order_release);   // intervals, at the next boundary
     start_failed_said = no_answer_said = offer_said = false;

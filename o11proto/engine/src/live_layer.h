@@ -125,8 +125,8 @@ struct LiveLayer {
     Health slot_health[kLiveSlots];
     std::uint32_t slot_peer[kLiveSlots] = {};   // control's copy of the slots
     std::string slot_name[kLiveSlots];
-    // The room's mode (live_room.h): the latest room message, the health
-    // report last sent and the notices said (engine_live.cpp).
+    // The room's mode and the advice (live_room.h): the latest room message,
+    // the health report last sent and the notices said (engine_live.cpp).
     o11proto::live::LiveRoom room;
     bool has_room = false;
     std::uint64_t room_seq = 0;
@@ -134,7 +134,9 @@ struct LiveLayer {
     bool report_ever = false;
     TimePoint report_at{};
     int room_noticed = 0;                       // the applied mode the notices last spoke of
-    std::string cant_said;                      // whose "can't do Live" was said
+    std::string advice_said;                    // whose advice the notices last spoke of ("" for none)
+    o11proto::live::Advice advice_said_reason = o11proto::live::Advice::None;
+    int advice_said_count = 0;
     bool start_failed_said = false, no_answer_said = false, offer_said = false;
     TimePoint started_at{}, retry_at{};
     bool buffer_changed = false;                // B changed during this connection
