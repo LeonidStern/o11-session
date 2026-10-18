@@ -149,6 +149,7 @@ struct Room {
         thread.join();
     }
     std::uint16_t port() const { return server.port(); }
+    void forget(Client* c) { clients.erase(std::remove(clients.begin(), clients.end(), c), clients.end()); }
     void pump() {
         for (Client* c : clients) c->poll(0);
     }
@@ -163,11 +164,18 @@ struct Room {
     }
 };
 
-// A Live player: the TCP client and its transport.
+// A Live player: the TCP client and its transport. Its transport stops
+// first when it goes, before the inbox its on_data writes (and the test's
+// state its on_tick uses, declared before the player).
 struct Player {
     Client c;
     live::Transport t;
     Inbox in;
+    Room* room = nullptr;
+    ~Player() {
+        t.stop();
+        if (room) room->forget(&c);
+    }
     std::uint32_t id() const { return c.liveMessage().peer_id; }
     bool listsBound(std::uint32_t peer) const {
         for (const auto& p : c.liveMessage().peers)
@@ -175,6 +183,7 @@ struct Player {
         return false;
     }
     bool login(Room& r, const std::string& name) {
+        room = &r;
         r.clients.push_back(&c);
         Client::Options o;
         o.username = "anonymous:" + name;
@@ -198,6 +207,25 @@ struct Player {
         bool ok = t.start(o, err);
         if (!ok) std::printf("    transport: %s\n", err.c_str());
         return ok;
+    }
+};
+
+// A host's audio thread: it wakes the transports every half millisecond, as
+// the engine's audio does when it has queued, from before their restarts to
+// after. It stops when it goes, so it is declared after what it wakes.
+struct Waker {
+    std::atomic<bool> stop{false};
+    std::thread thread;
+    explicit Waker(std::vector<live::Transport*> ts)
+        : thread([this, ts] {
+              while (!stop.load()) {
+                  for (live::Transport* t : ts) t->wake();
+                  std::this_thread::sleep_for(std::chrono::microseconds(500));
+              }
+          }) {}
+    ~Waker() {
+        stop.store(true);
+        thread.join();
     }
 };
 
@@ -348,8 +376,8 @@ TEST(hello_schedule) {                         // 29, against a fake relay
 
 TEST(client_drop_rules) {                      // 4.2's list, and replies that aren't ours
     FakeRelay r;
+    Inbox in;                                  // before t: its on_data writes it until t stops
     live::Transport t;
-    Inbox in;
     in.wire(t);
     std::string err;
     REQUIRE(t.start(fakeOptions(r), err));
@@ -402,9 +430,9 @@ TEST(client_drop_rules) {                      // 4.2's list, and replies that a
 
 TEST(sends_and_closing) {                      // send() from the network thread; on_closing last
     FakeRelay r;
-    live::Transport t;
-    std::atomic<int> ticks{0};
+    std::atomic<int> ticks{0};                 // before t: its callbacks use them until it stops
     std::atomic<bool> closed{false};
+    live::Transport t;
     t.on_tick = [&] {
         if (ticks.fetch_add(1) == 5) {
             std::uint8_t p[3] = {1, 2, 3};
@@ -435,23 +463,111 @@ TEST(sends_and_closing) {                      // send() from the network thread
     CHECK(d.size() == live::kClientHeader + 1 && d[20] == 0xFF && live::getLE32(&d[16]) == 0);
 }
 
+TEST(stop_ends_the_callbacks) {                // what an owner relies on, through restarts while data pours in
+    FakeRelay r;
+    std::atomic<bool> pour{true}, stopped{false};   // before t: its callbacks use them until it stops
+    std::atomic<int> late{0}, data{0}, closings{0};
+    live::Transport t;
+    t.on_data = [&](std::uint32_t, const std::uint8_t*, std::size_t) {
+        late.fetch_add(stopped.load() ? 1 : 0);
+        data.fetch_add(1);
+    };
+    t.on_tick = [&] { late.fetch_add(stopped.load() ? 1 : 0); };
+    t.on_closing = [&] {
+        late.fetch_add(stopped.load() ? 1 : 0);
+        closings.fetch_add(1);
+    };
+    // The relay: data every 50 us to where the latest hello came from (each start has a new socket).
+    std::thread relay([&] {
+        const Bytes d = dataFrom(9, 100);
+        Bytes in;
+        while (pour.load()) {
+            r.recv(in, 0);
+            if (r.peer.port != 0) r.send(d);
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    });
+    {
+        Waker host({&t});
+        std::string err;
+        for (int i = 0; i < 20; ++i) {
+            stopped.store(false);
+            const bool started = t.start(fakeOptions(r), err);
+            CHECK(started);
+            if (!started) break;               // (not REQUIRE: the relay's thread is joined below)
+            const int before = data.load();
+            CHECK(waitFor([&] { return data.load() >= before + 20; }, 1000));
+            t.stop();                          // the callbacks end here,
+            stopped.store(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));   // so none comes in this time
+        }
+    }
+    pour.store(false);
+    relay.join();
+    CHECK_EQ(late.load(), 0);
+    CHECK_EQ(closings.load(), 20);
+    std::printf("    %d datagrams delivered over 20 starts\n", data.load());
+}
+
+TEST(send_gap_and_hold) {                      // the test hooks; a restart drops what is held
+    FakeRelay r;
+    std::atomic<int> want{0};                  // before t: its callbacks use them until it stops
+    std::uint32_t seq = 0;                     // the network thread's
+    live::Transport t;
+    t.on_tick = [&] {                          // numbered datagrams, as many as asked for
+        for (; want.load() > 0; want.fetch_sub(1)) {
+            std::uint8_t p[4];
+            live::putLE32(p, seq++);
+            t.send(0, p, sizeof(p));
+        }
+    };
+    auto sendNow = [&](int n) {                // and wait until the network thread has sent them
+        want.fetch_add(n);
+        return waitFor([&] { return want.load() == 0; }, 500);
+    };
+    auto arrived = [&] {                       // the numbers the relay has, in order, the hellos aside
+        std::vector<std::uint32_t> got;
+        Bytes d;
+        while (r.recv(d, 50))
+            if (d.size() == live::kClientHeader + 4 && d[3] == live::kTypeData)
+                got.push_back(live::getLE32(&d[live::kClientHeader]));
+        return got;
+    };
+    using Seqs = std::vector<std::uint32_t>;
+    std::string err;
+    REQUIRE(t.start(fakeOptions(r), err));
+    REQUIRE(sendNow(2));
+    CHECK(arrived() == Seqs({0, 1}));
+    t.setTestSendHold(300);
+    REQUIRE(sendNow(3));
+    CHECK(arrived().empty());                  // held
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    REQUIRE(sendNow(1));                       // the first after the hold: then all at once, in order
+    CHECK(arrived() == Seqs({2, 3, 4, 5}));
+    t.setTestSendGap(300);
+    REQUIRE(sendNow(3));                       // dropped
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    REQUIRE(sendNow(1));
+    CHECK(arrived() == Seqs({9}));
+    t.setTestSendHold(300);
+    REQUIRE(sendNow(2));                       // held, and dropped by the restart
+    t.stop();
+    REQUIRE(t.start(fakeOptions(r), err));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    REQUIRE(sendNow(1));
+    CHECK(arrived() == Seqs({12}));
+    t.stop();
+}
+
 // ----------------------------------------------------- through the server
 
 TEST(two_players_through_the_server) {
     Room r;
+    std::atomic<int> phase{0};                 // before the players: their callbacks read it until they stop
     Player a, b;
     REQUIRE(a.login(r, "a"));
     REQUIRE(b.login(r, "b"));
     REQUIRE(r.until([&] { return a.c.liveMessage().peers.size() == 1 && b.c.liveMessage().peers.size() == 1; }));
-    REQUIRE(a.startTransport());
-    REQUIRE(b.startTransport());
-    // Both bind within a round trip or two; the others see it within 1 s.
-    REQUIRE(r.until([&] { return a.listsBound(b.id()) && b.listsBound(a.id()); }, 1500));
-    CHECK(a.t.serverAnswered() && b.t.serverAnswered());
-    std::printf("    server round trip %.3f ms\n", a.t.serverRoundTripMs());
-    CHECK(a.t.serverRoundTripMs() >= 0 && a.t.serverRoundTripMs() < 50);
-
-    std::atomic<int> phase{0};
     a.t.on_tick = [&] {
         if (phase.load() == 1) {
             std::uint8_t p[5] = {0x81, 1, 2, 3, 4};
@@ -468,6 +584,13 @@ TEST(two_players_through_the_server) {
             phase.store(4);
         }
     };
+    REQUIRE(a.startTransport());
+    REQUIRE(b.startTransport());
+    // Both bind within a round trip or two; the others see it within 1 s.
+    REQUIRE(r.until([&] { return a.listsBound(b.id()) && b.listsBound(a.id()); }, 1500));
+    CHECK(a.t.serverAnswered() && b.t.serverAnswered());
+    std::printf("    server round trip %.3f ms\n", a.t.serverRoundTripMs());
+    CHECK(a.t.serverRoundTripMs() >= 0 && a.t.serverRoundTripMs() < 50);
     phase.store(1);
     REQUIRE(r.until([&] { return b.in.size() == 1; }));
     CHECK(b.in.at(0).first == a.id() && b.in.at(0).second == Bytes({0x81, 1, 2, 3, 4}));
@@ -480,14 +603,11 @@ TEST(two_players_through_the_server) {
 
 TEST(live_off_stops_forwarding) {              // 21, through transports
     Room r;
+    std::atomic<bool> sending{false};          // before the players: a's callbacks read it until a stops
     Player a, b;
     REQUIRE(a.login(r, "a"));
     REQUIRE(b.login(r, "b"));
     REQUIRE(r.until([&] { return a.c.liveMessage().peers.size() == 1; }));
-    REQUIRE(a.startTransport());
-    REQUIRE(b.startTransport());
-    REQUIRE(r.until([&] { return a.listsBound(b.id()) && b.listsBound(a.id()); }, 1500));
-    std::atomic<bool> sending{true};
     a.t.on_tick = [&] {
         static thread_local TimePoint last;
         if (sending.load() && Clock::now() - last >= std::chrono::milliseconds(5)) {
@@ -496,6 +616,10 @@ TEST(live_off_stops_forwarding) {              // 21, through transports
             a.t.send(0, p, sizeof(p));
         }
     };
+    REQUIRE(a.startTransport());
+    REQUIRE(b.startTransport());
+    REQUIRE(r.until([&] { return a.listsBound(b.id()) && b.listsBound(a.id()); }, 1500));
+    sending.store(true);
     REQUIRE(r.until([&] { return b.in.size() >= 10; }));
     a.c.say("!live off");
     REQUIRE(r.until([&] { return !a.c.liveMessage().roomOn() && !b.c.liveMessage().roomOn(); }));
@@ -512,19 +636,20 @@ TEST(live_off_stops_forwarding) {              // 21, through transports
 
 TEST(restarts_survive) {                       // 45: stop and start while sending, 50 times
     Room r;
+    TimePoint last = Clock::now();             // before the players: a's callbacks use it until a stops
     Player a, b;
     REQUIRE(a.login(r, "a"));
     REQUIRE(b.login(r, "b"));
     REQUIRE(r.until([&] { return a.c.liveMessage().peers.size() == 1; }));
     REQUIRE(b.startTransport());
     std::uint32_t bid = b.id();
-    TimePoint last = Clock::now();
     a.t.on_tick = [&, bid] {                   // a stream's 200 datagrams/s, within the rate limit
         if (Clock::now() - last < std::chrono::milliseconds(5)) return;
         last = Clock::now();
         std::uint8_t p[100] = {0x81};
         a.t.send(bid, p, sizeof(p));
     };
+    Waker host({&a.t, &b.t});
     int answered = 0;
     for (int i = 0; i < 50; ++i) {
         REQUIRE(a.startTransport());
@@ -536,11 +661,48 @@ TEST(restarts_survive) {                       // 45: stop and start while sendi
     CHECK(answered >= 45);
     REQUIRE(a.startTransport());
     CHECK(r.until([&] { return a.t.serverAnswered(); }));
+    const std::size_t had = b.in.size();
+    CHECK(r.until([&] { return b.in.size() > had; }));
+}                                              // the host stops, then b goes while a streams to it
+
+TEST(players_go_while_streamed_to) {           // each one's transport stops before what its callbacks use goes
+    Room r;
+    std::atomic<std::uint32_t> to{0};          // before the players: a's callbacks use them until a stops
+    TimePoint last = Clock::now();
+    Player a;
+    REQUIRE(a.login(r, "a"));
+    a.t.on_tick = [&] {                        // 200 datagrams/s to the latest player
+        const std::uint32_t dest = to.load();
+        if (dest == 0 || Clock::now() - last < std::chrono::milliseconds(5)) return;
+        last = Clock::now();
+        std::uint8_t p[100] = {0x81};
+        a.t.send(dest, p, sizeof(p));
+    };
+    REQUIRE(a.startTransport());
+    int received = 0;
+    for (int i = 0; i < 10; ++i) {
+        std::unique_ptr<Player> b(new Player);
+        REQUIRE(b->login(r, "b" + std::to_string(i)));
+        REQUIRE(b->startTransport());
+        to.store(b->id());
+        Waker host({&a.t, &b->t});
+        received += r.until([&] { return b->in.size() >= 5; }) ? 1 : 0;
+        // Each goes at another point between two of a's datagrams.
+        std::this_thread::sleep_for(std::chrono::microseconds(500 * i));
+    }                                          // the host stops, then b goes while a streams to it
+    std::printf("    %d of 10 players received a's stream before they went\n", received);
+    CHECK(received >= 9);
 }
 
 TEST(load_eight_players) {                     // each streams to the room for 2 s
     Room r;
     const int kPlayers = 8;
+    // Before the players: their callbacks use these until they stop.
+    // 200 datagrams/s (frame 240) of 105 bytes, as a 128 kbps stream averages.
+    std::atomic<bool> go{false};
+    TimePoint t0;
+    std::vector<std::unique_ptr<std::atomic<int>>> sent;
+    for (int i = 0; i < kPlayers; ++i) sent.emplace_back(new std::atomic<int>(0));
     std::vector<std::unique_ptr<Player>> ps;
     for (int i = 0; i < kPlayers; ++i) {
         ps.emplace_back(new Player);
@@ -551,22 +713,10 @@ TEST(load_eight_players) {                     // each streams to the room for 2
             if (p->c.liveMessage().peers.size() != kPlayers - 1) return false;
         return true;
     }));
-    for (auto& p : ps) REQUIRE(p->startTransport());
-    REQUIRE(r.until([&] {
-        for (auto& p : ps)
-            for (auto& q : ps)
-                if (p != q && !p->listsBound(q->id())) return false;
-        return true;
-    }, 3000));
-    // 200 datagrams/s (frame 240) of 105 bytes, as a 128 kbps stream averages.
-    std::atomic<bool> go{true};
-    std::vector<std::unique_ptr<std::atomic<int>>> sent;
-    for (int i = 0; i < kPlayers; ++i) sent.emplace_back(new std::atomic<int>(0));
-    TimePoint t0 = Clock::now();
     for (int i = 0; i < kPlayers; ++i) {
         Player* p = ps[i].get();
         std::atomic<int>* n = sent[i].get();
-        p->t.on_tick = [p, n, &go, t0] {
+        p->t.on_tick = [p, n, &go, &t0] {
             if (!go.load()) return;
             double el = std::chrono::duration<double>(Clock::now() - t0).count();
             while (n->load() < static_cast<int>(el * 200)) {
@@ -578,6 +728,15 @@ TEST(load_eight_players) {                     // each streams to the room for 2
             }
         };
     }
+    for (auto& p : ps) REQUIRE(p->startTransport());
+    REQUIRE(r.until([&] {
+        for (auto& p : ps)
+            for (auto& q : ps)
+                if (p != q && !p->listsBound(q->id())) return false;
+        return true;
+    }, 3000));
+    t0 = Clock::now();
+    go.store(true);
     r.until([] { return false; }, 2000);
     go.store(false);
     r.until([] { return false; }, 200);
