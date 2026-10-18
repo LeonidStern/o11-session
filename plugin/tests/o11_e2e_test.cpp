@@ -354,11 +354,23 @@ int main()
     CHECK(heardMs > 0 && heardMs < 150);
   }
   CHECK(room.guest.command("chatlog").find("The room is Live now") != std::string::npos);
-  // the buffer is the guest's own (a test setting now: not saved, no menu)
+  // the buffer is automatic, and each stream says what it plays with and what happened to it
+  CHECK(field(guestLive, "buffer") == "auto");
+  {
+    const std::string counters = room.guest.command("live counters");
+    printf("  guest live counters: %s", counters.c_str());
+    CHECK(counters.find(" buffer=") != std::string::npos);
+    CHECK(counters.find(" fell_back=") != std::string::npos);
+  }
+  // tests can fix it (not saved, no menu), and go back to automatic
   CHECK(room.guest.command("live buffer 40") == "ok");
   CHECK(room.waitForLive(room.guest, "buffer", "40", 5));
   CHECK(room.guest.getSettings().liveBufferMs == 40);
   CHECK(room.guest.command("live buffer 33").find("error") == 0);
+  CHECK(room.guest.command("live buffer 0").find("error") == 0);
+  CHECK(room.guest.command("live buffer auto") == "ok");
+  CHECK(room.waitForLive(room.guest, "buffer", "auto", 5));
+  CHECK(room.guest.getSettings().liveBufferMs == Settings::LIVE_BUFFER_AUTO);
 
   // transmit off: the host sends nothing from the next interval on (nor Live, at once), and the
   // guest hears silence

@@ -143,7 +143,8 @@ int Settings::nearestOpusKbps(int kbps)
 
 int Settings::nearestLiveBufferMs(int ms)
 {
-  int best = DEFAULT_LIVE_BUFFER_MS;
+  if (ms <= 0) return LIVE_BUFFER_AUTO;
+  int best = LIVE_BUFFER_MS[0];
   for (int b : LIVE_BUFFER_MS)
     if (abs(b - ms) < abs(best - ms)) best = b;
   return best;
@@ -370,8 +371,8 @@ void Engine::start()
 
   // benchmarks, with no window: join a room once loaded (O11_CONNECT="host:port name") or host one
   // (O11_HOST=1, on O11_HOST_PORT), pick the Opus bitrate (O11_BITRATE) and Live's buffer
-  // (O11_LIVE_BUFFER_MS), and print the `live` line when it changes (O11_LIVE_LOG=1)
-  if (const char *ms = getenv("O11_LIVE_BUFFER_MS")) setLiveBuffer(Settings::nearestLiveBufferMs(atoi(ms)));
+  // (O11_LIVE_BUFFER_MS: ms, or auto), and print the `live` line when it changes (O11_LIVE_LOG=1)
+  if (const char *ms = getenv("O11_LIVE_BUFFER_MS")) setLiveBuffer(Settings::nearestLiveBufferMs(strcmp(ms, "auto") == 0 ? 0 : atoi(ms)));
   if (const char *k = getenv("O11_BITRATE")) setOpusKbps(atoi(k)); // before hosting: the host's bitrate is the room's
   if (const char *h = getenv("O11_HOST")) setHosting(atoi(h) != 0);
   if (const char *c = getenv("O11_CONNECT"))
@@ -934,6 +935,23 @@ void Engine::threadProc()
         fflush(stdout);
       }
     }
+    if (m_liveLog && t - m_liveCountersAt >= 1.0)
+    {
+      // and each player's counters, at most once a second when they change
+      m_liveCountersAt = t;
+      const std::string counters = command("live counters");
+      if (counters != m_liveCountersLine)
+      {
+        m_liveCountersLine = counters;
+        for (size_t a = 0, b; a < counters.size(); a = b + 1)
+        {
+          b = counters.find('\n', a);
+          if (b == std::string::npos) b = counters.size();
+          printf("live counters: %s\n", counters.substr(a, b - a).c_str());
+        }
+        fflush(stdout);
+      }
+    }
 
     std::unique_lock<std::mutex> lock(m_cmdMutex);
     if (m_commands.empty() && !m_quit) m_cmdCv.wait_for(lock, std::chrono::milliseconds(10));
@@ -1272,6 +1290,20 @@ void Engine::updateUsers(Snapshot &snap)
     }
     uv.liveHeardMs = (int)lround(m_client->liveUserHeardMs(u));
     uv.liveFillMs = (int)lround(m_client->liveUserBufferMs(u));
+    uv.liveBufferMs = m_client->liveUserBufferInUseMs(u);
+    uv.liveFellBack = m_client->liveUserBufferFellBack(u);
+    {
+      o11proto::engine::LiveCounters k;
+      if (m_client->liveUserCounters(u, &k))
+      {
+        char b[320];
+        snprintf(b, sizeof(b), "late=%u lost=%u concealed=%llu dry=%u overflows=%u xruns=%u resent=%u skips=%u host_gaps=%u speed_changes=%u speed_ppm=%.0f fill=%.1f buffer=%d fell_back=%d",
+                 k.late, k.lost, (unsigned long long)k.concealed_frames, k.underruns, k.overflows, k.xrun_gaps, k.resent,
+                 k.skips, k.host_gaps, k.speed_changes, k.speed_ppm, k.fill_ms, k.buffer_ms, k.fell_back ? 1 : 0);
+        uv.liveCounters = b;
+      }
+      else uv.liveCounters.clear();
+    }
     signature += uv.name + "\n";
     for (int i = 0; ; i ++)
     {
@@ -1622,25 +1654,37 @@ std::string Engine::command(const std::string &lineIn)
     }
     if (arg.compare(0, 7, "buffer ") == 0)
     {
-      const int ms = atoi(arg.c_str() + 7);
-      if (Settings::nearestLiveBufferMs(ms) != ms) return "error: the buffer is one of 10 15 20 30 40 60 80 100 (ms)";
+      const int ms = arg.compare(7, std::string::npos, "auto") == 0 ? Settings::LIVE_BUFFER_AUTO : atoi(arg.c_str() + 7);
+      if (Settings::nearestLiveBufferMs(ms) != ms || (ms == Settings::LIVE_BUFFER_AUTO && arg.compare(7, std::string::npos, "auto") != 0))
+        return "error: the buffer is auto or one of 10 15 20 30 40 60 80 100 (ms)";
       setLiveBuffer(ms);
       return "ok";
     }
-    if (!arg.empty()) return "error: live on|off, live buffer N, or live";
+    if (arg == "counters")
+    {
+      // each player's stream since it started here: what went wrong and what the buffer did (benchmarks)
+      Snapshot s;
+      getSnapshot(s);
+      std::string out;
+      for (const auto &uv : s.users)
+        if (!uv.liveCounters.empty()) out += uv.displayName + " " + uv.liveCounters + "\n";
+      return out;
+    }
+    if (!arg.empty()) return "error: live on|off, live buffer auto|N, live counters, or live";
     Snapshot s;
     getSnapshot(s);
     static const char *reasons[] = { "none", "dropouts", "cantlive" };
     char buf[256];
-    snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s others=%d heard=%d buffer=%d inuse=%d\n",
+    const std::string bufferText = s.liveBufferMs == Settings::LIVE_BUFFER_AUTO ? "auto" : std::to_string(s.liveBufferMs);
+    snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s others=%d heard=%d buffer=%s inuse=%d\n",
              s.liveServer ? 1 : 0, s.liveSwitchOn ? 1 : 0, s.liveRoom ? "live" : "intervals", reasons[(int)s.liveReason],
-             s.liveReasonWho.c_str(), s.liveReasonOthers, s.liveHeardMs, s.liveBufferMs, s.liveBufferInUseMs);
-    // each player's stream: how late you hear them and how full its buffer is (benchmarks)
+             s.liveReasonWho.c_str(), s.liveReasonOthers, s.liveHeardMs, bufferText.c_str(), s.liveBufferInUseMs);
+    // each player's stream: how late you hear them, how full its buffer is and the buffer it plays with (benchmarks)
     std::string line = buf;
     line.pop_back();
     for (const auto &uv : s.users)
       if (uv.liveHeardMs >= 0 || uv.liveFillMs >= 0)
-        line += " " + uv.displayName + "=" + std::to_string(uv.liveHeardMs) + "/" + std::to_string(uv.liveFillMs);
+        line += " " + uv.displayName + "=" + std::to_string(uv.liveHeardMs) + "/" + std::to_string(uv.liveFillMs) + "/" + std::to_string(uv.liveBufferMs);
     return line + "\n";
   }
   if (verb == "vote")

@@ -136,20 +136,22 @@ static void test_state()
   CHECK(!offLoaded.followHostTempo);
   CHECK(e.followHostTempo);
 
-  // Live's jitter buffer: not saved (Live picks it), and older states' setting is ignored
-  CHECK_EQ(Settings().liveBufferMs, 20);
-  CHECK_EQ(old.liveBufferMs, 20);
+  // Live's jitter buffer: automatic, not saved, and older states' setting is ignored
+  CHECK_EQ(Settings().liveBufferMs, Settings::LIVE_BUFFER_AUTO);
+  CHECK_EQ(old.liveBufferMs, Settings::LIVE_BUFFER_AUTO);
   for (const char *saved : { "10", "40", "100", "abc", "" })
   {
     Settings k;
     CHECK(k.deserialize(std::string("O11-SESSION-STATE 1\nlive_buffer_ms=") + saved + "\n"));
-    CHECK_EQ(k.liveBufferMs, 20);
+    CHECK_EQ(k.liveBufferMs, Settings::LIVE_BUFFER_AUTO);
   }
   Settings longer;
   longer.liveBufferMs = 60;
   CHECK(longer.serialize().find("live_buffer_ms") == std::string::npos);
   CHECK_EQ(Settings::nearestLiveBufferMs(25), 20);
   CHECK_EQ(Settings::nearestLiveBufferMs(70), 60);
+  CHECK_EQ(Settings::nearestLiveBufferMs(3), 10);
+  CHECK_EQ(Settings::nearestLiveBufferMs(0), Settings::LIVE_BUFFER_AUTO);
 }
 
 static void test_names()

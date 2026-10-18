@@ -95,6 +95,9 @@ struct RemoteUserView
   double joinedAt = 0;     // when they joined the room you're in (nowSeconds()), 0 if they were there first
   int liveHeardMs = -1;    // while their Live stream plays here: how late you hear them, -1 when not known
   int liveFillMs = -1;     // ... and how full its jitter buffer is
+  int liveBufferMs = -1;   // ... and the buffer its stream plays with (automatic: 10 ms, or 20 once it fell back)
+  bool liveFellBack = false; // its automatic buffer fell back to the longer one
+  std::string liveCounters; // what its stream did here since it started, "" before it has one (the `live counters` line)
   std::vector<RemoteChannelView> channels;
 };
 
@@ -131,8 +134,8 @@ struct Snapshot
   std::string liveReasonWho; // whose connection or client (display name), "" when no one's
   int liveReasonOthers = 0;  // how many more have the same trouble
   int liveHeardMs = -1;      // about how late you hear the others while Live, -1 when not known
-  int liveBufferMs = 20;     // your jitter buffer (Settings::liveBufferMs)
-  int liveBufferInUseMs = 20; // what it is now: raised for the host's long blocks
+  int liveBufferMs = 0;      // your jitter buffer (Settings::liveBufferMs; 0 = Settings::LIVE_BUFFER_AUTO)
+  int liveBufferInUseMs = 20; // where a stream starts: the fixed buffer or the automatic one's 10 ms, raised for the host's long blocks
 
   std::vector<RemoteUserView> users;
   unsigned int usersRevision = 0; // changes when users or channels come or go (not for levels)
@@ -189,10 +192,11 @@ struct Settings
   static constexpr int OPUS_KBPS[] = { 64, 96, 128, 160, 256, 510 };
   static constexpr int NUM_OPUS_KBPS = 6, DEFAULT_OPUS_KBPS = 510; // the best Opus there is, by default
   static int nearestOpusKbps(int kbps);
-  // Live's jitter buffer (ms) to pick from: longer is safer on a bad connection, and later
+  // Live's jitter buffer: automatic by default (each player's stream starts at 10 ms and falls back
+  // to 20 ms on dropouts); tests can fix it at one of LIVE_BUFFER_MS instead
   static constexpr int LIVE_BUFFER_MS[] = { 10, 15, 20, 30, 40, 60, 80, 100 };
-  static constexpr int NUM_LIVE_BUFFERS = 8, DEFAULT_LIVE_BUFFER_MS = 20;
-  static int nearestLiveBufferMs(int ms);
+  static constexpr int NUM_LIVE_BUFFERS = 8, LIVE_BUFFER_AUTO = 0, DEFAULT_LIVE_BUFFER_MS = LIVE_BUFFER_AUTO;
+  static int nearestLiveBufferMs(int ms); // LIVE_BUFFER_AUTO for 0 or less
 
   std::string userName;
   std::string server;
@@ -203,7 +207,7 @@ struct Settings
   bool transmit = true;
   int opusKbps = DEFAULT_OPUS_KBPS; // what we send in Opus rooms; FLAC is lossless and ignores it
   bool followHostTempo = true; // Sync: follow the host's tempo (and line up with its bars)
-  int liveBufferMs = DEFAULT_LIVE_BUFFER_MS; // Live's jitter buffer, one of LIVE_BUFFER_MS; not saved: only the `live buffer` command and O11_LIVE_BUFFER_MS (tests) change it
+  int liveBufferMs = DEFAULT_LIVE_BUFFER_MS; // Live's jitter buffer: LIVE_BUFFER_AUTO, or fixed at one of LIVE_BUFFER_MS; not saved: only the `live buffer` command and O11_LIVE_BUFFER_MS (tests) change it
   int editorWidth = 0, editorHeight = 0; // the editor's size, 0 for the default
 
   struct Remote
@@ -275,7 +279,7 @@ public:
   void setFollowHostTempo(bool on); // Sync, and with it Ableton Link
   void setHostName(const std::string &name); // the host's name, for the editor
   void setRoomLive(bool on);       // the room's Live switch (!live on|off), while connected
-  void setLiveBuffer(int ms);      // one of Settings::LIVE_BUFFER_MS: your jitter buffer
+  void setLiveBuffer(int ms);      // your jitter buffer: Settings::LIVE_BUFFER_AUTO or one of Settings::LIVE_BUFFER_MS
 
   enum RemoteField { RemoteVolume, RemotePan, RemoteMute, RemoteSolo };
   void setRemote(const std::string &user, int channel, RemoteField field, float value);
@@ -383,6 +387,8 @@ private:
   bool m_liveLog = false; // O11_LIVE_LOG: print the `live` line when it changes (benchmarks)
   double m_liveLogAt = 0;
   std::string m_liveLogLine;
+  double m_liveCountersAt = 0;
+  std::string m_liveCountersLine;
   unsigned int m_seenProcessCalls = 0;
   std::map<std::string, int> m_playerOutSaid; // the player output we last told about, by user name
   std::map<std::string, double> m_joinedAt;   // when each user joined (RemoteUserView::joinedAt), by user name
