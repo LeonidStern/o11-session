@@ -1,5 +1,5 @@
 # dmgbuild settings for O11 Session's Mac disk image: the plug-in, a shortcut to the VST3 folder to
-# drag it onto, and a background that says so (make_dmg_background.py draws it).
+# open, and a background that says to open it and drag the plug-in in (make_dmg_background.py draws it).
 #
 #   dmgbuild -s dmg_settings.py -D bundle=path/to/O11Session.vst3 -D background=dmg-background.png "O11 Session" out.dmg
 #

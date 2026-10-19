@@ -329,7 +329,7 @@ jobs:
           NOTARIZE: ${{ steps.devid.outputs.notarize }}
         run: |
           # The Mac download: a disk image with O11Session.vst3 next to a shortcut to the VST3
-          # folder, over a background that says to drag one onto the other (plugin/packaging).
+          # folder, over a background that says to open the folder and drag the plug-in in (plugin/packaging).
           # dmgbuild lays it out in a read-write image; the bundle bit is set in there, for the
           # reasons above, and then the image is compressed, signed and notarized.
           python3 -m venv "$RUNNER_TEMP/dmgbuild"
