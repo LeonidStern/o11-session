@@ -74,7 +74,7 @@ add_library(o11proto STATIC
 target_include_directories(o11proto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(o11proto PUBLIC Threads::Threads PRIVATE o11proto_asio)   # live::Transport's network thread
 if(WIN32)
-  target_link_libraries(o11proto PUBLIC ws2_32 bcrypt)
+  target_link_libraries(o11proto PUBLIC ws2_32 bcrypt winmm)   # winmm: timeBeginPeriod() (realtime.cpp)
 endif()
 
 # The internal socket layer (src/socket_compat.h) is shared with o11server

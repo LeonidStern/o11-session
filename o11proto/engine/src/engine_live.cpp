@@ -228,6 +228,8 @@ std::string Engine::liveTestTiming() const {
     const live::Transport::Timing t = live_->networkTiming();
 #if defined(__APPLE__)
     const char* plain = "user-interactive QoS";
+#elif defined(_WIN32)
+    const char* plain = "the 1 ms timer";
 #else
     const char* plain = "the least timer slack";
 #endif
