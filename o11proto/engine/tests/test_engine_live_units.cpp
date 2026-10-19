@@ -986,6 +986,380 @@ TEST(long_host_blocks) {                         // the buffer texts with a 2048
                             "(200 ms), so expect dropouts: 4096 samples or less plays well.") != std::string::npos);
 }
 
+// ------------------------------------------------------------ host stalls
+
+namespace {
+
+// A sender and a receiver whose hosts each call a block of 128 frames at
+// 48 kHz, on one clock (the frame T), with the sender's blocks reaching
+// the receiver `net` frames after they are made (plus up to `jitter` more,
+// at random). A host's stall is a run of blocks it isn't called for: the
+// time it misses for good, as a host does when its device runs on without
+// it. Each reports it as LiveLayer::audioBlock() does: the first block
+// after the stall is late (the receiver's sink is told so, hostLate(),
+// and holds what came meanwhile, hostBehind()), the second confirms the
+// gap: the receiver's sink is told (hostGap()), and the sender sends its
+// xrun blocks (5.4: whole frames, the rest carried over), then the block's
+// audio. The sender plays a noise-like signal, sig(T), coded by Opus at the
+// room's frame; the receiver's output is kept by T.
+struct StallSim {
+    static constexpr int kHost = 128;
+    static constexpr long kLen = 48000 * 4;      // 4 s
+    int frame = 240;
+    int net = 24, jitter = 0;
+    struct Stall {
+        long from = -1;                          // the first block the host doesn't call (-1: none)
+        int blocks = 0;
+        int off = 0;                             // frames its measure of the gap is off by
+    };
+    Stall send_stall, recv_stall;
+    LiveSink k;
+    OpusEncoder* enc = nullptr;
+    std::vector<float> sig = std::vector<float>(kLen + 48000);
+    std::vector<float> out = std::vector<float>(kLen, 0.0f);
+    std::vector<char> played = std::vector<char>(kLen, 0), captured = std::vector<char>(kLen, 0);
+    struct Wire {
+        long at;
+        SinkItem it;
+    };
+    std::vector<Wire> wire;
+    std::mt19937 rng{7};
+    // The sender's source.
+    std::vector<float> pcm = std::vector<float>(2 * 480);
+    int pcm_n = 0;
+    std::int32_t seq = 0;
+    double xrun48 = 0;
+    int xruns_sent = 0;
+
+    explicit StallSim(int frame_size) : frame(frame_size) {
+        int err = 0;
+        enc = opus_encoder_create(48000, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+        opus_encoder_ctl(enc, OPUS_SET_BITRATE(128000));
+        // Noise through two one-pole low-passes, so the delay found by
+        // correlation is one and sharp.
+        std::uint32_t x = 12345;
+        double a = 0, b = 0;
+        for (float& v : sig) {
+            x = x * 1664525u + 1013904223u;
+            a += 0.25 * ((static_cast<double>(x >> 8) / (1u << 24) - 0.5) - a);
+            b += 0.25 * (a - b);
+            v = static_cast<float>(2.0 * b);
+        }
+        k.configure(11, kHost, 48000, 20);        // the automatic buffer at 128-frame host blocks (6.8)
+    }
+    ~StallSim() { opus_encoder_destroy(enc); }
+    StallSim(const StallSim&) = delete;
+    StallSim& operator=(const StallSim&) = delete;
+
+    static bool stalled(const Stall& s, long b) { return s.from >= 0 && b >= s.from && b < s.from + s.blocks; }
+    // 0: an ordinary block; 1: the first after a stall the layer notices
+    // (over 20 ms: 8 blocks or more); 2: the second.
+    static int after(const Stall& s, long b) {
+        if (s.from < 0 || s.blocks * kHost <= 960) return 0;
+        return b == s.from + s.blocks ? 1 : b == s.from + s.blocks + 1 ? 2 : 0;
+    }
+    void send(long t, const SinkItem& it) {
+        const long at = t + net + (jitter > 0 ? static_cast<long>(rng() % static_cast<unsigned>(jitter + 1)) : 0);
+        auto pos = std::upper_bound(wire.begin(), wire.end(), at, [](long v, const Wire& w) { return v < w.at; });
+        wire.insert(pos, Wire{at, it});
+    }
+    void sender(long b) {
+        const long t = b * kHost;
+        if (b == 0) send(t, item(SinkItem::Start, 0, 0, static_cast<std::uint16_t>(frame)));
+        if (stalled(send_stall, b)) return;
+        if (after(send_stall, b) == 2) {          // the gap: whole xrun blocks, the rest carried over
+            xrun48 += send_stall.blocks * kHost + send_stall.off;
+            const int n = static_cast<int>(xrun48 / frame);
+            xrun48 -= static_cast<double>(n) * frame;
+            for (int i = 0; i < n; ++i) send(t, item(SinkItem::Xrun, seq++));
+            xruns_sent += n;
+        }
+        for (int i = 0; i < kHost; ++i) {
+            captured[static_cast<std::size_t>(t + i)] = 1;
+            pcm[2 * pcm_n] = pcm[2 * pcm_n + 1] = sig[static_cast<std::size_t>(t + i)];
+            if (++pcm_n == frame) {
+                SinkItem it = item(SinkItem::Data, seq++);
+                it.len = static_cast<std::uint16_t>(opus_encode_float(enc, pcm.data(), frame, it.data, 1275));
+                send(t, it);
+                pcm_n = 0;
+            }
+        }
+    }
+    void receiver(long b) {
+        const long t = b * kHost;
+        if (stalled(recv_stall, b)) return;
+        const std::int64_t now = 1000 + t * 1000000000LL / 48000;
+        const int gap = recv_stall.blocks * kHost + recv_stall.off;
+        const int a = after(recv_stall, b);
+        if (a == 1) k.hostLate(gap, 48000, now);
+        if (a == 2) k.hostGap(gap, 48000, now);
+        k.hostBehind(recv_stall.from >= 0 && b == recv_stall.from + recv_stall.blocks ? recv_stall.blocks * kHost : 0);
+        while (!wire.empty() && wire.front().at <= t) {
+            k.apply(wire.front().it, now);
+            wire.erase(wire.begin());
+        }
+        k.configure(11, kHost, 48000, 20);
+        std::vector<float> o(2 * kHost);
+        k.render(o.data(), kHost, 48000, now);
+        for (int i = 0; i < kHost; ++i) out[static_cast<std::size_t>(t + i)] = o[2 * static_cast<std::size_t>(i)];
+        std::fill(played.begin() + t, played.begin() + t + kHost, 1);
+    }
+    void run(long to_block) {
+        for (long b = blocks_run; b < to_block; ++b) {
+            sender(b);
+            receiver(b);
+        }
+        blocks_run = to_block;
+    }
+    long blocks_run = 0;
+
+    // How late the receiver plays what the sender played, in frames, over
+    // its output's frames [from, from + 1920): the lag of the best
+    // correlation, and the correlation.
+    long delay(long from, double* corr = nullptr) const {
+        long best = -1;
+        double best_c = -2;
+        for (long lag = 0; lag <= 4800; ++lag) {
+            double c = 0, ex = 0, es = 0;
+            for (long n = from; n < from + 1920; n += 2) {
+                const double x = out[static_cast<std::size_t>(n)], y = sig[static_cast<std::size_t>(n - lag)];
+                c += x * y;
+                ex += x * x;
+                es += y * y;
+            }
+            const double v = ex > 0 && es > 0 ? c / std::sqrt(ex * es) : 0;
+            if (v > best_c) {
+                best_c = v;
+                best = lag;
+            }
+        }
+        if (corr) *corr = best_c;
+        return best;
+    }
+};
+
+struct Counts {
+    std::uint64_t concealed = 0;
+    std::uint32_t underruns = 0, overruns = 0, xruns = 0, lost = 0, late = 0, skips = 0, host_gaps = 0;
+    std::int64_t host_gap48 = 0;
+    static Counts of(const SinkStats& s) {
+        Counts c;
+        c.concealed = s.concealed48.load();
+        c.underruns = s.underruns.load();
+        c.overruns = s.overruns.load();
+        c.xruns = s.xrun_gaps.load();
+        c.lost = s.lost.load();
+        c.late = s.late.load();
+        c.skips = s.skips.load();
+        c.host_gaps = s.host_gaps.load();
+        c.host_gap48 = s.host_gap48.load();
+        return c;
+    }
+    Counts operator-(const Counts& o) const {
+        Counts c;
+        c.concealed = concealed - o.concealed;
+        c.underruns = underruns - o.underruns;
+        c.overruns = overruns - o.overruns;
+        c.xruns = xruns - o.xruns;
+        c.lost = lost - o.lost;
+        c.late = late - o.late;
+        c.skips = skips - o.skips;
+        c.host_gaps = host_gaps - o.host_gaps;
+        c.host_gap48 = host_gap48 - o.host_gap48;
+        return c;
+    }
+};
+
+// One stall of each host (blocks from the block `at`, -1 for none) in a
+// stream of `frame`-frame blocks: what the receiver's sink counted over
+// it, and its delay before and after it (frames).
+struct StallResult {
+    Counts c;
+    long before = 0, after = 0;
+    double corr_before = 0, corr_after = 0;
+    int xruns_sent = 0;
+    bool playing = false;
+};
+
+StallResult runStall(int frame, long send_at, int send_blocks, long recv_at, int recv_blocks, int net = 24,
+                     int jitter = 0, int send_off = 0, int recv_off = 0, int send_carry = 0) {
+    StallSim sim(frame);
+    sim.xrun48 = send_carry;                     // what the sender carried over from gaps before
+    sim.net = net;
+    sim.jitter = jitter;
+    sim.send_stall = {send_at, send_blocks, send_off};
+    sim.recv_stall = {recv_at, recv_blocks, recv_off};
+    const long first = std::min(send_at < 0 ? 1L << 30 : send_at, recv_at < 0 ? 1L << 30 : recv_at);
+    sim.run(first - 40);                         // 2 s or so: playing, its fill's level kept
+    StallResult r;
+    r.before = sim.delay((first - 60) * StallSim::kHost, &r.corr_before);
+    const Counts c0 = Counts::of(sim.k.stats);
+    sim.run(first + 290);                        // 0.6 s after the stall began
+    r.c = Counts::of(sim.k.stats) - c0;
+    r.after = sim.delay((first + 270) * StallSim::kHost, &r.corr_after);
+    r.xruns_sent = sim.xruns_sent;
+    r.playing = sim.k.playing();
+    return r;
+}
+
+void printStall(const char* what, int frame, const StallResult& r) {
+    std::printf("    frame %d, %s: delay %ld -> %ld frames (correlation %.3f, %.3f); concealed %llu, dry %u, "
+                "xruns %u (%d sent), lost %u, late %u, skips %u, host gaps %u (%lld frames skipped), overflows %u\n",
+                frame, what, r.before, r.after, r.corr_before, r.corr_after,
+                static_cast<unsigned long long>(r.c.concealed), r.c.underruns, r.c.xruns, r.xruns_sent, r.c.lost,
+                r.c.late, r.c.skips, r.c.host_gaps, static_cast<long long>(r.c.host_gap48), r.c.overruns);
+}
+
+}  // namespace
+
+// ENGINE.md 16.6, this host's gaps, at frames of 120 and 240 against host
+// blocks of 128 frames. 1: a stall that both hosts miss alike is not
+// heard: the receiver plays the sender's audio on without a break (nothing
+// concealed, dry or skipped, no dropout counted) and its delay after is
+// the one before. 2: when only the receiver's host missed time, it skips
+// as much of the stream (to the nearest block), so its delay stays. 3:
+// when only the sender's did, the hole is real: concealed, as long as it
+// was. 4: in between (different lengths, one host a block or two after
+// the other, stalls that overlap in part), no more is concealed than the
+// sender's audio really misses, and no more skipped than the delay needs.
+TEST(sink_host_stalls_alike_are_not_heard) {
+    for (int frame : {120, 240}) {
+        for (int blocks : {8, 12, 17, 30, 75}) {   // 21 to 200 ms
+            for (int phase = 0; phase < 3; ++phase) {   // where in the sender's frame the stall falls
+                const long at = 700 + phase;
+                const StallResult r = runStall(frame, at, blocks, at, blocks);
+                char what[80];
+                std::snprintf(what, sizeof(what), "both hosts miss %.1f ms (phase %d)", blocks * 128 / 48.0, phase);
+                printStall(what, frame, r);
+                CHECK(r.playing);
+                CHECK(r.corr_before > 0.9 && r.corr_after > 0.9);
+                CHECK_EQ(r.c.concealed, 0u);
+                CHECK_EQ(r.c.underruns, 0u);
+                CHECK_EQ(r.c.xruns, 0u);
+                CHECK_EQ(r.c.lost, 0u);
+                CHECK_EQ(r.c.late, 0u);
+                CHECK_EQ(r.c.skips, 0u);
+                CHECK_EQ(r.c.overruns, 0u);
+                CHECK_EQ(r.c.host_gap48, 0);
+                CHECK_EQ(r.c.host_gaps, 1u);
+                CHECK(r.xruns_sent > 0);
+                CHECK(std::labs(r.after - r.before) <= 2);   // the same delay, to the codec's rounding
+            }
+        }
+        // The hosts' measures of the gap differ, by up to a host block
+        // (each its own clock's reading of when its blocks began), and the
+        // sender carries over the rest of its gaps before, up to a frame.
+        for (int carry : {0, frame / 2, frame - 8}) {
+            for (int off : {-120, -40, -10, 0, 10, 40, 120}) {
+                const StallResult r = runStall(frame, 700, 12, 700, 12, 24, 0, 0, off, carry);
+                char what[96];
+                std::snprintf(what, sizeof(what), "both hosts miss 32 ms, the sender's carry %d, the receiver's measure %+d",
+                              carry, off);
+                printStall(what, frame, r);
+                CHECK_EQ(r.c.concealed, 0u);
+                CHECK_EQ(r.c.underruns, 0u);
+                CHECK_EQ(r.c.xruns, 0u);
+                CHECK_EQ(r.c.host_gap48, 0);
+                CHECK(std::labs(r.after - r.before) <= 2);
+            }
+        }
+        // Over a slower path, with jitter: the xrun blocks come later.
+        for (int net : {240, 720}) {
+            const StallResult r = runStall(frame, 700, 12, 700, 12, net, 144);
+            char what[80];
+            std::snprintf(what, sizeof(what), "both hosts miss 32 ms, a path of %d to %d ms", net / 48, (net + 144) / 48);
+            printStall(what, frame, r);
+            CHECK_EQ(r.c.concealed, 0u);
+            CHECK_EQ(r.c.underruns, 0u);
+            CHECK_EQ(r.c.xruns, 0u);
+            CHECK_EQ(r.c.host_gap48, 0);
+            CHECK(std::labs(r.after - r.before) <= 2);
+        }
+    }
+}
+
+TEST(sink_host_stalls_of_one_host) {
+    for (int frame : {120, 240}) {
+        for (int blocks : {8, 12, 17, 30, 75}) {
+            const double ms = blocks * 128 / 48.0;
+            for (int phase = 0; phase < 3; ++phase) {
+                const long at = 700 + phase;
+                char what[80];
+                // 2: the receiver's host alone: the stream skips the time missed, to the nearest block.
+                StallResult r = runStall(frame, -1, 0, at, blocks);
+                std::snprintf(what, sizeof(what), "the receiver's host misses %.1f ms (phase %d)", ms, phase);
+                printStall(what, frame, r);
+                const long missed = blocks * 128L;
+                CHECK(r.playing);
+                CHECK_EQ(r.c.concealed, 0u);
+                CHECK_EQ(r.c.underruns, 0u);
+                CHECK_EQ(r.c.overruns, 0u);
+                CHECK_EQ(r.c.lost, 0u);
+                CHECK_EQ(r.c.host_gaps, 1u);
+                CHECK(std::labs(r.c.host_gap48 - missed) <= frame / 2);
+                CHECK(std::labs(r.after - r.before) <= frame / 2);   // under a host block
+                // 3: the sender's host alone: the hole is concealed, as long as it was.
+                r = runStall(frame, at, blocks, -1, 0);
+                std::snprintf(what, sizeof(what), "the sender's host misses %.1f ms (phase %d)", ms, phase);
+                printStall(what, frame, r);
+                CHECK(r.playing);
+                CHECK_EQ(r.c.xruns, 1u);
+                CHECK_EQ(r.c.host_gaps, 0u);
+                CHECK_EQ(r.c.host_gap48, 0);
+                CHECK(r.c.concealed >= static_cast<std::uint64_t>(r.xruns_sent * frame));
+                CHECK(r.c.concealed <= static_cast<std::uint64_t>(missed + 2 * frame));
+                CHECK(std::labs(r.after - r.before) <= frame);
+            }
+        }
+    }
+}
+
+TEST(sink_host_stalls_in_between) {
+    for (int frame : {120, 240}) {
+        struct Case {
+            const char* what;
+            int send_from, send_blocks, recv_from, recv_blocks;
+        };
+        const Case cases[] = {
+            {"the sender 32 ms, the receiver 45 ms", 0, 12, 0, 17},
+            {"the sender 45 ms, the receiver 32 ms", 0, 17, 0, 12},
+            {"the sender 32 ms, the receiver 80 ms", 0, 12, 0, 30},
+            {"the sender 80 ms, the receiver 32 ms", 0, 30, 0, 12},
+            {"both 32 ms, the receiver a block later", 0, 12, 1, 12},
+            {"both 32 ms, the receiver two blocks later", 0, 12, 2, 12},
+            {"both 32 ms, the sender a block later", 1, 12, 0, 12},
+            {"both 32 ms, the sender two blocks later", 2, 12, 0, 12},
+            {"both 32 ms, overlapping 16 ms, the sender first", 0, 12, 6, 12},
+            {"both 32 ms, overlapping 16 ms, the receiver first", 6, 12, 0, 12},
+            {"the sender 53 ms, the receiver 21 ms within it", 0, 20, 6, 8},
+            {"the receiver 53 ms, the sender 21 ms within it", 6, 8, 0, 20},
+            {"the sender 45 ms, the receiver 32 ms from 21 ms in", 0, 17, 8, 12},
+        };
+        for (const Case& cs : cases) {
+            const long at = 700;
+            const StallResult r = runStall(frame, at + cs.send_from, cs.send_blocks, at + cs.recv_from, cs.recv_blocks);
+            printStall(cs.what, frame, r);
+            const long sent = cs.send_blocks * 128L, missed = cs.recv_blocks * 128L;
+            // The time the sender's audio misses beyond what this host
+            // missed too, and the time this host missed beyond the
+            // sender's: what is concealed and what is skipped, each to a
+            // block or so (the xrun blocks are whole frames).
+            const long s0 = cs.send_from * 128L, s1 = s0 + sent, r0 = cs.recv_from * 128L, r1 = r0 + missed;
+            const long both = std::max(0L, std::min(s1, r1) - std::max(s0, r0));
+            (void)both;
+            const long conceal_max = std::max(0L, sent - missed) + 2 * frame;
+            const long skip_max = std::max(0L, missed - sent) + frame;
+            CHECK(r.playing);
+            CHECK(r.corr_after > 0.9);
+            CHECK(static_cast<long>(r.c.concealed) <= std::min(sent + frame, conceal_max));
+            CHECK(r.c.host_gap48 <= skip_max);
+            CHECK_EQ(r.c.overruns, 0u);
+            CHECK_EQ(r.c.lost, 0u);
+            CHECK(std::labs(r.after - r.before) <= frame + 128);
+        }
+    }
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, TESTING_STDOUT_MODE, BUFSIZ);
     return testing::runAll();

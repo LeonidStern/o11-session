@@ -44,6 +44,10 @@ struct Side {
     std::unique_ptr<int[]> pos;                  // the interval position after each block
     std::atomic<long> clock_from{-1};            // the frame its interval clock started at, -1 before
     std::atomic<int> stall{0};                   // blocks the host doesn't call process() for
+    // Or from the room's block `stall_at` on (-1: none), for `stall_len`
+    // blocks: so that two sides' stalls begin at the blocks meant.
+    std::atomic<long> stall_at{-1};
+    std::atomic<int> stall_len{0};
     std::mutex m;
     std::vector<std::string> notices;
     std::size_t noticeCount() {
@@ -71,6 +75,8 @@ struct Options {
     bool live_on = true;
     bool live_server = true;                     // false: a server without Live (LiveMode::No)
     bool relay_fallback = false;                 // the server's backend option (LiveConfig)
+    int block = kBlock;                          // the host's block, frames
+    int live_frame = 0;                          // the room's Live frame (120, 240 or 480; 0: the server's default)
 };
 
 struct Room {
@@ -109,7 +115,7 @@ struct Room {
 
     explicit Room(const Options& o, const std::vector<std::string>& names) : opt(o) {
         max_frames = static_cast<long>(kMaxSeconds) * opt.rate;
-        max_blocks = max_frames / kBlock + 1;
+        max_blocks = max_frames / opt.block + 1;
         ServerConfig cfg;
         cfg.port = 0;
         cfg.allow_anonymous = true;
@@ -121,6 +127,7 @@ struct Room {
         cfg.bpi = static_cast<std::uint16_t>(opt.bpi);
         cfg.live.mode = !opt.live_server ? LiveMode::No : opt.live_on ? LiveMode::On : LiveMode::Yes;
         cfg.live.relay_fallback = opt.relay_fallback;
+        if (opt.live_frame) cfg.live.frame = opt.live_frame;
         bool ok = server.start(cfg);
         // Live's UDP port has the TCP port's number, which another program on
         // the machine may hold: then another port.
@@ -228,15 +235,16 @@ struct Room {
         }
     }
 
-    // The host: one block of every engine every kBlock frames. After a late
-    // wake it calls again at once to catch up, as hosts do; a stall is a
-    // side's `stall`.
+    // The host: one block of every engine every opt.block frames. After a
+    // late wake it calls again at once to catch up, as hosts do; a stall is
+    // a side's `stall`, or its `stall_at` and `stall_len`.
     void audioLoop() {
         const int n = opt.sides;
-        std::vector<float> in(kBlock);
-        std::vector<std::vector<float>> out(static_cast<std::size_t>(2 * n), std::vector<float>(kBlock, 0.0f));
-        const auto period = std::chrono::nanoseconds(1000000000LL * kBlock / opt.rate);
-        host_audio_thread.store(thread::makeAudioThread(static_cast<double>(kBlock) / opt.rate) ? 1 : 0);
+        const int B = opt.block;
+        std::vector<float> in(static_cast<std::size_t>(B));
+        std::vector<std::vector<float>> out(static_cast<std::size_t>(2 * n), std::vector<float>(static_cast<std::size_t>(B), 0.0f));
+        const auto period = std::chrono::nanoseconds(1000000000LL * B / opt.rate);
+        host_audio_thread.store(thread::makeAudioThread(static_cast<double>(B) / opt.rate) ? 1 : 0);
         auto next = Clock::now();
         while (!audio_stop.load()) {
             std::this_thread::sleep_until(next);
@@ -252,29 +260,31 @@ struct Room {
             }
             if (now - next > std::chrono::seconds(1)) next = now;
             const long f = frames.load();
-            if (f + kBlock > max_frames) break;
-            const long b = f / kBlock;
+            if (f + B > max_frames) break;
+            const long b = f / B;
             for (int s = 0; s < n; ++s) {
                 Side& sd = *side[static_cast<std::size_t>(s)];
-                if (sd.stall.load() > 0) {
-                    sd.stall.fetch_sub(1);
+                const long stall_at = sd.stall_at.load(std::memory_order_acquire);
+                const bool stalled = stall_at >= 0 && b >= stall_at && b < stall_at + sd.stall_len.load();
+                if (stalled || sd.stall.load() > 0) {
+                    if (!stalled) sd.stall.fetch_sub(1);
                     sd.live[b] = b > 0 ? sd.live[b - 1] : 0;
                     sd.room[b] = b > 0 ? sd.room[b - 1] : 0;
                     sd.pos[b] = b > 0 ? sd.pos[b - 1] : 0;
                     continue;
                 }
-                for (int i = 0; i < kBlock; ++i) in[static_cast<std::size_t>(i)] = sd.signal ? sd.signal(f + i, opt.rate) : 0.0f;
+                for (int i = 0; i < B; ++i) in[static_cast<std::size_t>(i)] = sd.signal ? sd.signal(f + i, opt.rate) : 0.0f;
                 const float* inp[1] = {in.data()};
                 float* o[2] = {out[static_cast<std::size_t>(2 * s)].data(), out[static_cast<std::size_t>(2 * s + 1)].data()};
                 const auto t0 = Clock::now();
-                sd.e.process(inp, 1, o, 2, kBlock, opt.rate);
+                sd.e.process(inp, 1, o, 2, B, opt.rate);
                 const long took =
                     static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
                 if (took > slow_us.load()) slow_us.store(took);
                 sum_us.fetch_add(took);
                 calls.fetch_add(1);
                 if (took > 2000) slow_calls.fetch_add(1);
-                std::copy(o[0], o[0] + kBlock, sd.heard.get() + f);
+                std::copy(o[0], o[0] + B, sd.heard.get() + f);
                 sd.live[b] = sd.e.userLive(0) ? 1 : 0;
                 sd.room[b] = sd.e.liveRoomLive() ? 1 : 0;
                 int p = 0, len = 0;
@@ -283,7 +293,7 @@ struct Room {
                 if (p > 0 && sd.clock_from.load(std::memory_order_relaxed) < 0)
                     sd.clock_from.store(f, std::memory_order_release);   // running starts with a block (ENGINE.md 4.2)
             }
-            frames.store(f + kBlock);
+            frames.store(f + B);
         }
     }
 
@@ -360,8 +370,8 @@ struct Room {
         }
         return ok;
     }
-    long block() const { return frames.load() / kBlock; }
-    double secondsOf(long blocks) const { return blocks * double(kBlock) / opt.rate; }
+    long block() const { return frames.load() / opt.block; }
+    double secondsOf(long blocks) const { return blocks * double(opt.block) / opt.rate; }
     double ms(long frame_count) const { return frame_count * 1000.0 / opt.rate; }
     bool calm(long from, long to) {              // no hiccup between these frames
         std::lock_guard<std::mutex> lock(hm);
@@ -376,13 +386,13 @@ struct Room {
         const long done = block();
         for (long b = std::max(1L, from_block); b < done; ++b)
             if (sd.room[b - 1] == (was ? 1 : 0) && sd.room[b] != sd.room[b - 1]) {
-                if (frame) *frame = b * kBlock + (sd.pos[b] <= kBlock ? kBlock - sd.pos[b] : 0);
+                if (frame) *frame = b * opt.block + (sd.pos[b] <= opt.block ? opt.block - sd.pos[b] : 0);
                 return b;
             }
         return -1;
     }
     // Whether an interval boundary fell into block `b` of `s`.
-    bool boundaryIn(int s, long b) { return (*this)[s].pos[b] <= kBlock; }
+    bool boundaryIn(int s, long b) { return (*this)[s].pos[b] <= opt.block; }
 };
 
 // ------------------------------------------------------------ analysis

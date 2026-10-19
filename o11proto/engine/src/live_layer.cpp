@@ -913,9 +913,12 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
     }
     host_block.store(longest_);
     // Host gaps (6.9), reported at the first block that doesn't arrive early.
+    // The late block itself already tells the sinks what the host has missed
+    // so far (`pending`), which it may still catch up (`caught_up`).
     const std::int64_t dur = static_cast<std::int64_t>(frames) * 1000000000LL / rate;
     const bool early = prev_dur_ns_ > 0 && now - prev_start_ns_ < prev_dur_ns_ * 9 / 10;
-    int gap = 0;
+    int gap = 0, pending = 0;
+    bool caught_up = false;
     if (expect_ns_ != 0) {
         const std::int64_t threshold =
             std::max<std::int64_t>(20000000LL, 2LL * longest_ * 1000000000LL / rate);
@@ -927,7 +930,9 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
                 expect_ns_ = now;
             } else if (late > threshold) {
                 late_pending_ = true;
+                pending = static_cast<int>(std::min<std::int64_t>(late, 500000000LL) * rate / 1000000000LL);
             } else {
+                caught_up = late_pending_;
                 late_pending_ = false;
                 expect_ns_ = now;
             }
@@ -1016,9 +1021,12 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
             k.stats.clear(g);
             audio_gen_[s] = g;
         }
-        // A host gap first: what came while the host was away is skipped,
-        // which leaves room for what came since.
+        // A host gap first, before what came while the host was away: the
+        // sink owes it to the stream's delay, and the sender's xrun blocks
+        // may take it back (LiveSink::hostGap()).
+        if (pending > 0) k.hostLate(pending, rate, now);
         if (gap > 0) k.hostGap(gap, rate, now);
+        if (caught_up) k.hostCaughtUp();
         k.hostBehind(behind48);
         for (int i = 0; i < 256; ++i) {
             SinkItem* it = queue[s]->front();

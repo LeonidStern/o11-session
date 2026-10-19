@@ -342,6 +342,7 @@ void LiveSink::configure(double latency_ms, int host_block, int host_rate, doubl
             phase_ = Buffering;
             waited_ = 0;
             has_align_ = realign_ = false;      // and so has a new delay
+            forgetGap();
             fill_ref_ = -1;
             owed48_ = 0;
             stats.active.store(false);
@@ -373,6 +374,8 @@ void LiveSink::reset() {
     if (!tail) fifo_n_ = fifo_at_ = 0;
     fill_ = fill_ref_ = -1;
     has_align_ = realign_ = false;
+    absorbed_ = 0;
+    forgetGap();
     path_room_ = false;
     path_ns_ = 0;
     stats.active.store(false);
@@ -392,15 +395,42 @@ void LiveSink::emptyFrom(std::int32_t seq) {
     newest_ = static_cast<std::int64_t>(seq) - 1;
     last_played_ = newest_;
     far_ = false;
+    absorbed_ = 0;
 }
 
 void LiveSink::dropBefore(std::int64_t seq) {
-    for (std::int64_t s = next_; s < seq && s <= newest_ && s < next_ + kRing; ++s)
-        ring_[s & (kRing - 1)].state = Empty;
-    if (seq <= next_) return;
+    if (seq > next_) advanceTo(seq);
+}
+
+void LiveSink::advanceTo(std::int64_t seq) {
+    for (std::int64_t s = next_; s < seq && s <= newest_ && s < next_ + kRing; ++s) {
+        Entry& e = ring_[s & (kRing - 1)];
+        if (e.seq == s && e.state == Absorbed) {
+            --absorbed_;
+            align_ -= block_;                    // it takes no turn
+        }
+        e.state = Empty;
+    }
     next_ = seq;
     last_played_ = seq - 1;
     if (newest_ < seq - 1) newest_ = seq - 1;
+}
+
+std::int64_t LiveSink::blocksOn(std::int64_t count) const {
+    std::int64_t s = next_;
+    for (;;) {
+        if (s > newest_) return s + count;
+        while (absorbedAt(s)) ++s;
+        if (count == 0) return s;
+        ++s;
+        --count;
+    }
+}
+
+std::int64_t LiveSink::due() const {
+    const std::int64_t t = turn();
+    if (absorbed_ == 0 || t < next_) return t;
+    return blocksOn(t - next_);
 }
 
 void LiveSink::take(std::int32_t seq, const SinkItem& it, std::int64_t now_ns) {
@@ -416,7 +446,7 @@ void LiveSink::take(std::int32_t seq, const SinkItem& it, std::int64_t now_ns) {
         newest_ = seq;
     }
     Entry& e = ring_[seq & (kRing - 1)];
-    if (e.seq == seq && (e.state == Full || e.state == XrunBlock)) return;   // a duplicate
+    if (e.seq == seq && (e.state == Full || e.state == XrunBlock || e.state == Absorbed)) return;   // a duplicate
     const bool resent = e.seq == seq && e.state == Missing && e.requested;
     if (e.seq != seq) e.requested = false;      // the entry held another block
     e.seq = seq;
@@ -455,6 +485,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         fifo_n_ = fifo_at_ = 0;
         fill_ = fill_ref_ = -1;
         has_align_ = realign_ = false;          // a new stream finds its own delay
+        forgetGap();
         path_room_ = false;
         path_ns_ = 0;
         stats.block.store(block_);
@@ -499,6 +530,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         }
         emptyFrom(seq);                          // the stream wrapped
         has_align_ = realign_ = false;          // and its turns are counted afresh
+        forgetGap();
     }
     if (phase_ == Dry) {                         // audio again after running dry
         if (stopping_) return;
@@ -511,11 +543,23 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         // the rest waits for its turn. Only a stream more than the capacity
         // ahead of it buffers afresh.
         realign_ = has_align_ && seq - turn() <= room();
-        if (!realign_) event(now_ns, LiveEventKind::Rebuffer, seq);
+        if (!realign_) {
+            event(now_ns, LiveEventKind::Rebuffer, seq);
+            forgetGap();                         // a delay of its own: nothing is owed to the old one
+        }
         has_align_ = realign_;
         late48_ = 0;
     }
-    if (realign_ && seq < turn()) {              // too late for its turn
+    // An xrun block while this host's gap is owed: absorbed, it takes no
+    // turn (hostGap()). One more than is owed: the sender's gap was the
+    // longer, and what it missed beyond this host's is a hole.
+    bool absorbing = it.kind == SinkItem::Xrun && gap_open_ && gap_owed48_ > absorbAbove();
+    if (it.kind == SinkItem::Xrun && gap_open_ && !absorbing && gap_absorbed_ > 0 && !gap_longer_) {
+        gap_longer_ = true;
+        unabsorb(absorbAbove());
+        absorbing = gap_owed48_ > absorbAbove();
+    }
+    if (realign_ && !absorbing && seq < due()) {   // too late for its turn
         if (it.kind == SinkItem::Xrun) {         // but it still tells of the sender's gap (6.4)
             if (played48_ - last_xrun48_ > 4800) stats.xrun_gaps.fetch_add(1);
             last_xrun48_ = played48_;
@@ -530,6 +574,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
     }
     if (seq <= newest_) {
         take(seq, it, now_ns);
+        if (absorbing) absorb(seq);
         return;
     }
     const std::int64_t ahead = static_cast<std::int64_t>(seq) - newest_;
@@ -542,6 +587,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
         }
     } else if (static_cast<std::int64_t>(seq) - next_ + 1 <= room()) {
         take(seq, it, now_ns);
+        if (absorbing) absorb(seq);
         return;
     }
     stats.overruns.fetch_add(1);                 // no room: only this block is kept
@@ -551,6 +597,7 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
     phase_ = Buffering;
     waited_ = 0;
     has_align_ = realign_ = false;
+    forgetGap();
     owed48_ = 0;                                 // buffering afresh gives the buffer in use
     take(seq, it, now_ns);
 }
@@ -669,6 +716,7 @@ void LiveSink::prime() {
 }
 
 void LiveSink::decodeNext(std::int64_t now_ns) {
+    if (gap_open_ && gap_late48_ == 0 && played48_ >= gap_until48_) closeGap(now_ns);
     fifo_at_ = 0;
     fifo_n_ = block_;
     fifo_real_ = false;
@@ -676,7 +724,7 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
         const int held = heldBlocks();
         if (realign_) {                          // after running dry: back on its delay
             growAlign();
-            const std::int64_t due = turn();
+            const std::int64_t due = this->due();
             for (std::int64_t s = next_; s < due && s <= newest_ && s < next_ + kRing; ++s) {
                 const Entry& e = ring_[s & (kRing - 1)];
                 if (e.seq == s && e.state == Full) {
@@ -698,6 +746,7 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
                 stats.overruns.fetch_add(1);
                 event(now_ns, LiveEventKind::Rebuffer, due);
                 realign_ = has_align_ = false;
+                forgetGap();
                 waited_ = 0;
                 owed48_ = 0;                     // buffering afresh gives the buffer in use
             }
@@ -709,9 +758,7 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
             const int keep = sizes_.latency_blocks + behindBlocks();
             if (held > keep) {
                 const std::int64_t skip = held - keep;
-                for (std::int64_t s = next_; s < next_ + skip; ++s) ring_[s & (kRing - 1)].state = Empty;
-                next_ += skip;
-                last_played_ = next_ - 1;
+                advanceTo(blocksOn(skip));
                 if (started_) {                  // buffering again: the position jumps
                     stats.skips.fetch_add(1);
                     stats.skipped48.fetch_add(skip * block_);
@@ -753,6 +800,7 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
         break;
     case Playing: {
         if (growNow()) break;                    // the fallback's delay, while concealing
+        if (absorbedAt(next_)) advanceTo(blocksOn(0));   // xrun blocks absorbed by this host's gap: no turn
         if (next_ > newest_) {                   // empty at a block's turn
             stats.active.store(false);
             if (stopping_) {
@@ -814,25 +862,123 @@ void LiveSink::decodeNext(std::int64_t now_ns) {
     played48_ += block_;
 }
 
+void LiveSink::hostLate(int host_frames, int host_rate, std::int64_t now_ns) {
+    if (phase_ == Idle || host_rate <= 0 || !has_align_ || gap_late48_ > 0) return;
+    gap_late48_ = std::max<std::int64_t>(1, std::llround(static_cast<double>(host_frames) * 48000.0 / host_rate));
+    gap_owed48_ += gap_late48_;
+    openGap(now_ns);
+}
+
 void LiveSink::hostGap(int host_frames, int host_rate, std::int64_t now_ns) {
     if (phase_ == Idle || host_rate <= 0) return;
-    // What is left of the block decoded last goes, and whole blocks, to
-    // the nearest of the time the host missed: the delay stays, and so
-    // does the fill (to half a block), with the level it keeps.
+    const std::int64_t g48 = std::llround(static_cast<double>(host_frames) * 48000.0 / host_rate);
+    if (has_align_) {
+        // The stream plays on where it was; what this host missed is owed
+        // to its delay, and the sender's xrun blocks may take it back.
+        if (started_) stats.host_gaps.fetch_add(1);
+        gap_owed48_ += g48 - gap_late48_;
+        gap_late48_ = 0;
+        gap_confirmed_ = true;
+        openGap(now_ns);
+        return;
+    }
+    // A stream still finding its delay (buffering afresh): what is left of
+    // the block decoded last goes, and whole blocks, to the nearest of the
+    // time the host missed.
+    forgetGap();
     const int rest = fifo_n_ - fifo_at_;
-    const double g48 = static_cast<double>(host_frames) * 48000.0 / host_rate - rest;
-    const std::int64_t n = std::max<std::int64_t>(0, static_cast<std::int64_t>(std::floor(g48 / block_ + 0.5)));
+    const std::int64_t n = std::max<std::int64_t>(0, static_cast<std::int64_t>(std::floor((g48 - rest) / static_cast<double>(block_) + 0.5)));
     fifo_at_ = fifo_n_;
-    for (std::int64_t s = next_; s < next_ + n && s <= newest_; ++s) ring_[s & (kRing - 1)].state = Empty;
-    next_ += n;
-    last_played_ = next_ - 1;
-    if (newest_ < next_ - 1) newest_ = next_ - 1;
-    align_ -= n * block_;                        // the time the host missed: the delay stays
+    advanceTo(next_ + n);
+    align_ -= n * block_;
     if ((n > 0 || rest > 0) && phase_ == Playing) concealer_->cut();   // the stream jumps: joined over
     if (started_) {
         stats.host_gaps.fetch_add(1);
         stats.host_gap48.fetch_add(n * block_ + rest);
         event(now_ns, LiveEventKind::HostGap, n * block_ + rest);
+    }
+}
+
+void LiveSink::hostCaughtUp() {
+    if (gap_late48_ == 0) return;
+    gap_owed48_ -= gap_late48_;                  // nothing missed after all
+    gap_late48_ = 0;
+    if (!gap_confirmed_) {                       // no gap in this window: nothing is owed
+        unabsorb(0);
+        forgetGap();
+        return;
+    }
+    unabsorb(absorbAbove());
+}
+
+void LiveSink::openGap(std::int64_t now_ns) {
+    (void)now_ns;
+    if (!gap_open_) gap_absorbed_ = 0;
+    gap_open_ = true;
+    gap_until48_ = played48_ + kGapWindow48;
+    unabsorb(absorbAbove());
+    absorbHeld();
+}
+
+void LiveSink::absorbHeld() {
+    for (std::int64_t s = next_; s <= newest_ && s < next_ + kRing && gap_owed48_ > absorbAbove(); ++s) {
+        const Entry& e = ring_[s & (kRing - 1)];
+        if (e.seq == s && e.state == XrunBlock) absorb(s);
+    }
+}
+
+void LiveSink::absorb(std::int64_t seq) {
+    Entry& e = ring_[seq & (kRing - 1)];
+    if (e.seq != seq || e.state != XrunBlock || gap_owed48_ <= absorbAbove()) return;
+    e.state = Absorbed;
+    ++absorbed_;
+    ++gap_absorbed_;
+    gap_owed48_ -= block_;
+}
+
+// While a block fewer would still leave no more owed than `above` (the host
+// caught up after all, or missed less than it seemed, or the sender's gap
+// was the longer), the newest absorbed blocks not yet passed are xrun
+// blocks again.
+void LiveSink::unabsorb(std::int64_t above) {
+    for (std::int64_t s = newest_; s >= next_ && s > newest_ - kRing && gap_owed48_ + block_ <= above && absorbed_ > 0; --s) {
+        Entry& e = ring_[s & (kRing - 1)];
+        if (e.seq != s || e.state != Absorbed) continue;
+        e.state = XrunBlock;
+        --absorbed_;
+        if (gap_absorbed_ > 0) --gap_absorbed_;
+        gap_owed48_ += block_;
+    }
+}
+
+// The window closes. What the sender's xrun blocks didn't take back is
+// skipped of the stream's own audio, to the nearest block. When xrun blocks
+// came, up to a block of it is their rounding (the sender carries the rest
+// of its gap over to the next) and up to the slack the hosts' measures of
+// the gap differing: that stays.
+void LiveSink::closeGap(std::int64_t now_ns) {
+    const std::int64_t owed = gap_owed48_;
+    const bool absorbed = gap_absorbed_ > 0;
+    forgetGap();
+    if (owed <= 0 || (absorbed && owed < block_ + gapSlack48())) return;
+    const std::int64_t n = static_cast<std::int64_t>(std::floor(static_cast<double>(owed) / block_ + 0.5));
+    if (n > 0) skipBlocks(n, now_ns);
+}
+
+void LiveSink::forgetGap() {
+    gap_owed48_ = gap_late48_ = 0;
+    gap_open_ = gap_confirmed_ = gap_longer_ = false;
+    gap_absorbed_ = 0;
+}
+
+void LiveSink::skipBlocks(std::int64_t n, std::int64_t now_ns) {
+    if (phase_ == Idle) return;
+    advanceTo(blocksOn(n));
+    align_ -= n * block_;                        // the time the host missed: the delay stays
+    if (phase_ == Playing) concealer_->cut();    // the stream jumps: joined over
+    if (started_) {
+        stats.host_gap48.fetch_add(n * block_);
+        event(now_ns, LiveEventKind::HostGap, n * block_);
     }
 }
 
@@ -853,7 +999,7 @@ bool LiveSink::render(float* out, int frames, int rate, std::int64_t now_ns) {
         // what the fill does then (the stream's sender may have stalled
         // too) says nothing of the clocks: the estimate holds until the host
         // has caught up.
-        if (behind48_ == 0) {
+        if (behind48_ == 0 && !gap_open_) {
             const double fill = (heldBlocks() * block_ + (fifo_n_ - fifo_at_)) / 48000.0;
             if (fill_ < 0) {                     // a new estimate: from this fill
                 fill_ = fill;
