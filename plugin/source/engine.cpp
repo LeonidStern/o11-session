@@ -541,6 +541,22 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
             if (bus[c]) mix[2 + 2 * p + c] = bus[c] + done;
     m_client->process(ins, 2, mix, MIX_OUTS, n, srate);
 
+    // a stopped host hears no room either (your monitoring goes on): the room and each player
+    // output fade over 10 ms to silence, and back in when it plays
+    const float roomTarget = stopped ? 0.0f : 1.0f;
+    const float roomStep = srate > 0 ? (float)(1.0 / (0.010 * srate)) : 1.0f;
+    float roomFrom = m_roomGain;
+    if (roomFrom != roomTarget || roomTarget == 0.0f)
+    {
+      float g = roomFrom;
+      for (int i = 0; i < n; i ++)
+      {
+        g = roomTarget > g ? std::min(roomTarget, g + roomStep) : std::max(roomTarget, g - roomStep);
+        for (int c = 0; c < MIX_OUTS; c ++) mix[c][i] *= g;
+      }
+      m_roomGain = g;
+    }
+
     // the main output: everyone, and your monitoring (the engine's own is muted, so it goes on
     // while nothing is sent)
     float *outs[2] = { out[0] + done, numOut > 1 && out[1] ? out[1] + done : m_spare.data() };
@@ -561,8 +577,8 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
       }
     }
 
-    // the metronome, on the beats of the interval these samples played in
-    if (m_client->isIntervalRunning())
+    // the metronome, on the beats of the interval these samples played in (not while stopped)
+    if (m_client->isIntervalRunning() && !stopped)
     {
       m_client->position(&pos, &length);
       m_click.render(outs[0], numOut > 1 && out[1] ? outs[1] : nullptr, n, pos - n, m_client->usualIntervalLength(),
