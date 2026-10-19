@@ -57,7 +57,7 @@ enum class LiveMode {
 struct LiveConfig {
     LiveMode mode = LiveMode::No;
     int kbps = 128;                            // the room's Live Opus bitrate, 32-510
-    int frame = 240;                           // Opus frame at 48 kHz: 120, 240 or 480
+    int frame = 480;                           // Opus frame at 48 kHz: 120, 240 or 480 (live::kDefaultFrame)
     int max_peers = 8;                         // senders per room, 1-64
     int announce_port = 0;                     // UDP port announced instead of the real one; 0 = the real one
     bool strict_address = true;                // UDP must come from the player's TCP address

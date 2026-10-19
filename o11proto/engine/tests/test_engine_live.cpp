@@ -766,8 +766,9 @@ TEST(jitter_buffer_setting_takes_effect) {
     const std::string line = r.side[1].findNotice("alice: ", seen);
     std::printf("    %s\n    %s\n", head.c_str(), line.c_str());
     CHECK(head.find("Live is on. Jitter buffer 60 ms (/live buffer N to change it). Round trip to the server ") == 0);
-    // The buffer and the codec as they are. The network figure is half the
-    // round trip measured over the loopback (0 ms here, 1 ms on the macOS
+    // The buffer and the codec as they are: at the default frame of 480
+    // samples, 11 ms (6 ms at 240). The network figure is half the round
+    // trip measured over the loopback (0 ms here, 1 ms on the macOS
     // runner), so any number.
     {
         const std::string pre = " ms late (buffer 60 ms, network ";
@@ -775,7 +776,7 @@ TEST(jitter_buffer_setting_takes_effect) {
         std::size_t d = b == std::string::npos ? line.size() : b + pre.size();
         const std::size_t digits = d;
         while (d < line.size() && line[d] >= '0' && line[d] <= '9') ++d;
-        CHECK(b != std::string::npos && d > digits && line.compare(d, 18, " ms, codec 6 ms), ") == 0);
+        CHECK(b != std::string::npos && d > digits && line.compare(d, 19, " ms, codec 11 ms), ") == 0);
     }
     CHECK(line.find(" s since the buffer changed, ") != std::string::npos);
     if (calm) {

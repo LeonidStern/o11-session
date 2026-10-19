@@ -14,10 +14,16 @@
 
 #include "check.h"
 #include "live_harness.h"
+#include "o11proto/live.h"
 
 using namespace harness;
 
 namespace {
+
+// A stream's blocks a second at the room's default frame (100 at 480
+// samples, 200 at 240), and within 10 % of that.
+constexpr long kBlocks = 48000 / o11proto::live::kDefaultFrame;
+constexpr long kBlocksLo = kBlocks * 9 / 10, kBlocksHi = kBlocks * 11 / 10;
 
 const double kHz[3] = {500, 700, 1100};
 float tone(long n, int rate, double hz) { return static_cast<float>(0.25 * std::sin(2 * M_PI * hz * n / rate)); }
@@ -369,9 +375,9 @@ TEST(relay_fallback_takes_the_room_to_the_relay) {
         CHECK(!rr.direct_possible);
     }
     const std::uint64_t relayed = relayedOver(r, 2.0);
-    // Each of three sends 200 blocks a second, copied to the two others.
+    // Each of three sends kBlocks a second, copied to the two others.
     std::printf("    the relay copied %llu data datagrams in 2 s\n", static_cast<unsigned long long>(relayed));
-    CHECK(relayed >= 2 * 3 * 2 * 180 && relayed <= 2 * 3 * 2 * 220 + 80);
+    CHECK(relayed >= 2 * 3 * 2 * kBlocksLo && relayed <= 2 * 3 * 2 * kBlocksHi + 80);
     hearsEveryoneEvenly(r, live_at + r.opt.rate, r.frames.load(), "across the change to the relay");
 
     // Let through: the advice comes, and the room stays on the relay.
@@ -440,9 +446,9 @@ TEST(forced_relay) {
     }
     hearsEveryoneEvenly(r, live_at + r.opt.rate, r.frames.load(), "alice through the relay");
     const std::uint64_t relayed = relayedOver(r, 2.0);
-    // alice's blocks to the two others, and theirs to her: 4 streams of 200 a second.
+    // alice's blocks to the two others, and theirs to her: 4 streams of kBlocks a second.
     std::printf("    the relay copied %llu data datagrams in 2 s\n", static_cast<unsigned long long>(relayed));
-    CHECK(relayed >= 2 * 4 * 180 && relayed <= 2 * 4 * 220 + 80);
+    CHECK(relayed >= 2 * 4 * kBlocksLo && relayed <= 2 * 4 * kBlocksHi + 80);
     for (int a = 0; a < 3; ++a) CHECK(r[a].e.liveAdviceReason() == Engine::LiveAdvice::None);
 
     // alice can send directly again. Make before break: each stream the
@@ -503,7 +509,7 @@ TEST(relay_fallback_forced_relay) {
     hearsEveryoneEvenly(r, live_at + r.opt.rate, r.frames.load(), "everyone through the relay");
     const std::uint64_t relayed = relayedOver(r, 2.0);
     std::printf("    the relay copied %llu data datagrams in 2 s\n", static_cast<unsigned long long>(relayed));
-    CHECK(relayed >= 2 * 3 * 2 * 180 && relayed <= 2 * 3 * 2 * 220 + 80);
+    CHECK(relayed >= 2 * 3 * 2 * kBlocksLo && relayed <= 2 * 3 * 2 * kBlocksHi + 80);
 
     r[0].e.setLiveTestForceRelay(false);
     const bool possible = r.until([&] { return r[2].e.liveRoomRoute().direct_possible; }, 8);
