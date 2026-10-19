@@ -940,8 +940,7 @@ void O11Editor::updateRoom(const Snapshot &s, double)
                        (s.liveHeardMs > 0 ? ": you hear the others about " + uitext::msText(s.liveHeardMs) + " late" : "") +
                        ". Or " + lengths);
   else if (s.liveSwitchOn)
-    setTooltip(m_mode, "Live is on: the room plays intervals until everyone's connection is clean, then everyone goes Live "
-                       "together at an interval's start. Or " + lengths);
+    setTooltip(m_mode, "Live is on: everyone goes Live together when the next interval starts. Or " + lengths);
   else setTooltip(m_mode, "The room plays intervals: pick Live to play everyone in real time, from an interval's start, or " + lengths);
 
   // what the room changes to at the next interval, and who voted for it (when the server says)
