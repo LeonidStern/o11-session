@@ -66,7 +66,7 @@ distance allows.
 
 - **Direct, all to all.** Every player sends to every other player over the
   shortest path the internet has.
-- **10 ms Opus frames** for low delay and steady sound.
+- **10 ms Opus frames at 128 kbps** for low delay and steady sound.
 - **A self-tuning buffer.** It starts at 10 ms and steps up to 20 ms by
   itself on a connection that can't hold 10 ms. Nothing to set.
 - **A room that tells you what's wrong.** If someone's connection isn't good
