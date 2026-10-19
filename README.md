@@ -46,8 +46,8 @@ Reaper, Studio One, Cubase and any other VST3 host.
 
 ## Quick start
 
-1. **Install.** On macOS, open the disk image and drag O11 Session onto the
-   VST3 folder (it is signed and notarized by Apple). On Windows, copy
+1. **Install.** On macOS, open the disk image, double-click the VST3
+   folder in it, and drag O11 Session into that folder's window (it is signed and notarized by Apple). On Windows, copy
    `O11Session.vst3` into `C:\Program Files\Common Files\VST3`. On Linux, copy
    it into `~/.vst3`. Then rescan plug-ins in your DAW.
 2. **Start a room.** Put O11 Session on a track and press Host. It opens the
