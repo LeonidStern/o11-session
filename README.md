@@ -1,140 +1,133 @@
+<div align="center">
+
 # O11 Session
 
-**Jam with anyone, anywhere, right from your DAW.**
+### Play with your band in real time, from anywhere, right inside your DAW.
+
+[![Build](https://github.com/LeonidStern/o11-session/actions/workflows/o11session.yml/badge.svg)](https://github.com/LeonidStern/o11-session/actions/workflows/o11session.yml)
+![VST3](https://img.shields.io/badge/format-VST3-blue)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
+
+[**Download**](#download) · [Live mode](#live-mode) · [Intervals mode](#intervals-mode) · [Ableton Link](#auto-bpm-with-ableton-link) · [Rock-solid timing](#rock-solid-timing) · [FAQ](#faq)
+
+</div>
 
 O11 Session is a plug-in that turns your DAW into a shared rehearsal room.
-Drop it on a track, send a link to your bandmates, and play together over the
-internet, in time, each of you in your own studio with your own sounds.
+Put it on a track, send the room address to your bandmates, and jam over the
+internet, each of you in your own studio with your own instruments, sounds
+and mix.
 
-Inspired by [NINJAM](https://www.cockos.com/ninjam/) and
-[JamTaba](https://jamtaba-music-web-site.appspot.com/), rebuilt from the
-ground up to be lighter, cleaner and easier to use.
+## Why O11 Session
+
+- 🎸 **Two ways to play, one room.** Live mode for real-time feel, Intervals
+  mode for perfect timing at any distance. Switch with one click.
+- 🥁 **Auto BPM.** Your DAW follows the room's tempo and bars through Ableton
+  Link.
+- ⏱️ **Built not to drift.** Continuous clock correction and smart stall
+  recovery keep everyone locked together for the whole session.
+- 🎛️ **Every player on their own track.** Mix, record and add effects to each
+  bandmate like any other track.
+- 🚀 **Host with one click.** The room runs inside the plug-in. No server to
+  rent, nothing to configure.
 
 ## Download
 
-| | |
+| Platform | Download |
 |---|---|
-| **macOS, Apple silicon** (M1 and later, macOS 12 or later) | [O11Session-macos-arm64.dmg](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-macos-arm64.dmg) |
-| **macOS, Intel** (macOS 12 or later) | [O11Session-macos-x86_64.dmg](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-macos-x86_64.dmg) |
+| **macOS, Apple silicon** (M1 and later, macOS 12+) | [O11Session-macos-arm64.dmg](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-macos-arm64.dmg) |
+| **macOS, Intel** (macOS 12+) | [O11Session-macos-x86_64.dmg](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-macos-x86_64.dmg) |
 | **Windows** (64-bit) | [O11Session-windows-x64.zip](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-windows-x64.zip) |
 | **Linux** (x86_64) | [O11Session-linux-x86_64.zip](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-linux-x86_64.zip) |
 
-These links always point to the newest build.
+These links always point to the newest build. Works in Ableton, Bitwig,
+Reaper, Studio One, Cubase and any other VST3 host.
 
-## Install
+## Quick start
 
-- **macOS:** open the disk image and drag O11 Session onto the VST3 folder.
-  It is signed and notarized by Apple, so it opens without warnings.
-- **Windows:** unzip and copy `O11Session.vst3` into
-  `C:\Program Files\Common Files\VST3`.
-- **Linux:** unzip and copy `O11Session.vst3` into `.vst3` in your home folder.
-
-Then rescan plug-ins in your DAW. In Ableton Live that is Settings, Plug-Ins,
-Rescan.
-
-## How it works
-
-Everyone hears everyone else one bar (or a few bars) late, perfectly in time.
-While you play the next phrase, the last one arrives from the others, so the
-music lines up on the beat no matter how far apart you are. It suits jams,
-loops, grooves and songs built on a steady pulse.
-
-1. **Start a room.** Put O11 Session on a track and press Host. It opens the
+1. **Install.** On macOS, open the disk image and drag O11 Session onto the
+   VST3 folder (it is signed and notarized by Apple). On Windows, copy
+   `O11Session.vst3` into `C:\Program Files\Common Files\VST3`. On Linux, copy
+   it into `~/.vst3`. Then rescan plug-ins in your DAW.
+2. **Start a room.** Put O11 Session on a track and press Host. It opens the
    room on your computer, asks your router to let people in, and shows the
    address to share.
-2. **Invite your band.** They paste the address into their own copy and join.
-3. **Play.** Each player arrives on their own output in your DAW, so you can
-   mix, mute, solo, record and add effects to them like any other track.
+3. **Invite your band.** They paste the address into their own copy and join.
+4. **Play.** Each player arrives on their own output in your DAW.
 
-## Features
+## Live mode
 
-- **Lives in your DAW.** A VST3 plug-in for Ableton Live, Bitwig, Reaper,
-  Studio One, Cubase and other VST3 hosts on macOS, Windows and Linux.
-- **Every player on their own track.** Up to eight other players each get a separate
-  stereo output, ready to mix, record or process.
-- **Studio sound.** Opus at up to 510 kbps for near-transparent audio, or
-  lossless FLAC when the connection allows. The room switches with one vote.
-- **Locked to your DAW's tempo.** The room follows your bars and tempo, and a
-  tempo change in your DAW becomes a vote for the room.
-- **Ableton Link.** Link-enabled DAWs such as Live and Bitwig follow the
-  room's tempo automatically.
-- **Host with one click.** No server to rent and nothing to configure. The
-  room runs inside the plug-in, and your router is set up for you where it
-  allows it.
-- **Room chat and votes.** Talk, set the tempo and bar length, and choose the
-  sound quality together.
-- **Built-in metronome**, saved with your project, along with every other
-  setting.
-- **Small and fast.** One compact window, a light footprint, and a server that
-  uses less than half the CPU of the classic one (see below).
+**Play together, right now.** Live mode sends your audio straight to every
+other player the moment you play it. No server in the middle and no bar of
+delay: you hear each other as if you were in the same room, as far as the
+distance allows.
 
-## Benchmarks
+- **Direct, all to all.** Every player sends to every other player over the
+  shortest path the internet has.
+- **10 ms Opus frames** for low delay and steady sound.
+- **A self-tuning buffer.** It starts at 10 ms and steps up to 20 ms by
+  itself on a connection that can't hold 10 ms. Nothing to set.
+- **A room that tells you what's wrong.** If someone's connection isn't good
+  enough for Live, the room names them and suggests Intervals mode. One click
+  switches the whole room.
 
-Measured on 2026-10-16 and 2026-10-17, back to back on the same Linux
-machine with the same inputs. The comparison is against NINJAM's reference
-server and client, the classic setup most online jam tools are built on.
+## Intervals mode
 
-**Server load** (every player sending two channels at 128 kbps):
+**Perfectly in time, at any distance.** Everyone hears everyone else a few
+beats late, exactly on the beat. While you play the next phrase, the last one
+arrives from the others, so the music lines up whether your band is across
+town or across an ocean. Made for jams, loops, grooves and songs with a steady
+pulse.
 
-| Room | Classic server CPU | O11 Session CPU |
-|---|---|---|
-| 8 players | 1.6 to 1.7 % | **0.6 to 0.7 %** |
-| 16 players | 4.1 to 4.8 % | **2.5 to 2.8 %** |
+- **Pick the interval:** 2, 4, 8, 12 or 16 beats.
+- **Studio sound:** Opus at up to 510 kbps, or lossless FLAC when the
+  connection allows.
+- **Works over any connection**, relayed through the player hosting the room.
 
-**Forwarding delay** inside the server:
+**Seamless switching.** Every change between Live and Intervals fades over
+20 ms, so it is click-free, and the room keeps its tempo and settings in both
+modes.
 
-| | Classic server | O11 Session |
-|---|---|---|
-| Typical | 0.40 ms | **0.19 ms** |
-| Worst seen | 5 to 6 ms | **0.4 to 1.7 ms** |
+## Auto BPM with Ableton Link
 
-**Audio quality** (a test tone sent through a real server and compared with
-what the listener hears; higher is better):
+Turn on Sync and your DAW follows the room. O11 Session leads your DAW's tempo
+through Ableton Link and lines up your bars with the room, so clips launch on
+the room's downbeat. Change the tempo in your DAW and it becomes a vote for
+the room. Works with Ableton, Bitwig and every other Link-enabled DAW; in
+other DAWs the room follows your DAW's tempo and bars.
 
-| | Opus 510 kbps | FLAC |
-|---|---|---|
-| Classic client | 42.6 dB | 87.3 dB |
-| O11 Session | **47.8 dB** | 87.3 dB |
+## Rock-solid timing
 
-**Client CPU** for a sender and a listener together: about 1.7 % of one core
-at Opus 510 kbps, a little above the classic client's 1.4 %. Profiling shows
-why: about 78 % of it is the Opus library at its highest quality setting,
-which is also what gives the better sound above. O11 Session's own code is 5
-to 8 %. Two parts of it cost more than they should have, and were tuned on
-2026-10-17:
+Playing over the internet is a fight against drift and dropouts. O11 Session
+is built to win it:
 
-| | Before | After |
-|---|---|---|
-| Opus at 44.1 kHz, CPU of one core | 2.5 % | **2.2 %** |
-| FLAC's 16-bit conversion, instructions per 20 s | 172 M | **59 M** |
-| 44.1 kHz resampler, instructions per 20 s | 1041 M | **318 M** |
+- **Clock drift is corrected continuously.** Each player's audio plays a
+  tiny, inaudible bit faster or slower to keep the buffer exactly where it
+  belongs, so the delay never creeps up and never jumps.
+- **Your bandmates' hiccups don't become yours.** When a player's computer
+  misses a moment of audio, the listeners absorb the gap smoothly instead of
+  falling behind for the rest of the session.
+- **Catch-up done right.** After a stall, a stream catches up only by what it
+  really lost, so no music is skipped that didn't need to be.
+- **Lost packets are asked for again**, and anything that still doesn't
+  arrive is concealed and faded out, never clicked.
 
-The sound is the same to 0.1 dB.
+## More features
 
-**Compatibility:** the classic server's own protocol test suite passes 28 of
-28 cases against the O11 Session server.
+- **Up to eight other players**, each on a separate stereo output.
+- **Room chat and votes** for tempo, interval and sound quality.
+- **Built-in metronome**, saved with your project along with every setting.
+- **Small and light.** One compact window and a light footprint.
 
-Every change is built and tested automatically on macOS, and each release
-candidate on macOS, Windows and Linux, including Tracktion's pluginval at its
-strictest level and a full two-player session through a hosted room.
+## FAQ
 
-## Coming next
+**Do I need a server?** No. One player presses Host and the room runs inside
+their plug-in.
 
-- **Live mode:** real-time playing with no bar of delay, for players close
-  to each other.
-- **CLAP** support.
-- **The O11 Session box:** a networked audio interface for jamming without a
-  computer.
+**Live or Intervals?** Start in Live. If the room suggests Intervals, someone
+is too far or on a shaky connection; switch and keep playing.
 
-## For developers
-
-Building from source needs CMake 3.25 or later, Ninja and a C++17 compiler:
-
-    cmake -S plugin -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-    cmake --build build
-
-The plug-in is in `plugin/` and the network and audio engine with its
-specifications is in `o11proto/`.
+**Does it work with my DAW?** Any VST3 host on macOS, Windows or Linux.
+Ableton and Bitwig also get auto BPM through Ableton Link.
 
 ## Licence
 
