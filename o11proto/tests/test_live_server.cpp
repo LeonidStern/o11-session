@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -262,6 +263,13 @@ struct Harness {
         return n;
     }
 };
+
+// The server's cookie epoch now: its cookies change every
+// kCookieEpochSeconds of the steady clock, which this process shares.
+static std::int64_t cookieEpoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() /
+           live::kCookieEpochSeconds;
+}
 
 // Drains everything waiting on `u`; returns how many datagrams.
 static int drain(Harness& h, Udp& u, int quiet_ms = 100) {
@@ -673,13 +681,21 @@ TEST(nat_rebinding) {                               // 12, 13
     // 13: a hello without a cookie from another socket on the same IP
     CHECK(h.helloCookie(stranger, b) != 0);
     // 12: the old port's cookie from the new port: answered, doesn't move b
+    const std::int64_t epoch = cookieEpoch();
     std::uint64_t new_cookie = h.helloCookie(ub_new, b, old_cookie);
     CHECK(new_cookie != 0 && new_cookie != old_cookie);
     Bytes p = payloadOf(20, 7), got;
     ua.send(data(a.id(), a.key(), b.id(), p));
     CHECK(h.recv(ub_old, got) && isData(got, a.id(), p));
     CHECK(h.silent(ub_new, 100) && h.silent(stranger, 50));
-    CHECK_EQ(h.helloCookie(ub_new, b, new_cookie), new_cookie);
+    // Echoed, the cookie moves b. Its reply has the same cookie, or the next
+    // epoch's when one began meanwhile (the echoed one, of the epoch
+    // before, still binds; the data below shows it).
+    const std::uint64_t again = h.helloCookie(ub_new, b, new_cookie);
+    if (cookieEpoch() == epoch)
+        CHECK_EQ(again, new_cookie);
+    else
+        CHECK(again != 0);
     ua.send(data(a.id(), a.key(), b.id(), p));
     CHECK(h.recv(ub_new, got) && isData(got, a.id(), p));
     CHECK(h.silent(ub_old, 100));
