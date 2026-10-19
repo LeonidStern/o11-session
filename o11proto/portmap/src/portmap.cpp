@@ -3,11 +3,10 @@
 // One thread (section 4) maps the port (section 5), waits for the renewal
 // time or the retry time, and removes the mapping (section 6) when told to
 // stop. UPnP-IGD goes through miniupnpc, NAT-PMP through libnatpmp. With
-// Live (PROTOCOL.md 15.11) the UDP port of the same number is mapped too,
+// Live (PROTOCOL.md 15.8) the UDP port of the same number is mapped too,
 // after TCP and with TCP's lease; a UDP failure never fails the TCP mapping.
 #include "o11proto/portmap.h"
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -16,6 +15,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include "socket_compat.h"   // Asio
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -32,7 +33,6 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #endif
@@ -150,6 +150,7 @@ struct PortMapper::Impl {
     bool udp = false;                   // map the UDP port too (Live)
 
     std::thread thread;
+    asio::io_context io{1};             // the mapping thread's waits for NAT-PMP's answers
     std::mutex mutex;
     std::condition_variable cv;
     bool stopping = false;
@@ -304,30 +305,44 @@ struct PortMapper::Impl {
 
     // Waits for the answer to the pending request for up to waitMs, calling
     // readnatpmpresponseorretry every 250 ms (it retransmits on its own
-    // schedule). With checkStop, gives up when stop() was called. Returns the
-    // library result, or NATPMP_TRYAGAIN when the time ran out.
+    // schedule) or as soon as libnatpmp's socket is readable. The waits are
+    // Asio's, on the mapper's io_context, with the socket lent to it for the
+    // time of the call (released, not closed: closenatpmp closes it). With
+    // checkStop, gives up when stop() was called. Returns the library result,
+    // or NATPMP_TRYAGAIN when the time ran out.
     int natpmpWait(natpmp_t& np, natpmpresp_t& resp, int waitMs, bool checkStop) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs);
+        asio::ip::udp::socket sock(io);
+        asio::error_code lent;
+        sock.assign(asio::ip::udp::v4(), static_cast<asio::ip::udp::socket::native_handle_type>(np.s), lent);
+        asio::steady_timer step_timer(io);
+        int r = NATPMP_TRYAGAIN;
         for (;;) {
-            if (checkStop && stopRequested()) return NATPMP_TRYAGAIN;
+            if (checkStop && stopRequested()) break;
             auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) return NATPMP_TRYAGAIN;
+            if (now >= deadline) break;
             auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
             int step = static_cast<int>(left < kPollStepMs ? left : kPollStepMs);
-            fd_set fds;
-            FD_ZERO(&fds);
-#ifdef _WIN32
-            FD_SET(static_cast<SOCKET>(np.s), &fds);
-#else
-            FD_SET(np.s, &fds);
-#endif
-            timeval tv{};
-            tv.tv_sec = step / 1000;
-            tv.tv_usec = (step % 1000) * 1000;
-            select(np.s + 1, &fds, nullptr, nullptr, &tv);
-            int r = readnatpmpresponseorretry(&np, &resp);
-            if (r != NATPMP_TRYAGAIN) return r;
+            if (!lent) sock.async_wait(asio::socket_base::wait_read, [](const asio::error_code&) {});
+            step_timer.expires_after(std::chrono::milliseconds(step));
+            step_timer.async_wait([](const asio::error_code&) {});
+            io.restart();
+            io.run_one();                       // the answer, or the step's time
+            asio::error_code ignored;
+            if (!lent) sock.cancel(ignored);
+            step_timer.cancel();
+            io.run();                           // the other one ends too
+            r = readnatpmpresponseorretry(&np, &resp);
+            if (r != NATPMP_TRYAGAIN) break;
         }
+        if (!lent) {
+            asio::error_code kept;
+            sock.release(kept);
+            // Should Asio ever keep it, it closes it: then libnatpmp mustn't
+            // (its next requests fail, as when the router doesn't answer).
+            if (kept) np.s = static_cast<decltype(np.s)>(-1);
+        }
+        return r;
     }
 
     // Sends a TCP mapping request and waits for the answer. Returns the

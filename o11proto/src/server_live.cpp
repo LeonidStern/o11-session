@@ -15,6 +15,7 @@
 #include "o11proto/live.h"
 #include "o11proto/live_room.h"
 #include "o11proto/server.h"
+#include "server_net.h"
 #include "udp_compat.h"
 
 namespace o11proto {
@@ -185,6 +186,10 @@ struct Server::Live {
     std::uint64_t in = 0, out = 0;
     std::array<std::uint64_t, kReasons> dropped{};
     std::uint8_t buf[2048];
+    // A datagram since the last pass that may change what a pass does (a
+    // hello: a binding, its 0x07 and 0x09, the advice). Relayed data
+    // changes nothing there: no pass of its own (the 20 ms tick has them).
+    bool pass_wanted = false;
     // The advice: worked out at every tick from the players' reports.
     live::RoomAdvice advice;
     TimePoint epoch = Clock::now();            // the advice's clock starts here
@@ -211,7 +216,7 @@ struct Server::Live {
     };
     RouteCheck checkRoute() const {
         RouteCheck r;
-        std::vector<int> in;                   // the bound senders that send directly
+        std::vector<int> direct;               // the bound senders that send directly
         for (int id : senders) {
             auto it = players.find(id);
             if (it == players.end() || !it->second.bound) continue;
@@ -220,7 +225,7 @@ struct Server::Live {
                                      : p.relay_only ? live::RelayWhy::RelayOnly
                                                     : live::RelayWhy::None;
             if (w == live::RelayWhy::None) {
-                in.push_back(id);
+                direct.push_back(id);
                 continue;
             }
             r.all_up = false;
@@ -234,18 +239,18 @@ struct Server::Live {
             auto it = m.find(to);
             return it == m.end() ? live::PathState::Opening : it->second;
         };
-        for (std::size_t i = 0; i < in.size(); ++i)
-            for (std::size_t j = i + 1; j < in.size(); ++j) {
-                const live::PathState x = state(in[i], in[j]), y = state(in[j], in[i]);
+        for (std::size_t i = 0; i < direct.size(); ++i)
+            for (std::size_t j = i + 1; j < direct.size(); ++j) {
+                const live::PathState x = state(direct[i], direct[j]), y = state(direct[j], direct[i]);
                 if (x == live::PathState::Up && y == live::PathState::Up) continue;
                 r.all_up = false;
                 if (x != live::PathState::Down && y != live::PathState::Down) continue;
-                ++r.no_path[in[i]];
-                ++r.no_path[in[j]];
+                ++r.no_path[direct[i]];
+                ++r.no_path[direct[j]];
                 if (r.why == live::RelayWhy::None) {
                     r.why = live::RelayWhy::NoPath;
-                    r.a = in[i];
-                    r.b = in[j];
+                    r.a = direct[i];
+                    r.b = direct[j];
                 }
             }
         return r;
@@ -271,9 +276,9 @@ struct Server::Live {
             kv.second.path_states.clear();     // new keys: every path opens again
         }
         paths_ok = live::systemRandom(path_secret, sizeof(path_secret));   // new keys for every pair
-        cfg.fresh_seconds = envSeconds("NINJAM_LIVE_FRESH_SECONDS", cfg.fresh_seconds);
+        cfg.fresh_seconds = envSeconds("O11_LIVE_FRESH_SECONDS", cfg.fresh_seconds);
         cfg.relay_fallback = envFlag("O11_LIVE_RELAY_FALLBACK", cfg.relay_fallback);
-        cfg.stats_seconds = envSeconds("NINJAM_LIVE_STATS_SECONDS", cfg.stats_seconds);
+        cfg.stats_seconds = envSeconds("O11_LIVE_STATS_SECONDS", cfg.stats_seconds);
         stats_since = next_fresh_check = Clock::now();
         in = out = 0;
         dropped.fill(0);
@@ -289,29 +294,25 @@ namespace {
 
 enum class OpenResult { Ok, Busy, NoRandom };
 
-// Opens the relay's socket on `port` (on `bind_address` when the TCP
+// Opens the relay's socket `s` on `port` (on `bind_address` when the TCP
 // listener has one) and draws a new cookie secret.
-OpenResult openRelaySocket(std::uint16_t port, const std::string& bind_address, std::uint8_t secret[16],
-                           socket_t& out) {
-    out = kInvalidSocket;
-    socket_t fd = udp::open(live::kRelaySocketBuffer, true);   // no address reuse
-    if (fd == kInvalidSocket) return OpenResult::Busy;
-    sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_ANY);
-    std::uint32_t ip = 0;
-    if (!bind_address.empty() && udp::parseIPv4(bind_address, ip)) sa.sin_addr.s_addr = ip;
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-        compat::closeSocket(fd);
-        return OpenResult::Busy;
+OpenResult openRelaySocket(asio::ip::udp::socket& s, std::uint16_t port, const std::string& bind_address,
+                           std::uint8_t secret[16]) {
+    asio::error_code ec;
+    if (!udp::openSocket(s, live::kRelaySocketBuffer, true, ec)) return OpenResult::Busy;   // no address reuse
+    asio::ip::address_v4 addr = asio::ip::address_v4::any();
+    if (!bind_address.empty()) {
+        asio::error_code bad;
+        const asio::ip::address_v4 a = asio::ip::make_address_v4(bind_address, bad);
+        if (!bad) addr = a;
     }
-    if (!live::systemRandom(secret, 16)) {     // no secret, no cookies: the port stays closed
-        compat::closeSocket(fd);
-        return OpenResult::NoRandom;
+    s.bind(asio::ip::udp::endpoint(addr, port), ec);
+    if (ec || !live::systemRandom(secret, 16)) {   // no secret, no cookies: the port stays closed
+        asio::error_code ignored;
+        s.close(ignored);
+        return ec ? OpenResult::Busy : OpenResult::NoRandom;
     }
-    udp::reportLocalAddress(fd);
-    out = fd;
+    udp::reportLocalAddress(s.native_handle());
     return OpenResult::Ok;
 }
 
@@ -333,8 +334,7 @@ bool Server::liveStart() {
     L.room_on = L.cfg.mode == LiveMode::On;
     if (!L.allowed()) return true;
     const std::string p = std::to_string(port_);
-    socket_t fd;
-    OpenResult r = openRelaySocket(port_, cfg_.bind_address, L.secret, fd);
+    OpenResult r = openRelaySocket(net_->relay, port_, cfg_.bind_address, L.secret);
     if (r != OpenResult::Ok) {
         if (L.cfg.mode == LiveMode::Require) {
             if (r == OpenResult::Busy)
@@ -348,14 +348,17 @@ bool Server::liveStart() {
         log(r == OpenResult::Busy ? busyWarning(p) : randomWarning(p));
         return true;
     }
-    L.opened(fd, port_);
+    L.opened(static_cast<socket_t>(net_->relay.native_handle()), port_);
     log("Live: listening on UDP port " + p);
+    armRelay();
     return true;
 }
 
 void Server::liveShutdown() {
     if (!live_ || live_->fd == kInvalidSocket) return;
-    compat::closeSocket(live_->fd);
+    asio::error_code ec;
+    net_->relay.close(ec);                     // its wait ends with operation_aborted
+    net_->relay_reading = false;
     live_->fd = kInvalidSocket;
     live_->port = 0;
     live_->dirty = true;
@@ -374,21 +377,22 @@ void Server::setLiveConfig(const LiveConfig& config) {
         }
     } else if (!L.open()) {
         const std::string p = std::to_string(port_);
-        socket_t fd;
-        OpenResult r = openRelaySocket(port_, cfg_.bind_address, L.secret, fd);
+        OpenResult r = openRelaySocket(net_->relay, port_, cfg_.bind_address, L.secret);
         if (r == OpenResult::Ok) {
-            L.opened(fd, port_);
+            L.opened(static_cast<socket_t>(net_->relay.native_handle()), port_);
             log("Live: listening on UDP port " + p);
+            armRelay();
         } else {                               // require doesn't stop a running server
             log(r == OpenResult::Busy ? busyWarning(p) : randomWarning(p));
         }
     } else {
-        L.cfg.fresh_seconds = envSeconds("NINJAM_LIVE_FRESH_SECONDS", L.cfg.fresh_seconds);
+        L.cfg.fresh_seconds = envSeconds("O11_LIVE_FRESH_SECONDS", L.cfg.fresh_seconds);
         L.cfg.relay_fallback = envFlag("O11_LIVE_RELAY_FALLBACK", L.cfg.relay_fallback);
-        L.cfg.stats_seconds = envSeconds("NINJAM_LIVE_STATS_SECONDS", L.cfg.stats_seconds);
+        L.cfg.stats_seconds = envSeconds("O11_LIVE_STATS_SECONDS", L.cfg.stats_seconds);
     }
     if (!L.room_chosen) L.room_on = L.cfg.mode == LiveMode::On;
     L.dirty = true;
+    schedulePass();                            // the Live messages go out at the next poll()
 }
 
 bool Server::liveUdpOpen() const { return live_ && live_->open(); }
@@ -424,13 +428,6 @@ bool Server::liveRefusesUpload(TimePoint now) {
 }
 std::string Server::liveAdviceUser() const { return live_ ? live_->advice_name : std::string(); }
 int Server::liveAdviceCount() const { return live_ ? live_->advice.state().count : 0; }
-socket_t Server::liveSocket() const { return live_ ? live_->fd : kInvalidSocket; }
-
-int Server::livePollTimeout(int timeout_ms) const {
-    // Freshness is checked every 100 ms while the port is open.
-    if (live_ && live_->open() && (timeout_ms < 0 || timeout_ms > 100)) return 100;
-    return timeout_ms;
-}
 
 // ------------------------------------------------------- players come and go
 
@@ -736,15 +733,56 @@ void Server::liveRoomTick(TimePoint now) {
 
 // ---------------------------------------------------------------- the relay
 
-void Server::liveReadable() {
-    if (!live_ || !live_->open()) return;
+// The relay's socket is read until it would block, then waited on (Asio's
+// waits are not speculative: see server_net.h). A read that stops at its
+// budget goes on in a handler of its own, after what else is ready.
+void Server::armRelay() {
+    Net& n = *net_;
+    if (n.relay_reading || !live_ || !live_->open()) return;
+    n.relay_reading = true;
+    const unsigned e = n.epoch;
+    asio::post(n.io, [this, e] {               // the first read: anything that came before the wait
+        if (net_->epoch != e || !live_ || !live_->open()) return;
+        net_->relay_reading = false;
+        relayReadable();
+    });
+}
+
+void Server::relayReadable() {
+    Net& n = *net_;
+    const unsigned e = n.epoch;
+    const bool more = liveReadable();
+    if (!live_ || !live_->open() || n.epoch != e) return;
+    n.relay_reading = true;
+    if (more) {
+        asio::post(n.io, [this, e] {
+            if (net_->epoch != e || !live_ || !live_->open()) return;
+            net_->relay_reading = false;
+            relayReadable();
+        });
+    } else {
+        n.relay.async_wait(asio::socket_base::wait_read, [this, e](const asio::error_code& ec) {
+            if (net_->epoch != e) return;
+            net_->relay_reading = false;
+            if (ec == asio::error::operation_aborted || !live_ || !live_->open()) return;
+            relayReadable();
+        });
+    }
+    if (live_->pass_wanted) {
+        live_->pass_wanted = false;
+        schedulePass();
+    }
+}
+
+bool Server::liveReadable() {
+    if (!live_ || !live_->open()) return false;
     Live& L = *live_;
     for (int budget = 0; budget < 4096; ++budget) {   // bounded, so TCP is served too
         std::size_t n = 0;
         bool truncated = false, has_local = false;
         udp::Addr from, local;
         udp::Recv r = udp::receive(L.fd, L.buf, sizeof(L.buf), n, truncated, from, local, has_local);
-        if (r == udp::Recv::Empty) return;
+        if (r == udp::Recv::Empty) return false;
         if (r == udp::Recv::Error) continue;
         if (has_local && udp::isBroadcastOrMulticast(local.ip)) has_local = false;
         ++L.in;
@@ -826,6 +864,7 @@ void Server::liveReadable() {
         };
 
         if (d[3] == live::kTypeHello) {
+            L.pass_wanted = true;
             // 7: always answered; bound only with the cookie sent to this very address
             std::uint8_t ip[4], port[2];
             std::memcpy(ip, &from.ip, 4);
@@ -905,6 +944,7 @@ void Server::liveReadable() {
             copyTo(*to);
         }
     }
+    return true;
 }
 
 // ------------------------------------------------------------- !live

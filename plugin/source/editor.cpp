@@ -10,7 +10,6 @@
 #include <math.h>
 #include <string.h>
 #include <algorithm>
-#include <chrono>
 #include <vector>
 
 #include "processor.h"
@@ -37,28 +36,24 @@ static const float ROOM_X = 6, ROOM_Y = 5;      // the room panel's margins
 static const float LABEL_H = 11, CHIP_H = 17;   // the room panel's labels, its notes of changes to come
 static const double SILENT_SECONDS = 10;        // a row says "silent" after this long without sound (or two intervals)
 
-static double now_seconds()
+// a view's text is already this: its UTF-8 bytes compared where they are (the editor asks 30
+// times a second, mostly of texts that haven't changed), without making a juce::String of it
+static bool sameText(const juce::String &shown, const std::string &text)
 {
-  using namespace std::chrono;
-  return duration<double>(steady_clock::now().time_since_epoch()).count();
+  return shown.getNumBytesAsUTF8() == text.size() && memcmp(shown.toRawUTF8(), text.data(), text.size()) == 0;
 }
-
-static juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
 
 static void setLabel(juce::Label *label, const std::string &text, bool tooltip = false)
 {
-  if (!label) return;
+  if (!label || sameText(label->getText(), text)) return;
   const juce::String t = str(text);
-  if (label->getText() == t) return;
   label->setText(t, juce::dontSendNotification);
   if (tooltip) label->setTooltip(t); // the whole text, when the label cuts it off
 }
 
 static void setTooltip(juce::SettableTooltipClient *v, const std::string &text)
 {
-  if (!v) return;
-  const juce::String t = str(text);
-  if (v->getTooltip() != t) v->setTooltip(t);
+  if (v && !sameText(v->getTooltip(), text)) v->setTooltip(str(text));
 }
 
 static void setLabelColor(juce::Label *label, juce::Colour c)
@@ -326,7 +321,7 @@ void O11Editor::buildViews()
   m_host->setTooltip("Host a room in this plug-in, and join it");
   m_host->onChange = [this]() {
     m_hostPending = true;
-    m_hostPendingSince = now_seconds();
+    m_hostPendingSince = nowSeconds();
     engine().setHosting(m_host->value());
   };
   m_hostCount = add(m_hostBar, makeLabel("", f.value, Colors::value()));
@@ -600,7 +595,7 @@ void O11Editor::update()
   if (!m_root) return;
   Snapshot s;
   engine().getSnapshot(s);
-  const double now = now_seconds();
+  const double now = nowSeconds();
 
   if (s.settingsRevision != m_settingsRevision) syncSettings();
   m_settingsRevision = s.settingsRevision;
@@ -672,7 +667,7 @@ void O11Editor::updateHeader(const Snapshot &s)
       break;
     default: text = "Not connected"; break;
   }
-  if (m_connText->getText() != str(text))
+  if (!sameText(m_connText->getText(), text))
   {
     setLabel(m_connText, text);
     layoutHeader((float)m_header->getWidth());
@@ -802,7 +797,7 @@ void O11Editor::updateEmpty(const Snapshot &s, const uitext::HostBar &bar)
   else if (channels == 0) text = "Nobody else is here yet.";
 
   bool relayout = false;
-  if (m_emptyText->getText() != str(text))
+  if (!sameText(m_emptyText->getText(), text))
   {
     setLabel(m_emptyText, text);
     relayout = true;
@@ -1214,7 +1209,7 @@ void O11Editor::updateHostBar(const Snapshot &s, const uitext::HostBar &bar)
 {
   if (m_hostPending)
   {
-    const bool done = !s.hostBusy && (s.hosting == m_host->value() || now_seconds() - m_hostPendingSince > 3.0);
+    const bool done = !s.hostBusy && (s.hosting == m_host->value() || nowSeconds() - m_hostPendingSince > 3.0);
     if (done) m_hostPending = false;
   }
   if (!m_hostPending) m_host->setValue(s.hosting);
@@ -1232,7 +1227,7 @@ void O11Editor::updateHostBar(const Snapshot &s, const uitext::HostBar &bar)
   {
     const bool full = s.hostMaxUsers > 0 && s.hostUsers >= s.hostMaxUsers;
     const std::string count = std::to_string(s.hostUsers) + " in room" + (full ? " \xc2\xb7 full" : "");
-    if (m_hostCount->getText() != str(count))
+    if (!sameText(m_hostCount->getText(), count))
     {
       setLabel(m_hostCount, count);
       relayout = true;
@@ -1275,7 +1270,7 @@ void O11Editor::updateHostBar(const Snapshot &s, const uitext::HostBar &bar)
                              : "Host a room in this plug-in: anyone can join at your address without an account, and one "
                                "vote changes the tempo or the interval");
   }
-  if (m_portText->getText() != str(port))
+  if (!sameText(m_portText->getText(), port))
   {
     setLabel(m_portText, port);
     relayout = true;
@@ -1359,7 +1354,7 @@ void O11Editor::copyAddress(AddressBox *box)
   setTooltip(box, "Copied " + box->address());
   if (m_copied && m_copied != box) m_copied->setCopyTitle("Copy");
   m_copied = box;
-  m_copiedUntil = now_seconds() + 1.5;
+  m_copiedUntil = nowSeconds() + 1.5;
 }
 
 } // namespace o11

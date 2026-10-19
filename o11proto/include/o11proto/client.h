@@ -1,7 +1,9 @@
 // o11proto - non-blocking NINJAM client state machine.
 //
-// The caller drives it from a loop with poll(); every incoming message is
-// delivered through a callback. Audio encoding is out of scope: the caller
+// The caller drives it from a loop with poll(), which runs the client's own
+// Asio io_context on the caller's thread for up to the time it is given:
+// the socket's waits and a housekeeping timer (keepalives, idle downloads)
+// all complete there. Every incoming message is delivered through a callback. Audio encoding is out of scope: the caller
 // hands in opaque encoded bytes per interval and receives the bytes of
 // other users' intervals as they arrive.
 #ifndef O11PROTO_CLIENT_H
@@ -11,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -94,7 +97,7 @@ public:
     void answerLicence(bool agree);
 
     // One iteration of the event loop: waits up to timeout_ms for socket
-    // activity, then processes it and the timers.
+    // activity or the housekeeping timer, then processes what is ready.
     void poll(int timeout_ms);
     // Blocking helpers for tools and tests: poll until pred() is true (returns
     // true) or the timeout passes (returns false); or for a fixed time.
@@ -150,6 +153,22 @@ public:
     static Guid randomGuid();
 
 private:
+    // The io_context, the connection's waits and the timer (client.cpp).
+    // Declared before conn_: the socket goes before its io_context.
+    struct Net;
+    struct NetDeleter {
+        void operator()(Net* p) const;
+    };
+    std::unique_ptr<Net, NetDeleter> net_;
+    Net& net();
+    void readNow();
+    void armRead();
+    void armWrite();
+    void armTimer();
+    void schedulePass();
+    void pass();
+    void connected();
+
     void fail(const std::string& reason);
     void handleMessage(const RawMessage& m);
     void handleChallenge(const std::vector<std::uint8_t>& p);

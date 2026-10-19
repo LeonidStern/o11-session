@@ -1,6 +1,9 @@
 // o11proto - single-threaded NINJAM server.
 //
-// One poll() loop serves every connection. The server never looks inside
+// One Asio io_context serves every connection, run by poll() (or runFor())
+// on the caller's thread: the listening socket's, each connection's and Live
+// UDP's waits, and a housekeeping timer (keepalives, login and transfer
+// timeouts, votes, Live's freshness and advice), all on that thread. The server never looks inside
 // audio data: it only routes BEGIN/WRITE messages to subscribers. Lobby mode
 // and session channels are not implemented (see NOTES.md).
 #ifndef O11PROTO_SERVER_H
@@ -63,11 +66,11 @@ struct LiveConfig {
     // advice; on, the room goes through the relay for everyone once a pair
     // has no direct path, until `!live direct`. A backend option, off by
     // default; O11_LIVE_RELAY_FALLBACK (1 or 0) overrides it when the
-    // UDP port opens.
+    // UDP port opens and at each setLiveConfig() while it is open.
     bool relay_fallback = false;
-    // Test hooks; the environment variables NINJAM_LIVE_FRESH_SECONDS and
-    // NINJAM_LIVE_STATS_SECONDS (decimal seconds, above 0) override them
-    // when the UDP port opens.
+    // Test hooks; the environment variables O11_LIVE_FRESH_SECONDS and
+    // O11_LIVE_STATS_SECONDS (decimal seconds, above 0) override them
+    // when the UDP port opens and at each setLiveConfig() while it is open.
     double fresh_seconds = 20;                 // a player stays bound this long after a verified hello
     double stats_seconds = 60;                 // period of the relay's traffic line
 };
@@ -117,12 +120,13 @@ public:
 
     bool start(const ServerConfig& config);
     void stop();
-    bool running() const { return listen_fd_ != kInvalidSocket; }
+    bool running() const;
     std::uint16_t port() const { return port_; }
 
-    // One iteration of the event loop, waiting up to timeout_ms.
+    // One iteration of the event loop: waits up to timeout_ms for the first
+    // socket event or timer, then runs whatever else is ready.
     void poll(int timeout_ms);
-    void runFor(int ms);
+    void runFor(int ms);                        // runs the loop until a timer of `ms` ends
 
     // Introspection, mostly for tests and the status line.
     std::size_t userCount() const;              // logged-in, non-hidden
@@ -181,6 +185,7 @@ private:
         bool logged_in = false;
         bool close_after_flush = false;
         TimePoint close_deadline;
+        bool reading = false, writing = false;  // its socket's waits are armed
         std::string name;                       // effective username
         std::uint32_t privs = 0;
         std::uint32_t caps = 0;                 // client_caps
@@ -201,6 +206,23 @@ private:
         int value = 0;
         TimePoint when;
     };
+
+    // The io_context, the listening socket, Live's UDP socket and the timer
+    // (src/server_net.h). Declared before the connections: their sockets go
+    // before their io_context.
+    struct Net;
+    struct NetDeleter {
+        void operator()(Net* p) const;
+    };
+    std::unique_ptr<Net, NetDeleter> net_;
+    Net& net();
+    void armAccept();
+    void armRead(Conn& c);
+    void armWrite(Conn& c);
+    void armTimer();
+    void readConn(Conn& c);
+    void schedulePass();
+    void pass();
 
     void log(const std::string& s) const;
     void acceptPending();
@@ -250,7 +272,6 @@ private:
     static std::string codecName(std::uint32_t bits);
 
     ServerConfig cfg_;
-    socket_t listen_fd_ = kInvalidSocket;
     std::uint16_t port_ = 0;
     int next_id_ = 1;
     std::vector<std::unique_ptr<Conn>> conns_;
@@ -270,9 +291,9 @@ private:
     std::unique_ptr<Live, LiveDeleter> live_;
     bool liveStart();                            // false: Require and no UDP port
     void liveShutdown();                         // closes the UDP port
-    socket_t liveSocket() const;
-    int livePollTimeout(int timeout_ms) const;
-    void liveReadable();                         // takes every datagram waiting
+    void armRelay();                             // waits for Live's datagrams
+    void relayReadable();
+    bool liveReadable();                         // takes the datagrams waiting; true: more than its budget
     void liveTick(TimePoint now);                // freshness, the log line, SERVER_LIVE
     void liveSendMessages();                     // SERVER_LIVE to whoever needs a new one
     void liveRoomTick(TimePoint now);            // the advice and SERVER_LIVE_ROOM

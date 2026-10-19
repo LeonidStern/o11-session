@@ -74,7 +74,23 @@ struct DirectPath {
 
 struct Transport::Impl {
     Options opt;
-    socket_t fd = kInvalidSocket;
+    // The network thread's Asio side: its io_context (run only by that
+    // thread; start() and stop() touch it only while the thread isn't
+    // running, but for io.stop()), the socket, the wake pipe's read end (a
+    // duplicate: the pipe itself stays open for the transport's life) and the
+    // timer of the timed passes. `gen` counts the starts: a wait of an
+    // earlier socket ends with operation_aborted and then does nothing.
+    asio::io_context io{1};
+    asio::ip::udp::socket sock{io};
+#ifndef _WIN32
+    asio::posix::stream_descriptor wake_desc{io};
+#endif
+    asio::steady_timer timer{io};
+    unsigned gen = 0;
+    bool reading = false, wake_waiting = false, timing = false;
+    bool event = false;                            // a wait ended for a datagram, a wake or the time
+    TimePoint deadline{};                          // the next timed pass: wait_ms after the last pass
+    socket_t fd = kInvalidSocket;                  // sock's handle, for recvmsg and sendmsg
     udp::Addr relay;                           // where the hellos go and the relay's datagrams come from
     std::uint32_t lan_ip = 0;                  // localAddress()
     std::uint16_t local_port = 0;
@@ -115,12 +131,36 @@ struct Transport::Impl {
     std::atomic<std::int64_t> longest_us{0}, wake_longest_us{0};
     std::atomic<std::int64_t> woken_at_us{0};      // wake(): when it wrote to the pipe
     int wait_ms = 1;
-    void drainWake() {
+    // The timed pass: at `deadline`, which each pass moves on. The timer
+    // isn't moved with it (no cancel per pass): when it ends before the
+    // deadline it is set again, and only one that ends at or after it counts,
+    // as a timed wait that ran out (how long it took, since the last pass).
+    void armTimer(unsigned g) {
+        timing = true;
+        timer.expires_at(deadline);
+        timer.async_wait([this, g](const asio::error_code& ec) {
+            if (gen != g) return;
+            timing = false;
+            if (ec == asio::error::operation_aborted) return;
+            const TimePoint now = Clock::now();
+            if (now < deadline) return;
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                now - (deadline - std::chrono::milliseconds(wait_ms)))
+                                .count();
+            timeouts.fetch_add(1, std::memory_order_relaxed);
+            if (us > 1000L * wait_ms + 5000) over_5ms.fetch_add(1, std::memory_order_relaxed);
+            if (us > longest_us.load(std::memory_order_relaxed)) longest_us.store(us, std::memory_order_relaxed);
+            event = true;
+        });
+    }
+    // Empties the wake pipe; true when there was something in it.
+    bool drainWake() {
+        bool any = false;
 #ifndef _WIN32
         char b[64];
-        while (wake_fd[0] >= 0 && ::read(wake_fd[0], b, sizeof(b)) > 0) {
-        }
+        while (wake_fd[0] >= 0 && ::read(wake_fd[0], b, sizeof(b)) > 0) any = true;
 #endif
+        return any;
     }
     bool lose() {
         const double l = loss.load(std::memory_order_relaxed);
@@ -369,9 +409,9 @@ bool Transport::start(const Options& o, std::string& error) {
         error = "no peer ID or server address";
         return false;
     }
-    socket_t fd = udp::open(kClientSocketBuffer, false);
-    if (fd == kInvalidSocket) {
-        error = "can't open a UDP socket (error " + std::to_string(compat::lastError()) + ")";
+    asio::error_code ec;
+    if (!udp::openSocket(m.sock, kClientSocketBuffer, false, ec)) {
+        error = "can't open a UDP socket (error " + std::to_string(ec.value()) + ")";
         return false;
     }
     udp::Addr to;
@@ -380,35 +420,42 @@ bool Transport::start(const Options& o, std::string& error) {
     // One socket for the relay and the direct paths, on a port of its own.
     // It isn't connect()ed: what comes from the relay's address and port is
     // the relay's, anything else must be a peer's (with its pair's key).
-    sockaddr_in any{};
-    any.sin_family = AF_INET;
-    any.sin_addr.s_addr = htonl(INADDR_ANY);
-    any.sin_port = 0;
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&any), sizeof(any)) != 0) {
-        error = "can't open a UDP socket (error " + std::to_string(compat::lastError()) + ")";
-        compat::closeSocket(fd);
+    m.sock.bind(asio::ip::udp::endpoint(asio::ip::address_v4::any(), 0), ec);
+    if (ec) {
+        error = "can't open a UDP socket (error " + std::to_string(ec.value()) + ")";
+        asio::error_code ignored;
+        m.sock.close(ignored);
         return false;
     }
-    {
-        sockaddr_in sa{};
-        socklen_t len = sizeof(sa);
-        m.local_port = ::getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &len) == 0 ? ntohs(sa.sin_port) : 0;
-    }
+    m.local_port = m.sock.local_endpoint(ec).port();
+    if (ec) m.local_port = 0;
     // The LAN address: the one the system sends to the relay from (a
     // connect()ed socket of its own sends nothing). Loopback is none.
     m.lan_ip = 0;
-    if (socket_t probe = ::socket(AF_INET, SOCK_DGRAM, 0); probe != kInvalidSocket) {
-        sockaddr_in sa = udp::toSockaddr(to);
-        if (::connect(probe, reinterpret_cast<const sockaddr*>(&sa), sizeof(sa)) == 0) {
-            sockaddr_in me{};
-            socklen_t len = sizeof(me);
-            if (::getsockname(probe, reinterpret_cast<sockaddr*>(&me), &len) == 0 &&
-                !isLoopback(me.sin_addr.s_addr) && me.sin_addr.s_addr != 0)
-                m.lan_ip = me.sin_addr.s_addr;
+    {
+        asio::ip::udp::socket probe(m.io);
+        asio::error_code pe;
+        probe.open(asio::ip::udp::v4(), pe);
+        if (!pe) probe.connect(asio::ip::udp::endpoint(asio::ip::address_v4(ntohl(ip)), o.port), pe);
+        const asio::ip::udp::endpoint me = pe ? asio::ip::udp::endpoint() : probe.local_endpoint(pe);
+        if (!pe && me.address().is_v4()) {
+            const asio::ip::address_v4 a = me.address().to_v4();
+            if (!a.is_loopback() && !a.is_unspecified()) m.lan_ip = htonl(a.to_uint());
         }
-        compat::closeSocket(probe);
     }
-    m.fd = fd;
+    m.fd = static_cast<socket_t>(m.sock.native_handle());
+#ifndef _WIN32
+    if (m.wake_fd[0] >= 0) {
+        const int d = ::fcntl(m.wake_fd[0], F_DUPFD_CLOEXEC, 0);
+        if (d >= 0) {
+            m.wake_desc.assign(d, ec);
+            if (ec) ::close(d);
+        }
+    }
+#endif
+    ++m.gen;
+    m.reading = m.wake_waiting = m.timing = m.event = false;
+    m.io.restart();
     m.relay = to;
     m.stopping.store(false);
     m.drainWake();
@@ -422,7 +469,7 @@ bool Transport::start(const Options& o, std::string& error) {
 #ifdef _WIN32
     m.wait_ms = 1;                             // wake() does nothing here: the passes are the only tick
 #else
-    m.wait_ms = m.wake_fd[0] >= 0 ? std::max(1, std::min(100, o.wait_ms)) : 1;
+    m.wait_ms = m.wake_desc.is_open() ? std::max(1, std::min(100, o.wait_ms)) : 1;
 #endif
     for (auto& s : m.stamps) s = 0;
     m.next_stamp = 0;
@@ -451,8 +498,14 @@ void Transport::stop() {
     Impl& m = *impl_;
     if (!m.running.load()) return;
     m.stopping.store(true);
+    m.io.stop();                               // its wait ends at once
     if (m.thread.joinable()) m.thread.join();
-    compat::closeSocket(m.fd);
+    asio::error_code ec;
+    m.timer.cancel();
+    m.sock.close(ec);
+#ifndef _WIN32
+    m.wake_desc.close(ec);                     // the duplicate: the pipe stays open for wake()
+#endif
     m.fd = kInvalidSocket;
     {
         // What the test's hold kept goes with the socket: it carries this
@@ -705,33 +758,24 @@ void Transport::handleDirect(const std::uint8_t* d, std::size_t n, std::uint32_t
     if (on_data) on_data(sender, d + kClientHeader, n - kClientHeader, true);
 }
 
+// The network thread: a pass (what the wake pipe and the socket have, the
+// hello, the probes, on_tick), then a wait in Asio for the next datagram,
+// wake() or timed pass, and so on until stop(). The waits are armed at the
+// end of each pass, after the socket and the pipe were read until they
+// would block: Asio's waits are not speculative (on epoll and kqueue a
+// readiness that came before the wait was armed is not reported again), and
+// a wait's handler only says that something came; the pass reads it.
 void Transport::loop() {
     Impl& m = *impl_;
     const thread::NetworkScheduling sched = thread::makeNetworkThread();
     m.realtime.store(sched == thread::NetworkScheduling::Realtime);
     m.latency_critical.store(sched == thread::NetworkScheduling::LatencyCritical);
+    const unsigned g = m.gen;
+    const auto wait = std::chrono::milliseconds(m.wait_ms);
+    bool more = false;                         // the socket had more than one pass reads
     while (!m.stopping.load()) {
-        pollfd p[2] = {};
-        p[0].fd = m.fd;
-        p[0].events = POLLIN;
-        std::size_t n_fds = 1;
-#ifndef _WIN32
-        if (m.wake_fd[0] >= 0) {
-            p[1].fd = m.wake_fd[0];
-            p[1].events = POLLIN;
-            n_fds = 2;
-        }
-#endif
-        const TimePoint t0 = Clock::now();
-        const int ready = compat::poll(p, n_fds, m.wait_ms);
-        if (ready == 0) {                      // the timed wait ran out: how long it took
-            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
-            m.timeouts.fetch_add(1, std::memory_order_relaxed);
-            if (us > 1000L * m.wait_ms + 5000) m.over_5ms.fetch_add(1, std::memory_order_relaxed);
-            if (us > m.longest_us.load(std::memory_order_relaxed)) m.longest_us.store(us, std::memory_order_relaxed);
-        }
-        if (n_fds == 2 && (p[1].revents & POLLIN)) {
-            // How long after the wake() it runs: the wake-up delay.
+        // The wake: how long after the wake() this runs (the wake-up delay).
+        if (m.drainWake()) {
             const std::int64_t at = m.woken_at_us.load();
             const std::int64_t us = static_cast<std::int64_t>(monotonicMicros()) - at;
             if (at > 0 && us >= 0) {
@@ -739,11 +783,15 @@ void Transport::loop() {
                 if (us > m.wake_longest_us.load(std::memory_order_relaxed))
                     m.wake_longest_us.store(us, std::memory_order_relaxed);
             }
-            m.drainWake();                     // then the flag: a wake() after it writes again
-            m.wake_pending.store(false, std::memory_order_release);
+            m.wake_pending.store(false, std::memory_order_release);   // then a wake() writes again
             m.wakes.fetch_add(1, std::memory_order_relaxed);
         }
-        for (int i = 0; i < 1024; ++i) {       // bounded, so the tick runs too
+        more = false;
+        for (int i = 0;; ++i) {
+            if (i == 1024) {                   // bounded, so the tick runs too
+                more = true;
+                break;
+            }
             std::size_t n = 0;
             bool truncated = false, has_local = false;
             udp::Addr from, local;
@@ -762,6 +810,44 @@ void Transport::loop() {
         if (Clock::now() - m.last_hello >= std::chrono::milliseconds(kHelloIntervalMs)) sendHello();
         probePaths();
         if (on_tick) on_tick();
+
+        // The waits for what comes next.
+        m.deadline = Clock::now() + wait;
+        if (!m.reading && !more) {
+            m.reading = true;
+            m.sock.async_wait(asio::socket_base::wait_read, [&m, g](const asio::error_code& ec) {
+                if (m.gen != g) return;
+                m.reading = false;
+                if (ec != asio::error::operation_aborted) m.event = true;
+            });
+        }
+#ifndef _WIN32
+        if (!m.wake_waiting && m.wake_desc.is_open()) {
+            m.wake_waiting = true;
+            m.wake_desc.async_wait(asio::posix::descriptor_base::wait_read, [&m, g](const asio::error_code& ec) {
+                if (m.gen != g) return;
+                m.wake_waiting = false;
+                if (ec != asio::error::operation_aborted) m.event = true;
+            });
+        }
+#endif
+        if (!m.timing) m.armTimer(g);
+
+        // Until something came (or straight on, when the socket had more).
+        m.event = more;
+        while (!m.event && !m.stopping.load()) {
+            // An io_context whose waits had all ended at once stopped then, for
+            // want of work: it runs again. (stop() sets `stopping` before it
+            // stops the io_context, so a stop() is never undone here.)
+            if (m.io.stopped()) {
+                m.io.restart();
+                if (m.stopping.load()) break;
+            }
+            m.io.run_one();
+            while (m.io.poll_one()) {
+            }
+            if (!m.timing && !m.event) m.armTimer(g);   // it ended before the deadline: again, for it
+        }
     }
     if (on_closing) on_closing();
 }

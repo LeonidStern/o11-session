@@ -65,8 +65,6 @@ static void drawBox(juce::Graphics &g, juce::Rectangle<float> r)
   fillRect(g, r, RADIUS, Colors::box());
 }
 
-static juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
-
 // ---------------------------------------------------------------------------
 
 void Strip::setColor(juce::Colour c)
@@ -78,7 +76,16 @@ void Strip::setColor(juce::Colour c)
 
 void Strip::paint(juce::Graphics &g)
 {
-  fillRect(g, getLocalBounds().toFloat(), m_radius, m_color);
+  const juce::Rectangle<float> r = getLocalBounds().toFloat();
+  // a view in it repainted, away from the corners and edges: inside, the rounded rectangle is
+  // the plain colour, filled without its path
+  if (m_radius > 0 && r.reduced(m_radius + 1).contains(g.getClipBounds().toFloat()))
+  {
+    g.setColour(m_color);
+    g.fillAll();
+    return;
+  }
+  fillRect(g, r, m_radius, m_color);
 }
 
 // ---------------------------------------------------------------------------

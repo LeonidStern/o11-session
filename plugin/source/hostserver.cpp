@@ -119,9 +119,6 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
     cfg.live.mode = o11proto::LiveMode::On;
     server->setLiveConfig(cfg.live);
   }
-  else if (!env_is_off("O11_LIVE"))
-    onLog("Live is off in this room: no port from " + std::to_string(FIRST_PORT) + " to " +
-          std::to_string(FIRST_PORT + PORTS_TO_TRY - 1) + " had UDP free as well as TCP, so everyone plays through intervals");
 
   const bool portmap = !env_is_off("O11_PORTMAP");
   {

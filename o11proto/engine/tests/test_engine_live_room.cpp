@@ -100,8 +100,9 @@ long measureSwitch(Room& r, int listener, long from, bool was, const std::string
 // live is replayed.
 struct Hush {
     long frame = -1;                             // the switch
-    long in = -1;                                // where the intervals come in
-    long boundary = -1;                          // the listener's boundary they come in at
+    long in = -1;                                // where the intervals come in (-60 dB)
+    long start = -1;                             // their first sample that isn't silent
+    long boundary = -1;                          // the listener's boundary they start at
     double out_step = 0;                         // the fade-out's largest step, against the steady sound's
     double in_step = 0;                          // the fade-in's largest step, against the steady sound's after
     double in_rms_db = 0;                        // the 10 ms RMS from 25 ms on, against the steady RMS after
@@ -123,15 +124,22 @@ Hush measureOff(Room& r, int listener, long from, const std::string& what, Tally
     const long ms = r.opt.rate / 1000, s = h.frame, L = intervalLengthFor(r.opt.bpm, r.opt.bpi, r.opt.rate);
     r.until([&] { return r.frames.load() > s + 2 * L + 1500 * ms; }, 8);
     const float* x = r[listener].heard.get();
-    for (long i = s + 25 * ms; i < s + 2 * L + 100 * ms && h.in < 0; ++i)
+    for (long i = s + 25 * ms; i < s + 2 * L + 100 * ms && h.in < 0; ++i) {
+        if (h.start < 0 && x[i] != 0.0f) h.start = i;
         if (std::fabs(x[i]) >= 0.001f) h.in = i;
+    }
     if (h.in < 0) {
         std::printf("    %s: the intervals don't come in\n", what.c_str());
         CHECK(h.in > 0);
         return h;
     }
-    const long n = h.in;
-    for (long b = n / kBlock; b >= n / kBlock - 1 && h.boundary < 0; --b)
+    // The boundary is checked where the interval audio starts. Where it
+    // reaches -60 dB depends on what plays there under the senders' fade-in:
+    // alice's kick on the boundary, or, when her interval clock started a
+    // block before carl's (the drums start at his), bob's quiet hat, which
+    // gets there ms later.
+    const long n = h.in, f = h.start;
+    for (long b = f / kBlock; b >= f / kBlock - 1 && h.boundary < 0; --b)
         if (r.boundaryIn(listener, b)) h.boundary = (b + 1) * kBlock - r[listener].pos[b];
     const Steady before = steady(x, s - 600 * ms, s - 100 * ms), after = steady(x, n + 100 * ms, n + 600 * ms);
     double out = 0, in = 0;
@@ -150,16 +158,18 @@ Hush measureOff(Room& r, int listener, long from, const std::string& what, Tally
     ++t.hushes;
     t.hush_least = t.hushes == 1 ? r.ms(n - s) : std::min(t.hush_least, r.ms(n - s));
     t.hush_most = std::max(t.hush_most, r.ms(n - s));
-    const double late = h.boundary >= 0 ? r.ms(n - h.boundary) : -1;
+    const double late = h.boundary >= 0 ? r.ms(f - h.boundary) : -1;
+    const double heard = h.boundary >= 0 ? r.ms(n - h.boundary) : -1;
     if (!steady_sound) {
-        std::printf("    %s: silent for %.0f ms (an interval is %.0f), then the intervals, %.1f ms after a boundary\n",
-                    what.c_str(), r.ms(n - s), r.ms(L), late);
+        std::printf("    %s: silent for %.0f ms (an interval is %.0f), then the intervals, %.1f ms after a boundary "
+                    "(-60 dB at %.1f ms)\n",
+                    what.c_str(), r.ms(n - s), r.ms(L), late, heard);
     } else {
         t.hush_step = std::max(t.hush_step, std::max(h.out_step, h.in_step));
         std::printf("    %s: the fade-out's largest step x%.2f, silent for %.0f ms (an interval is %.0f), then the "
-                    "intervals, %.1f ms after a boundary, fade in with a largest step x%.2f of the steady sound's, "
-                    "10 ms RMS from 25 ms on %+.2f dB, level %+.2f dB against live\n",
-                    what.c_str(), h.out_step, r.ms(n - s), r.ms(L), late, h.in_step, h.in_rms_db, h.level_db);
+                    "intervals, %.1f ms after a boundary (-60 dB at %.1f ms), fade in with a largest step x%.2f of "
+                    "the steady sound's, 10 ms RMS from 25 ms on %+.2f dB, level %+.2f dB against live\n",
+                    what.c_str(), h.out_step, r.ms(n - s), r.ms(L), late, heard, h.in_step, h.in_rms_db, h.level_db);
         CHECK(h.out_step <= 1.5);
         CHECK(h.in_step <= 1.5);
         CHECK(std::fabs(h.in_rms_db) <= 1.0);
@@ -1129,10 +1139,10 @@ TEST(listening_file) {
     for (long n = start; n < end; ++n) heard_peak = std::max(heard_peak, std::fabs(r[2].heard[n]));
     std::printf("    what carl hears peaks at %.1f dBFS\n", 20 * std::log10(heard_peak));
     if (!tones) CHECK(heard_peak < 0.5f);
-    std::FILE* f = std::fopen(txt.c_str(), "w");
-    REQUIRE(f);
+    std::FILE* notes = std::fopen(txt.c_str(), "w");
+    REQUIRE(notes);
     if (tones)
-        std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is steady tones: alice plays\n"
+        std::fprintf(notes, "%s: what carl hears, 48 kHz mono, %.1f s. The music is steady tones: alice plays\n"
                         "440 Hz and a quiet 3520 Hz (-20 dB), bob 660 Hz, each at about -12 dBFS, from a 50 ms\n"
                         "fade-in at the players' frame 0 on, without a break; carl sends nothing. The room is at\n"
                         "%d bpm, the timeline is the drum file's (live-transitions.wav). A slot without audio is\n"
@@ -1144,7 +1154,7 @@ TEST(listening_file) {
                      wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
                      kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
     else
-        std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is 909-style drums, synthesized,\n"
+        std::fprintf(notes, "%s: what carl hears, 48 kHz mono, %.1f s. The music is 909-style drums, synthesized,\n"
                         "at %d bpm, one bar per interval: alice plays the kick and the snare, bob the closed and open\n"
                         "hi-hats and the clap; carl sends nothing. A slot without audio is concealed for %.0f x B =\n"
                         "%.0f ms from where carl's concealment begins (\"the gap reaches carl\"), then fades out over\n"
@@ -1154,8 +1164,8 @@ TEST(listening_file) {
                         "start.\n\n",
                      wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
                      kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
-    for (const Event& e : ev) std::fprintf(f, "%7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
-    std::fclose(f);
+    for (const Event& e : ev) std::fprintf(notes, "%7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
+    std::fclose(notes);
     std::printf("    wrote %s (%.1f s) and %s:\n", wav.c_str(), double(end - start) / o.rate, txt.c_str());
     for (const Event& e : ev) std::printf("      %7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
 

@@ -2,9 +2,7 @@
 #include "o11proto/client.h"
 
 #include <chrono>
-#include <cstring>
 #include <random>
-#include <thread>
 
 #include "o11proto/sha1.h"
 #include "socket_compat.h"
@@ -15,6 +13,40 @@ bool Client::RemoteUser::anyActive() const {
     for (const auto& c : channels)
         if (c.active) return true;
     return false;
+}
+
+// The client's Asio side: one io_context, run by poll() on the caller's
+// thread (concurrency hint 1: nothing else runs it, so no strand or lock is
+// needed), the connection's read and write waits, and a timer for the
+// keepalives and the idle downloads. `gen` counts the connections: a wait
+// of an older one ends with operation_aborted when it closes and then does
+// nothing, even if its handler runs after the next connect().
+struct Client::Net {
+    asio::io_context io{1};
+    asio::steady_timer timer{io};
+    unsigned gen = 0;
+    bool reading = false, writing = false, timing = false, pass_due = false;
+    // Runs ready handlers, waiting up to `ms` for the first (0: none, < 0:
+    // as long as it takes). Bounded, as one pass of a poll() loop was: what is
+    // still ready then runs at the next call.
+    void run(int ms) {
+        if (io.stopped()) io.restart();
+        if (ms < 0) io.run_one();
+        else if (ms > 0) io.run_one_for(std::chrono::milliseconds(ms));
+        for (int i = 0; i < 1024 && io.poll_one(); ++i) {
+        }
+    }
+};
+
+void Client::NetDeleter::operator()(Net* p) const { delete p; }
+
+// How often the housekeeping runs: keepalives are whole seconds, the
+// download timeout 8 s.
+constexpr auto kClientTick = std::chrono::milliseconds(100);
+
+Client::Net& Client::net() {
+    if (!net_) net_.reset(new Net);
+    return *net_;
 }
 
 Client::~Client() { conn_.close(); }
@@ -50,34 +82,91 @@ bool Client::connect(const std::string& host, std::uint16_t port, const Options&
     server_addr_.clear();
     server_port_ = port;
 
-    if (!compat::startup()) return false;
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res)
-        return false;
-    socket_t fd = kInvalidSocket;
-    for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-        fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd == kInvalidSocket) continue;
-        setNonBlocking(fd);
-        int rc = ::connect(fd, ai->ai_addr, static_cast<socklen_t>(ai->ai_addrlen));
-        if (rc == 0 || compat::isInProgress(compat::lastError())) break;
-        compat::closeSocket(fd);
-        fd = kInvalidSocket;
+    Net& n = net();
+    asio::error_code ec;
+    asio::ip::tcp::resolver resolver(n.io);
+    // No flags: every address the name has, as getaddrinfo() gives them
+    // (Asio's default, AI_ADDRCONFIG, would hide loopback-only machines').
+    const auto found = resolver.resolve(host, std::to_string(port), asio::ip::resolver_base::flags(), ec);
+    if (ec || found.empty()) return false;
+    // The first address whose non-blocking connect starts (one that fails at
+    // once, an IPv6 one without a route, say, gives way to the next).
+    for (const auto& entry : found) {
+        asio::ip::tcp::socket s(n.io);
+        s.open(entry.endpoint().protocol(), ec);
+        if (ec) continue;
+        s.non_blocking(true, ec);
+        if (ec) continue;
+        const asio::ip::tcp::endpoint ep = entry.endpoint();
+        if (::connect(s.native_handle(), ep.data(), static_cast<socklen_t>(ep.size())) != 0) {
+            const int err = compat::lastError();
+#ifdef _WIN32
+            if (err != WSAEWOULDBLOCK) continue;
+#else
+            if (err != EINPROGRESS) continue;
+#endif
+        }
+        conn_.adopt(std::unique_ptr<Connection::Net, Connection::NetDeleter>(new Connection::Net(std::move(s))));
+        break;
     }
-    freeaddrinfo(res);
-    if (fd == kInvalidSocket) return false;
-    conn_.adopt(fd);
+    if (!conn_.isOpen()) return false;
+    ++n.gen;
+    n.reading = n.writing = n.timing = n.pass_due = false;
     state_ = State::Connecting;
+    // The connect's outcome: writable, or (on Windows, whose select() reports
+    // a failed connect only among the exceptions) an error.
+    const unsigned g = n.gen;
+    asio::ip::tcp::socket& sock = conn_.net()->socket;
+    sock.async_wait(asio::socket_base::wait_write, [this, g](const asio::error_code& e) {
+        if (!e && net_->gen == g && state_ == State::Connecting) connected();
+    });
+#ifdef _WIN32
+    sock.async_wait(asio::socket_base::wait_error, [this, g](const asio::error_code& e) {
+        if (!e && net_->gen == g && state_ == State::Connecting) connected();
+    });
+#endif
+    armTimer();
     return true;
+}
+
+// The connect finished, one way or the other.
+void Client::connected() {
+    int err = 0;
+    socklen_t len = sizeof(err);
+    compat::getOpt(conn_.fd(), SOL_SOCKET, SO_ERROR, &err, &len);
+#ifdef _WIN32
+    if (err == 0) {
+        // The error wait can end first only for a failed connect.
+        fd_set ex;
+        FD_ZERO(&ex);
+        FD_SET(conn_.fd(), &ex);
+        timeval zero{};
+        if (::select(0, nullptr, nullptr, &ex, &zero) > 0 && FD_ISSET(conn_.fd(), &ex)) err = WSAECONNREFUSED;
+    }
+#endif
+    if (err != 0) {
+        fail("connect failed: " + compat::errorString(err));
+        return;
+    }
+    state_ = State::AwaitingChallenge;
+    conn_.touchRecv();
+    asio::error_code ec;
+    const asio::ip::tcp::endpoint peer = conn_.net()->socket.remote_endpoint(ec);
+    server_addr_ = ec ? std::string() : compat::addressText(peer.address());
+    if (server_addr_.find(':') != std::string::npos) server_addr_.clear();   // IPv6: no Live
+    readNow();                                  // the challenge may be here already; then the pass
 }
 
 void Client::disconnect(const std::string& reason) {
     if (!conn_.isOpen()) return;
     conn_.flush();          // best effort for anything still queued
-    conn_.close();
+    conn_.close();          // its waits end with operation_aborted
+    if (net_) {
+        ++net_->gen;
+        net_->reading = net_->writing = false;
+        net_->timer.cancel();
+        net_->timing = false;
+    }
     for (auto& d : downloads_)
         if (on_download_end) on_download_end(d.first, false);
     downloads_.clear();
@@ -98,65 +187,110 @@ bool Client::sendRaw(std::uint8_t type, const std::vector<std::uint8_t>& payload
         fail("send queue overflow");
         return false;
     }
+    schedulePass();
     return true;
 }
 
 // ------------------------------------------------------------- event loop
 
-void Client::poll(int timeout_ms) {
-    if (!conn_.isOpen()) return;
-    pollfd pfd{};
-    pfd.fd = conn_.fd();
-    pfd.events = POLLIN;
-    if (state_ == State::Connecting || conn_.wantWrite()) pfd.events |= POLLOUT;
-    int rc = compat::poll(&pfd, 1, timeout_ms);
-    if (rc < 0 && !compat::isInterrupted(compat::lastError())) {
-        fail("poll failed");
+// Reads what the socket has, handles it, and then waits for more: always in
+// that order, as Asio's waits are not speculative (on epoll and kqueue a
+// readiness that came before the wait was armed is not reported again).
+void Client::readNow() {
+    if (!conn_.readAvailable()) {
+        // The server closes after a refused login; keep that reason.
+        if (state_ == State::Failed) return;
+        if (!fail_reason_.empty()) fail(fail_reason_);
+        else fail("connection closed by peer");
         return;
     }
-    if (state_ == State::Connecting && !(rc > 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP)))) {
-        int err = 0;
-        if (compat::connectFailed(conn_.fd(), err)) {   // Windows only; see socket_compat.h
-            fail("connect failed: " + compat::errorString(err));
-            return;
-        }
+    const unsigned g = net_->gen;
+    RawMessage msg;
+    bool error = false;
+    while (conn_.isOpen() && conn_.nextMessage(msg, error)) handleMessage(msg);
+    if (error) {
+        fail("protocol error from server");
+        return;
     }
-    if (rc > 0) {
-        if (state_ == State::Connecting) {
-            if (pfd.revents & (POLLOUT | POLLERR | POLLHUP)) {
-                int err = 0;
-                socklen_t len = sizeof(err);
-                compat::getOpt(conn_.fd(), SOL_SOCKET, SO_ERROR, &err, &len);
-                if (err != 0) {
-                    fail("connect failed: " + compat::errorString(err));
-                    return;
-                }
-                state_ = State::AwaitingChallenge;
-                conn_.touchRecv();
-                server_addr_ = peerAddressOf(conn_.fd());
-                if (server_addr_.find(':') != std::string::npos) server_addr_.clear();   // IPv6: no Live
-            }
-        }
-        if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
-            if (!conn_.readAvailable()) {
-                // The server closes after a refused login; keep that reason.
-                if (state_ == State::Failed) return;
-                if (!fail_reason_.empty()) fail(fail_reason_);
-                else fail("connection closed by peer");
-                return;
-            }
-            RawMessage m;
-            bool error = false;
-            while (conn_.isOpen() && conn_.nextMessage(m, error)) handleMessage(m);
-            if (error) {
-                fail("protocol error from server");
-                return;
-            }
-        }
+    if (!conn_.isOpen() || net_->gen != g) return;
+    armRead();
+    schedulePass();
+}
+
+void Client::armRead() {
+    Net& n = *net_;
+    if (n.reading || !conn_.isOpen()) return;
+    n.reading = true;
+    const unsigned g = n.gen;
+    conn_.net()->socket.async_wait(asio::socket_base::wait_read, [this, g](const asio::error_code& ec) {
+        Net& m = *net_;
+        if (m.gen != g) return;                 // a closed connection's wait
+        m.reading = false;
+        if (ec == asio::error::operation_aborted || !conn_.isOpen()) return;
+        readNow();
+    });
+}
+
+void Client::armWrite() {
+    Net& n = *net_;
+    if (n.writing || !conn_.isOpen()) return;
+    n.writing = true;
+    const unsigned g = n.gen;
+    conn_.net()->socket.async_wait(asio::socket_base::wait_write, [this, g](const asio::error_code& ec) {
+        Net& m = *net_;
+        if (m.gen != g) return;
+        m.writing = false;
+        if (ec != asio::error::operation_aborted) schedulePass();   // an error shows in the flush
+    });
+}
+
+// The housekeeping, every kClientTick while connected: no wait of its own in
+// poll(), so a quiet connection still sends its keepalives on time.
+void Client::armTimer() {
+    Net& n = *net_;
+    if (n.timing || !conn_.isOpen()) return;
+    n.timing = true;
+    const unsigned g = n.gen;
+    n.timer.expires_after(kClientTick);
+    n.timer.async_wait([this, g](const asio::error_code& ec) {
+        Net& m = *net_;
+        if (m.gen != g) return;
+        m.timing = false;
+        if (ec || !conn_.isOpen()) return;
+        handleTimers(Clock::now());
+        if (!conn_.isOpen() || m.gen != g) return;
+        armTimer();
+        schedulePass();
+    });
+}
+
+// What used to end every poll(): the queue goes out once whatever is ready
+// has run (one pass for all of it).
+void Client::schedulePass() {
+    Net& n = net();
+    if (n.pass_due || !conn_.isOpen()) return;
+    n.pass_due = true;
+    const unsigned g = n.gen;
+    asio::post(n.io, [this, g] {
+        Net& m = *net_;
+        if (m.gen != g) return;
+        m.pass_due = false;
+        pass();
+    });
+}
+
+void Client::pass() {
+    if (!conn_.isOpen() || state_ == State::Connecting) return;
+    if (!conn_.flush()) {
+        fail("send failed");
+        return;
     }
+    if (conn_.wantWrite()) armWrite();
+}
+
+void Client::poll(int timeout_ms) {
     if (!conn_.isOpen()) return;
-    handleTimers(Clock::now());
-    if (conn_.isOpen() && !conn_.flush()) fail("send failed");
+    net_->run(timeout_ms);
 }
 
 bool Client::waitFor(const std::function<bool()>& pred, int timeout_ms) {
@@ -172,14 +306,16 @@ bool Client::waitFor(const std::function<bool()>& pred, int timeout_ms) {
     return true;
 }
 
+// Runs the io_context until a timer of `ms` ends (whether or not anything
+// is connected meanwhile).
 void Client::runFor(int ms) {
-    TimePoint deadline = Clock::now() + std::chrono::milliseconds(ms);
-    while (Clock::now() < deadline) {
-        if (!conn_.isOpen()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-        }
-        poll(50);
+    Net& n = net();
+    asio::steady_timer until(n.io, std::chrono::milliseconds(ms));
+    bool done = false;
+    until.async_wait([&done](const asio::error_code&) { done = true; });
+    while (!done) {
+        if (n.io.stopped()) n.io.restart();
+        n.io.run_one();
     }
 }
 

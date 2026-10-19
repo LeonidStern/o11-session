@@ -54,7 +54,7 @@ public:
   void resized() override;
 
   // the size it is laid out for, the smallest, the largest
-  enum { DEFAULT_WIDTH = 720, DEFAULT_HEIGHT = 330, MIN_WIDTH = 640, MIN_HEIGHT = 300, MAX_WIDTH = 3000, MAX_HEIGHT = 2000 };
+  static constexpr int DEFAULT_WIDTH = 720, DEFAULT_HEIGHT = 330, MIN_WIDTH = 640, MIN_HEIGHT = 300, MAX_WIDTH = 3000, MAX_HEIGHT = 2000;
   // how much a window of this size scales the layout: 1 up to the default size, then as much as fits
   static double zoomFor(double width, double height);
 
