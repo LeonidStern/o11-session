@@ -389,6 +389,7 @@ private:
         std::atomic<float> peak[2]{{0.0f}, {0.0f}};
         std::mutex qm;                          // upload queue
         std::vector<UploadBlock> queue;
+        std::vector<UploadBlock> drained;       // uploadLoop's turn (control context only)
         std::vector<std::vector<float>> spare;  // recycled block buffers
         // control-context encoder state
         std::unique_ptr<Encoder> enc;
@@ -506,6 +507,7 @@ private:
     std::map<int, std::unique_ptr<LocalState>> locals_;
     std::vector<std::unique_ptr<RemoteUser>> users_;
     std::vector<std::unique_ptr<Decoder>> garbage_;
+    std::vector<std::unique_ptr<Decoder>> garbage_spare_;   // collectGarbage's turn (control context only)
     std::map<Guid, Download> downloads_;
 
     std::atomic<Status> status_{Status::Preconnect};
