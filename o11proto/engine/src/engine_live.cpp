@@ -1105,10 +1105,15 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
         const float vol = std::min(4.0f, std::max(0.0f, u.volume * rc.volume));
         const float pan = std::min(1.0f, std::max(-1.0f, u.pan + rc.pan));
         const bool muted = any_solo ? !rc.solo : (rc.mute || u.mute);
-        const bool audible = !muted && vol >= 1e-7f && numOut > 0;
+        // The level meter (8.6) is measured whether or not the channel is
+        // heard; the peak meter and the output only when it is. Unheard,
+        // the same samples go to `scratch` instead of the output.
+        const bool metered = vol >= 1e-7f;
+        const bool audible = !muted && metered && numOut > 0;
         int idx = 0;
         bool mono = false;
-        if (numOut > 0) outputPair(rc.outChannel, offset, numOut, &idx, &mono);
+        outputPair(rc.outChannel, offset, numOut, &idx, &mono);   // with no outputs: mono, idx 0, unused
+        float scratch[2][LiveMix::kChunk];
         float gl, gr;
         panGains(pan, &gl, &gr);
         float pk0 = 0, pk1 = 0;
@@ -1156,8 +1161,13 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
             bool rest = m.pos[0] == target[0] && (m.pos[1] == 0.0f || m.pos[1] == 1.0f);
             for (int i = 0; rest && i < n; ++i)
                 rest = (live && slot_ok && quietAt(i) <= keep ? 1.0f : 0.0f) == m.pos[1];
-            if (rest && audible)
+            if (rest && audible) {
                 mixAtRest(m, n, vol, gl, gr, mono, out[idx] + done, mono ? nullptr : out[idx + 1] + done, &pk0, &pk1);
+            } else if (rest && metered) {
+                std::fill(scratch[0], scratch[0] + n, 0.0f);
+                std::fill(scratch[1], scratch[1] + n, 0.0f);
+                mixAtRest(m, n, vol, gl, gr, mono, scratch[0], mono ? nullptr : scratch[1], &pk0, &pk1);
+            }
             for (int i = 0; !rest && i < n; ++i) {
                 target[1] = live && slot_ok && quietAt(i) <= keep ? 1.0f : 0.0f;
                 float g[2];
@@ -1177,19 +1187,20 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
                     g[0] *= k;
                     g[1] *= k;
                 }
-                if (!audible) continue;
+                if (!metered) continue;
                 const int f0 = (m.w + i - m.delay[0]) & R, f1 = (m.w + i - m.delay[1]) & R;
                 const float s1 = g[0] * m.ring[0][2 * f0] + g[1] * m.ring[1][2 * f1];
                 const float s2 = g[0] * m.ring[0][2 * f0 + 1] + g[1] * m.ring[1][2 * f1 + 1];
-                float* o0 = out[idx] + done;
                 if (mono) {
                     const float v = clip1((s1 + s2) * 0.5f * vol);
-                    o0[i] += v;
+                    if (audible) out[idx][done + i] += v;
                     pk0 = std::max(pk0, std::fabs(v));
                 } else {
                     const float lv = clip1(s1 * vol * gl), rv = clip1(s2 * vol * gr);
-                    o0[i] += lv;
-                    out[idx + 1][done + i] += rv;
+                    if (audible) {
+                        out[idx][done + i] += lv;
+                        out[idx + 1][done + i] += rv;
+                    }
                     pk0 = std::max(pk0, std::fabs(lv));
                     pk1 = std::max(pk1, std::fabs(rv));
                 }
@@ -1206,6 +1217,10 @@ void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleR
         }
         if (!m.path_live && m.pos[1] <= 0) u.live_slot = -1;   // faded out: no longer this user's to play
         u.live_now.store(m.path_live && u.live_slot >= 0);
+        if (metered) {
+            raisePeak(rc.level[0], pk0);
+            raisePeak(rc.level[1], mono ? pk0 : pk1);
+        }
         if (audible) {
             raisePeak(rc.peak[0], pk0);
             raisePeak(rc.peak[1], mono ? pk0 : pk1);

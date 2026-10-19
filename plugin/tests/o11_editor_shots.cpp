@@ -17,7 +17,7 @@
   writes, as the hosting instance (Leo) sees it: first-open.png (not in a
   room), alone.png (hosting, nobody else), room.png (four others: one just
   joined, one muted, one silent, one with dropouts; a tempo and an interval
-  to come, voted for by Anna), full.png
+  to come, voted for by Anna), live.png (the same room, Live), full.png
   (eight in the room, one too loud), small.png (the smallest window) and
   large.png (a larger one). It takes about a minute.
 
@@ -225,6 +225,12 @@ int main(int argc, char **argv)
       return s.bpm == 100 && s.bpi == 16;
     }, 10), "the room takes 100 BPM and 16 beats");
     shot(*editor, folder.getChildFile("room.png"), 0.3);
+
+    // the room goes Live (from the next interval's start): no beat cells, no next interval
+    leo.plugin->engine().setRoomLive(true);
+    check(waitFor([&]() { return leo.snapshot().liveRoom; }, 30), "the room plays Live");
+    idle(*editor, 3);
+    shot(*editor, folder.getChildFile("live.png"), 0.3);
 
     // eight in the room
     for (int i = 4; i < 7; i ++) join(i);
