@@ -716,15 +716,6 @@ void O11Editor::updateTransport(const Snapshot &s)
   setTooltip(m_sync, syncTooltip(s.hostLabel, s.linkState, s.linkPeers));
   m_clickVolume->setAlpha(m_click->value() ? 1.0f : 0.4f);
 
-  // a Live room has no intervals to show: the box says Live and the beat cells go
-  const bool live = connected && s.liveServer && s.liveRoom;
-  m_beats->setVisible(!live);
-  if (live)
-  {
-    setLabel(m_beatBox, "Live");
-    return;
-  }
-
   // the beat of the interval that plays; without the host's audio nothing plays (and the
   // engine's interval is still the one it started with), so the room's interval and no beat
   const bool playing = connected && s.audioRunning && s.intervalBeats > 0 && s.intervalLength > 0;
@@ -860,8 +851,6 @@ void O11Editor::updateFooter(const Snapshot &s)
     text = s.syncNote;
     warn = true;
   }
-  else if (connected && s.liveServer && s.liveRoom)
-    ; // Live: no next interval, and the bars don't wait for one
   else if (s.nextIntervalPpq >= 0)
     text = nextIntervalText(s.hostChip, s.nextIntervalPpq, s.timeSigNum, s.timeSigDen) + (s.linkLeads ? " (Link)" : "");
   else if (connected)
