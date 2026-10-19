@@ -194,6 +194,22 @@ jobs:
       - name: Tests
         run: ctest --test-dir build --output-on-failure -V
 
+      - name: Split into Apple silicon and Intel bundles
+        run: |
+          # One download per architecture, each half the size of the universal bundle: the
+          # build and the tests above stay universal, and lipo keeps one slice of each copy.
+          for ARCH in arm64 x86_64; do
+            B="build/split/$ARCH/O11Session.vst3"
+            mkdir -p "build/split/$ARCH"
+            ditto "$BUNDLE" "$B"
+            lipo -thin "$ARCH" "$B/Contents/MacOS/O11Session" -output "$B/Contents/MacOS/O11Session.thin"
+            mv "$B/Contents/MacOS/O11Session.thin" "$B/Contents/MacOS/O11Session"
+            test "$(lipo -archs "$B/Contents/MacOS/O11Session")" = "$ARCH"
+            codesign --force --deep --sign - "$B"
+            codesign --verify --deep --strict --verbose=2 "$B"
+            du -sh "$B"
+          done
+
       - name: Are there Developer ID secrets?
         id: devid
         env:
@@ -233,10 +249,13 @@ jobs:
           if [ -z "$IDENTITY" ]; then echo "MACOS_CERT_P12 has no Developer ID Application certificate"; exit 1; fi
           echo "DEVID_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
 
-          codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$BUNDLE"
-          codesign --verify --deep --strict --verbose=2 "$BUNDLE"
+          for ARCH in arm64 x86_64; do
+          B="build/split/$ARCH/O11Session.vst3"
+          codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$B"
+          codesign --verify --deep --strict --verbose=2 "$B"
 
-          ditto -c -k --keepParent "$BUNDLE" "$RUNNER_TEMP/notarize.zip"
+          rm -f "$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --keepParent "$B" "$RUNNER_TEMP/notarize.zip"
           xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD" --wait --output-format json > "$RUNNER_TEMP/notarize.json" || true
           cat "$RUNNER_TEMP/notarize.json"
@@ -249,16 +268,17 @@ jobs:
             fi
             exit 1
           fi
-          xcrun stapler staple "$BUNDLE"
-          xcrun stapler validate "$BUNDLE"
-          codesign --verify --deep --strict --verbose=2 "$BUNDLE"
+          xcrun stapler staple "$B"
+          xcrun stapler validate "$B"
+          codesign --verify --deep --strict --verbose=2 "$B"
+          done
 
       - name: pluginval (with the editor)
         run: |
           curl -fsSL -o pluginval.zip "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/pluginval_macOS.zip"
           echo "$PLUGINVAL_SHA256_MACOS  pluginval.zip" | shasum -a 256 -c -
           ditto -x -k pluginval.zip pluginval
-          pluginval/pluginval.app/Contents/MacOS/pluginval $PLUGINVAL_ARGS --validate "$BUNDLE"
+          pluginval/pluginval.app/Contents/MacOS/pluginval $PLUGINVAL_ARGS --validate build/split/arm64/O11Session.vst3
 
       - name: Package
         run: |
@@ -269,17 +289,23 @@ jobs:
           # the signature itself covers the files inside and stays valid. ditto zips the Finder
           # info of what is inside the folder it is given (not of that folder itself), the way
           # Finder's Compress does (--sequesterRsrc: in __MACOSX/), and unzipping restores it.
-          mkdir -p stage dist
-          ditto "$BUNDLE" stage/O11Session.vst3
+          mkdir -p dist
+          for ARCH in arm64 x86_64; do
+          rm -rf stage "$RUNNER_TEMP/unzipped"
+          mkdir -p stage
+          ditto "build/split/$ARCH/O11Session.vst3" stage/O11Session.vst3
           xattr -wx com.apple.FinderInfo 0000000000000000200000000000000000000000000000000000000000000000 stage/O11Session.vst3
-          ditto -c -k --sequesterRsrc stage dist/O11Session-macos.zip
-          ls -l dist
-          zipinfo -1 dist/O11Session-macos.zip | grep -Fx "__MACOSX/._O11Session.vst3"
+          ZIP="dist/O11Session-macos-$ARCH.zip"
+          ditto -c -k --sequesterRsrc stage "$ZIP"
+          zipinfo -1 "$ZIP" | grep -Fx "__MACOSX/._O11Session.vst3"
           # what someone gets after unzipping: the bundle bit and a valid signature
-          ditto -x -k dist/O11Session-macos.zip "$RUNNER_TEMP/unzipped"
+          ditto -x -k "$ZIP" "$RUNNER_TEMP/unzipped"
           UNZIPPED="$RUNNER_TEMP/unzipped/O11Session.vst3"
           test "$(xattr -px com.apple.FinderInfo "$UNZIPPED" | tr -d ' \n' | cut -c17-20)" = 2000
+          test "$(lipo -archs "$UNZIPPED/Contents/MacOS/O11Session")" = "$ARCH"
           codesign --verify --deep --verbose=2 "$UNZIPPED"
+          done
+          ls -l dist
 
       - name: Disk image
         env:
@@ -294,21 +320,22 @@ jobs:
           # reasons above, and then the image is compressed, signed and notarized.
           python3 -m venv "$RUNNER_TEMP/dmgbuild"
           "$RUNNER_TEMP/dmgbuild/bin/pip" install -q dmgbuild==1.6.7
+          for ARCH in arm64 x86_64; do
           "$RUNNER_TEMP/dmgbuild/bin/dmgbuild" -s plugin/packaging/dmg_settings.py \
-            -D bundle="$BUNDLE" -D background=plugin/packaging/dmg-background.png \
-            "O11 Session" "$RUNNER_TEMP/O11Session-rw.dmg"
+            -D bundle="build/split/$ARCH/O11Session.vst3" -D background=plugin/packaging/dmg-background.png \
+            "O11 Session" "$RUNNER_TEMP/O11Session-$ARCH-rw.dmg"
           RW="$RUNNER_TEMP/dmg-rw"
-          hdiutil attach -nobrowse -noautoopen -mountpoint "$RW" "$RUNNER_TEMP/O11Session-rw.dmg"
+          hdiutil attach -nobrowse -noautoopen -mountpoint "$RW" "$RUNNER_TEMP/O11Session-$ARCH-rw.dmg"
           xattr -wx com.apple.FinderInfo 0000000000000000200000000000000000000000000000000000000000000000 "$RW/O11Session.vst3"
           hdiutil detach "$RW" || { sleep 5; hdiutil detach -force "$RW"; }
-          DMG=dist/O11Session-macos.dmg
-          hdiutil convert "$RUNNER_TEMP/O11Session-rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
+          DMG="dist/O11Session-macos-$ARCH.dmg"
+          hdiutil convert "$RUNNER_TEMP/O11Session-$ARCH-rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
           if [ "$NOTARIZE" = true ]; then
             codesign --force --timestamp --sign "$DEVID_IDENTITY" "$DMG"
             xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
-              --password "$APPLE_APP_PASSWORD" --wait --output-format json > "$RUNNER_TEMP/notarize-dmg.json" || true
-            cat "$RUNNER_TEMP/notarize-dmg.json"
-            STATUS=$(plutil -extract status raw "$RUNNER_TEMP/notarize-dmg.json" 2>/dev/null || echo unknown)
+              --password "$APPLE_APP_PASSWORD" --wait --output-format json > "$RUNNER_TEMP/notarize-dmg-$ARCH.json" || true
+            cat "$RUNNER_TEMP/notarize-dmg-$ARCH.json"
+            STATUS=$(plutil -extract status raw "$RUNNER_TEMP/notarize-dmg-$ARCH.json" 2>/dev/null || echo unknown)
             if [ "$STATUS" != "Accepted" ]; then echo "Notarization of the disk image: $STATUS"; exit 1; fi
             xcrun stapler staple "$DMG"
             xcrun stapler validate "$DMG"
@@ -324,6 +351,7 @@ jobs:
           test "$(xattr -px com.apple.FinderInfo "$RO/O11Session.vst3" | tr -d ' \n' | cut -c17-20)" = 2000
           codesign --verify --deep --verbose=2 "$RO/O11Session.vst3"
           hdiutil detach "$RO"
+          done
 
       - name: Remove the signing keychain
         if: always() && steps.devid.outputs.notarize == 'true'
@@ -331,7 +359,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: O11Session-macos-universal
+          name: O11Session-macos
           path: dist/
 
       - uses: actions/upload-artifact@v4
@@ -374,7 +402,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: O11Session-macos-universal
+          name: O11Session-macos
           path: macos
 
       - name: Zip the downloads
@@ -385,7 +413,7 @@ jobs:
             (cd windows && zip -qr ../release/O11Session-windows-x64.zip O11Session.vst3)
           fi
           # made on the Mac, with the bundle bit (see the macos job)
-          cp macos/O11Session-macos.dmg macos/O11Session-macos.zip release/
+          cp macos/O11Session-macos-*.dmg macos/O11Session-macos-*.zip release/
           ls -l release
 
       - name: Publish to the o11session-latest release
@@ -402,6 +430,10 @@ jobs:
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "O11 Session (latest build)" --notes "$NOTES" --latest
           fi
+          # the universal Mac files of older builds, replaced by one per architecture
+          for OLD in O11Session-macos.dmg O11Session-macos.zip; do
+            gh release delete-asset "$TAG" "$OLD" --repo "$GITHUB_REPOSITORY" -y 2>/dev/null || true
+          done
           gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Publish the release candidate

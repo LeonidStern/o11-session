@@ -14,7 +14,8 @@ ground up to be lighter, cleaner and easier to use.
 
 | | |
 |---|---|
-| **macOS** (Apple silicon and Intel, macOS 12 or later) | [O11Session-macos.dmg](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-macos.dmg) |
+| **macOS, Apple silicon** (M1 and later, macOS 12 or later) | [O11Session-macos-arm64.dmg](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-macos-arm64.dmg) |
+| **macOS, Intel** (macOS 12 or later) | [O11Session-macos-x86_64.dmg](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-macos-x86_64.dmg) |
 | **Windows** (64-bit) | [O11Session-windows-x64.zip](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-windows-x64.zip) |
 | **Linux** (x86_64) | [O11Session-linux-x86_64.zip](https://github.com/LeonidStern/o11-session/releases/download/o11session-latest/O11Session-linux-x86_64.zip) |
 
