@@ -553,11 +553,11 @@ void LiveSink::apply(const SinkItem& it, std::int64_t now_ns) {
     // An xrun block while this host's gap is owed: absorbed, it takes no
     // turn (hostGap()). One more than is owed: the sender's gap was the
     // longer, and what it missed beyond this host's is a hole.
-    bool absorbing = it.kind == SinkItem::Xrun && gap_open_ && gap_owed48_ > absorbAbove();
+    bool absorbing = it.kind == SinkItem::Xrun && gap_open_ && owedNow() > absorbAbove();
     if (it.kind == SinkItem::Xrun && gap_open_ && !absorbing && gap_absorbed_ > 0 && !gap_longer_) {
         gap_longer_ = true;
         unabsorb(absorbAbove());
-        absorbing = gap_owed48_ > absorbAbove();
+        absorbing = owedNow() > absorbAbove();
     }
     if (realign_ && !absorbing && seq < due()) {   // too late for its turn
         if (it.kind == SinkItem::Xrun) {         // but it still tells of the sender's gap (6.4)
@@ -899,6 +899,12 @@ void LiveSink::hostGap(int host_frames, int host_rate, std::int64_t now_ns) {
     }
 }
 
+void LiveSink::hostGapBack(int host_frames, int host_rate) {
+    if (!gap_open_ || !gap_confirmed_ || host_frames <= 0 || host_rate <= 0) return;
+    gap_back48_ += std::llround(static_cast<double>(host_frames) * 48000.0 / host_rate);
+    unabsorb(absorbAbove());
+}
+
 void LiveSink::hostCaughtUp() {
     if (gap_late48_ == 0) return;
     gap_owed48_ -= gap_late48_;                  // nothing missed after all
@@ -921,7 +927,7 @@ void LiveSink::openGap(std::int64_t now_ns) {
 }
 
 void LiveSink::absorbHeld() {
-    for (std::int64_t s = next_; s <= newest_ && s < next_ + kRing && gap_owed48_ > absorbAbove(); ++s) {
+    for (std::int64_t s = next_; s <= newest_ && s < next_ + kRing && owedNow() > absorbAbove(); ++s) {
         const Entry& e = ring_[s & (kRing - 1)];
         if (e.seq == s && e.state == XrunBlock) absorb(s);
     }
@@ -929,7 +935,7 @@ void LiveSink::absorbHeld() {
 
 void LiveSink::absorb(std::int64_t seq) {
     Entry& e = ring_[seq & (kRing - 1)];
-    if (e.seq != seq || e.state != XrunBlock || gap_owed48_ <= absorbAbove()) return;
+    if (e.seq != seq || e.state != XrunBlock || owedNow() <= absorbAbove()) return;
     e.state = Absorbed;
     ++absorbed_;
     ++gap_absorbed_;
@@ -941,7 +947,7 @@ void LiveSink::absorb(std::int64_t seq) {
 // was the longer), the newest absorbed blocks not yet passed are xrun
 // blocks again.
 void LiveSink::unabsorb(std::int64_t above) {
-    for (std::int64_t s = newest_; s >= next_ && s > newest_ - kRing && gap_owed48_ + block_ <= above && absorbed_ > 0; --s) {
+    for (std::int64_t s = newest_; s >= next_ && s > newest_ - kRing && owedNow() + block_ <= above && absorbed_ > 0; --s) {
         Entry& e = ring_[s & (kRing - 1)];
         if (e.seq != s || e.state != Absorbed) continue;
         e.state = XrunBlock;
@@ -951,7 +957,8 @@ void LiveSink::unabsorb(std::int64_t above) {
     }
 }
 
-// The window closes. What the sender's xrun blocks didn't take back is
+// The window closes. What the sender's xrun blocks didn't take back, less
+// what the host caught up on after its report (hostGapBack()), is
 // skipped of the stream's own audio: to the nearest block when none came
 // (this host alone missed the time). When xrun blocks came, up to a block
 // of what is owed is their rounding (whole frames: the sender carries the
@@ -960,7 +967,7 @@ void LiveSink::unabsorb(std::int64_t above) {
 // was, so it stays: what is left after the slack goes in whole blocks,
 // rounded down.
 void LiveSink::closeGap(std::int64_t now_ns) {
-    const std::int64_t owed = gap_owed48_;
+    const std::int64_t owed = gap_owed48_ - gap_back48_;
     const bool absorbed = gap_absorbed_ > 0;
     forgetGap();
     if (owed <= 0) return;
@@ -970,7 +977,7 @@ void LiveSink::closeGap(std::int64_t now_ns) {
 }
 
 void LiveSink::forgetGap() {
-    gap_owed48_ = gap_late48_ = 0;
+    gap_owed48_ = gap_late48_ = gap_back48_ = 0;
     gap_open_ = gap_confirmed_ = gap_longer_ = false;
     gap_absorbed_ = 0;
 }

@@ -917,7 +917,8 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
     // so far (`pending`), which it may still catch up (`caught_up`).
     const std::int64_t dur = static_cast<std::int64_t>(frames) * 1000000000LL / rate;
     const bool early = prev_dur_ns_ > 0 && now - prev_start_ns_ < prev_dur_ns_ * 9 / 10;
-    int gap = 0, pending = 0;
+    int gap = 0, pending = 0, back = 0;
+    std::int64_t gap_ns = 0;
     bool caught_up = false;
     if (expect_ns_ != 0) {
         const std::int64_t threshold =
@@ -925,7 +926,8 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
         if (!early) {
             const std::int64_t late = now - expect_ns_;
             if (late > threshold && late_pending_) {
-                gap = static_cast<int>(std::min<std::int64_t>(late, 500000000LL) * rate / 1000000000LL);
+                gap_ns = std::min<std::int64_t>(late, 500000000LL);
+                gap = static_cast<int>(gap_ns * rate / 1000000000LL);
                 late_pending_ = false;
                 expect_ns_ = now;
             } else if (late > threshold) {
@@ -939,6 +941,31 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
         }
     } else {
         expect_ns_ = now;
+    }
+    // After a gap is reported. Its block may itself have come late, the
+    // host not yet caught up on the stall (a wake a few ms late), and the
+    // gap measured as long by that much; then the blocks after it come
+    // early until it has. A block that isn't early, so on the host's own
+    // schedule again, says how much: by as much as it comes before the
+    // schedule the gap's block began, the gap was shorter. That much the
+    // sinks owe the delay no more (LiveSink::hostGapBack()). Early blocks
+    // don't say: a host may call some of its blocks back to back on each
+    // of its device's periods. For 50 ms, or until a block is late again.
+    if (back_gap_ns_ > 0) {
+        back_sched_ns_ += prev_dur_ns_;
+        back_frames_ += frames;
+        if (pending > 0 || gap > 0 || back_frames_ * 1000000000LL > kGapBackNs * rate) {
+            back_gap_ns_ = 0;
+        } else if (!early && back_sched_ns_ - now > back_ns_) {
+            const std::int64_t to = std::min(back_sched_ns_ - now, back_gap_ns_);
+            back = static_cast<int>(to * rate / 1000000000LL - back_ns_ * rate / 1000000000LL);
+            back_ns_ = to;
+        }
+    }
+    if (gap > 0) {
+        back_sched_ns_ = now;
+        back_gap_ns_ = gap_ns;
+        back_ns_ = back_frames_ = 0;
     }
     // How far this block is behind the host's schedule. A host whose
     // blocks stall and then come back to back to catch up plays the stream
@@ -1026,6 +1053,7 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
         // may take it back (LiveSink::hostGap()).
         if (pending > 0) k.hostLate(pending, rate, now);
         if (gap > 0) k.hostGap(gap, rate, now);
+        if (back > 0) k.hostGapBack(back, rate);
         if (caught_up) k.hostCaughtUp();
         k.hostBehind(behind48);
         for (int i = 0; i < 256; ++i) {

@@ -417,6 +417,19 @@ void stalls(int frame) {
         {"bob's host misses 45 ms, its measure 1 ms short", {{0, 0}, {0, 17}}, {1, -1, 1000}},
         {"bob's host misses 35 ms, its measure 1 ms long", {{0, 0}, {0, 13}}, {1, 13 + 1, 1000}},
         {"both hosts miss 45 ms, bob's measure 1 ms short", {{0, 17}, {0, 17}}, {1, -1, 1000}},
+        // Bob's host back on its schedule only after its report of the gap:
+        // its call of the block that reports it (the second after the
+        // stall) 4 ms late, its blocks after that back to back until it
+        // has caught up. Its measure is 4 ms long, and so are its xrun
+        // blocks (a frame more at 120); as a listener it skips only the
+        // stall all the same (a wake some ms late there made a CI runner
+        // skip 50 ms for 45 at frames of 240). Its first block after the
+        // stall 4 ms late instead: it catches up before it reports, at its
+        // fourth block. And both hosts' reports 4 ms late alike (one thread
+        // calls both): not heard.
+        {"bob's host misses 45 ms, its report 4 ms late", {{0, 0}, {0, 17}}, {1, 17 + 1, 4000}},
+        {"bob's host misses 45 ms, back 4 ms late", {{0, 0}, {0, 17}}, {1, 17, 4000}},
+        {"both hosts miss 45 ms, both reports 4 ms late", {{0, 17}, {0, 17}}, {0, 17 + 1, 4000}},
     };
     for (const Case& c : cases) stallCase(frame, c);
 }
