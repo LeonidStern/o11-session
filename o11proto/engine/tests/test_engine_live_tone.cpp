@@ -186,7 +186,7 @@ struct ToneRoom {
 
     // Each side's jitter buffer setting: 20 ms fixed, or automatic
     // (Engine::kLiveBufferAutomatic).
-    ToneRoom(double ppm, double seconds, const int buffer_ms[2]) {
+    ToneRoom(double ppm, double seconds, const int buffer_ms[2], int frame = 0) {
         ServerConfig cfg;
         cfg.port = 0;
         cfg.allow_anonymous = true;
@@ -196,6 +196,7 @@ struct ToneRoom {
         cfg.bpm = 120;
         cfg.bpi = 4;
         cfg.live.mode = LiveMode::On;
+        if (frame) cfg.live.frame = frame;
         bool ok = server.start(cfg);
         for (int i = 0; ok && !server.liveUdpOpen() && i < 5; ++i) {
             std::printf("    UDP port %u is taken: the server moves\n", server.port());
@@ -542,6 +543,7 @@ struct RunSetup {
     // A listener whose stream the test disturbs: its concealments are the
     // test's, not the machine's (its dips must still have one there).
     bool disturbed[2] = {false, false};
+    int frame = 0;                               // the room's Live frame (0: the server's default)
 };
 
 // What one listener heard.
@@ -627,7 +629,7 @@ RunResult toneRun(const RunSetup& setup) {
     std::printf("  the clocks %.1f ppm apart, %.0f s, buffers %s and %s:\n", ppm, seconds,
                 setup.buffer_ms[0] ? (std::to_string(setup.buffer_ms[0]) + " ms").c_str() : "automatic",
                 setup.buffer_ms[1] ? (std::to_string(setup.buffer_ms[1]) + " ms").c_str() : "automatic");
-    ToneRoom r(ppm, seconds, setup.buffer_ms);
+    ToneRoom r(ppm, seconds, setup.buffer_ms, setup.frame);
     if (!r.connect() || !r.bothLive(20)) {
         CHECK(!"both connected and live");
         n.dips_unexplained = -1;
@@ -944,6 +946,11 @@ TEST(fixed_buffer_never_falls_back) {
     setup.buffer_ms[0] = Engine::kLiveBufferAutomatic;
     setup.buffer_ms[1] = 10;
     setup.disturbed[1] = true;
+    // Frames of 240 samples (5 ms), which the holds of 10 to 20 ms below
+    // make late in a 10 ms buffer. At the default frame of 480 (10 ms)
+    // the same holds made none late (a CI runner: 0 late in the 8 s), and
+    // the test is about the buffer, not the frame.
+    setup.frame = 240;
     LiveCounters fixed;
     int fixed_buffer = -1, fixed_falls = -1;
     bool fixed_fell = true, counted = false;
