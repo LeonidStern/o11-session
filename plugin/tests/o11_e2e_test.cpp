@@ -12,7 +12,9 @@
   the first one's process() with a simulated clock (blocks of 512 at 48 kHz,
   paced at real time, as a host would), and the second one must hear it: SNR
   of at least 35 dB with Opus at the room's bitrate, 60 dB once the room is
-  switched to FLAC with "codec flac". Modelled on o11proto's
+  switched to FLAC with "codec flac". The hosted room has Live, switched on:
+  those checks run with it off ("live off"), then with it on again the whole
+  room goes Live and the guest hears the tone in real time. Modelled on o11proto's
   engine/tests/test_engine_e2e.cpp, through the plug-in's own text commands.
 
   Ableton Link, with Sync on in both (as by default): one instance in a
@@ -36,7 +38,6 @@
 
 #include <math.h>
 #include <stdio.h>
-#include <string.h>
 
 #include <algorithm>
 #include <chrono>
@@ -45,6 +46,7 @@
 #include <vector>
 
 #include "engine.h"
+#include "o11proto/realtime.h"
 
 static constexpr double kPi = 3.14159265358979323846; // kPi is not in MSVC's <math.h> by default
 
@@ -130,6 +132,18 @@ struct Room
     printf("  status: %s\n", e.command("status").c_str());
     return false;
   }
+  // the same for a field of the "live" reply
+  bool waitForLive(Engine &e, const char *key, const std::string &value, double seconds)
+  {
+    const double deadline = now_seconds() + seconds;
+    while (now_seconds() < deadline)
+    {
+      if (field(e.command("live"), key) == value) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    printf("  live: %s", e.command("live").c_str());
+    return false;
+  }
   // `seconds` of audio through both, at real time (the network threads run meanwhile)
   void advance(double seconds)
   {
@@ -172,6 +186,10 @@ struct Room
 
 int main()
 {
+  // this thread calls process() and sleeps between blocks, as a DAW's audio thread: on macOS an
+  // ordinary thread's waits are stretched by timer coalescing (tens of ms on a CI runner)
+  const bool audioThread = o11proto::thread::makeAudioThread((double)Room::BLOCK / Room::RATE);
+  printf("  test thread: audio thread %s; %s\n", audioThread ? "yes" : "no", o11proto::thread::describe().c_str());
   Room room;
   // the host: a room on this computer (120 BPM, 4 BPI), joined at once
   CHECK(room.host.command("name Host") == "ok");
@@ -191,6 +209,11 @@ int main()
   CHECK(room.waitFor(room.host, "lookedup", "-", 5));
   CHECK(field(room.host.command("status"), "joinedfrominternet") == "0");
 
+  // the host looks at Link in its room before the guest joins, so it is the first and leads Link
+  // (two joins within one of its looks race for it)
+  for (int i = 0; i < 250 && field(room.host.command("status"), "link") == "waiting"; i ++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
   // the guest joins; it hears the host, who plays alone on a player output
   CHECK(room.guest.command("connect 127.0.0.1:" + std::to_string(port) + " Guest") == "ok");
   CHECK(room.waitFor(room.guest, "state", "connected", 10));
@@ -204,6 +227,15 @@ int main()
   const std::string chat = room.guest.command("chatlog");
   CHECK(chat.find("Host plays alone on the output Player 1") != std::string::npos);
   CHECK(chat.find("Connected to 127.0.0.1:") != std::string::npos);
+
+  // the hosted room has Live, switched on; the interval checks below run with it off
+  CHECK(room.waitForLive(room.guest, "server", "1", 10));
+  CHECK(room.waitForLive(room.guest, "switch", "1", 5));
+  CHECK(room.waitForLive(room.host, "switch", "1", 5));
+  CHECK(room.guest.command("live off") == "ok");
+  CHECK(room.waitForLive(room.host, "switch", "0", 5));
+  CHECK(room.waitForLive(room.guest, "switch", "0", 5));
+  CHECK(field(room.guest.command("live"), "room") == "intervals");
 
   // Opus, at the room's bitrate
   room.advance(12.0);
@@ -233,8 +265,13 @@ int main()
   CHECK(room.waitFor(room.host, "roomkbps", "128", 10));
 
   // Link: the host, first in the room, leads it; the guest, in the same process, can't
-  const bool haveLink = field(room.host.command("status"), "link") != "unavailable";
+  const std::string linkStatus = room.host.command("status");
+  const bool haveLink = field(linkStatus, "link") != "unavailable";
+  // other Link apps on this machine (a DAW, a benchmark's players) take the lead or contest it
+  const int otherLinkApps = atoi(field(linkStatus, "peers").c_str());
   if (!haveLink) printf("  Link couldn't start here: its checks are skipped\n");
+  else if (otherLinkApps > 0)
+    printf("  %d other Link apps on this machine (link=%s): the Link checks are skipped\n", otherLinkApps, field(linkStatus, "link").c_str());
   else
   {
     CHECK(room.waitFor(room.host, "link", "leading", 5));
@@ -291,7 +328,53 @@ int main()
     peer.enable(false);
   }
 
-  // transmit off: the host sends nothing from the next interval on, and the guest hears silence
+  // Live on again: the whole room goes Live at an interval's start, and the guest hears the tone
+  // in real time (Opus at Live's 128 kbps, though the room's intervals are FLAC)
+  CHECK(room.guest.command("live on") == "ok");
+  for (int i = 0; i < 100 && (field(room.guest.command("live"), "room") != "live" || field(room.host.command("live"), "room") != "live"); i ++)
+    room.advance(0.2);
+  const std::string guestLive = room.guest.command("live");
+  printf("  guest live: %s", guestLive.c_str());
+  CHECK(field(guestLive, "room") == "live");
+  CHECK(field(room.host.command("live"), "room") == "live");
+  room.heard.clear();
+  room.advance(3.0);
+  {
+    const size_t take = (size_t)Room::RATE * 2;
+    const float *p = room.heard.data() + (room.heard.size() - take);
+    const double liveSnr = snrAgainstTone(p, take, room.hz, Room::RATE);
+    float livePeak = 0;
+    for (size_t i = 0; i < take; ++i) livePeak = std::max(livePeak, fabsf(p[i]));
+    const int heardMs = atoi(field(room.guest.command("live"), "heard").c_str());
+    printf("  live: snr %.1f dB, peak %.3f, heard %d ms late\n", liveSnr, livePeak, heardMs);
+    CHECK(liveSnr >= 30.0);
+    CHECK(livePeak >= 0.45f && livePeak <= 0.55f);
+    CHECK(heardMs > 0 && heardMs < 150);
+  }
+  CHECK(room.guest.command("chatlog").find("The room is Live now") != std::string::npos);
+  // the buffer is automatic, and each stream says what it plays with and what happened to it
+  CHECK(field(guestLive, "buffer") == "auto");
+  // all to all: the guest and the host hear each other directly, not through the room's server
+  CHECK(room.waitForLive(room.guest, "route", "direct", 5));
+  CHECK(room.waitForLive(room.host, "route", "direct", 5));
+  {
+    const std::string counters = room.guest.command("live counters");
+    printf("  guest live counters: %s", counters.c_str());
+    CHECK(counters.find(" buffer=") != std::string::npos);
+    CHECK(counters.find(" fell_back=") != std::string::npos);
+  }
+  // tests can fix it (not saved, no menu), and go back to automatic
+  CHECK(room.guest.command("live buffer 40") == "ok");
+  CHECK(room.waitForLive(room.guest, "buffer", "40", 5));
+  CHECK(room.guest.getSettings().liveBufferMs == 40);
+  CHECK(room.guest.command("live buffer 33").find("error") == 0);
+  CHECK(room.guest.command("live buffer 0").find("error") == 0);
+  CHECK(room.guest.command("live buffer auto") == "ok");
+  CHECK(room.waitForLive(room.guest, "buffer", "auto", 5));
+  CHECK(room.guest.getSettings().liveBufferMs == Settings::LIVE_BUFFER_AUTO);
+
+  // transmit off: the host sends nothing from the next interval on (nor Live, at once), and the
+  // guest hears silence
   CHECK(room.host.command("transmit off") == "ok");
   room.advance(2.0 * room.intervalLength() / Room::RATE + 1.0);
   room.heard.clear();

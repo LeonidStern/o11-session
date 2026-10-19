@@ -195,6 +195,12 @@ implemented as written and no longer listed as a choice.
   lowest value leads. Votes expire after `VotingTimeout` seconds and are
   dropped on disconnect. The "Voting not enabled" check runs before the
   privilege check (order not given by the spec).
+- A vote that passes those checks is shown to the room (revision 2c): everyone,
+  the voter included, first gets `MSG <voter> <text>` with the command text as
+  the client sent it, white space trimmed at both ends (`!Vote BPM 100 ` gives
+  `!Vote BPM 100`), then the `leading candidate` or `setting` line. A refused
+  vote is answered to the sender only and shown to nobody. A hidden voter is
+  shown by name, as their chat is.
 - `/topic` with text needs the topic privilege and is broadcast as
   `TOPIC <user> <text>`; without text the sender gets `TOPIC "" <topic>`.
   `/kick name` matches exactly, `/kick name*` kicks every prefix match; each
@@ -234,6 +240,139 @@ implemented as written and no longer listed as a choice.
   reason) only happens when the effective codec is neither the chosen one nor
   blocked by a user lacking the chosen codec; it is kept as a fallback.
 
+## Live mode (section 15)
+
+Clean-room implementation of the Live specification, revision 2
+(2026-10-17). The only inputs were that document, `PROTOCOL.md`, `ENGINE.md`,
+`PORTMAP.md` and the o11proto sources; no AOO, NINJAM or Jamsa source was
+read. Live is o11proto's own: nothing exists only to talk to the reference
+build, but the wire formats are the specification's. Where the
+specification lets a new implementation choose (its quirks, section 10),
+the choice is listed here. Two parts are O11 Session's own and not in the
+specification: the room's one mode with its advice (PROTOCOL.md 15.11) and
+the direct paths, all to all (15.10).
+
+### Server
+
+- **One mode for the room** (a deliberate difference from the
+  specification's 6.5, which switches each player between Live and
+  intervals by its health). The room's mode is its `!live` switch alone:
+  while it is on the room is Live for everyone, the server relays no
+  interval audio (it refuses an upload that begins more than an interval
+  after the room went Live, and still relays silent intervals), and a
+  player who can't play Live neither hears nor is heard. Nothing moves a
+  player or the room to intervals: the clients' reports (`0x85`) only feed
+  the advice the server sends with the mode (`0x08`, `live_room.h`'s
+  `RoomAdvice`), for a UI to suggest `!live off`. The server logs the room's
+  state and the advice as `[live room]` lines (PROTOCOL.md 15.11).
+- **All to all, direct only.** The server gives each pair of senders with
+  caps bit 17 a key and the other's addresses (`0x09`) and works out the
+  room's route from the clients' `0x87`; the relay carries Live only for
+  players without paths. A pair whose path is unreachable can't hear each
+  other, and the advice calls one of them "can't play Live", which suggests
+  intervals. The rate limit is scaled by the number of other senders, so
+  that a player sending to each of them on its own isn't cut (15.7).
+- **The relay fallback** is a backend option, off by default:
+  `LiveConfig::relay_fallback` (`ServerConfig::live.relay_fallback`), or
+  the environment variable `O11_LIVE_RELAY_FALLBACK` (`1` or `0`), read when
+  the UDP port opens and at each `setLiveConfig()` while it is open; there
+  is no `o11server` flag. With it, once a pair has no direct path while the
+  room is Live, the whole room goes through the relay and stays there until
+  a player sends `!live direct`, which is shown nowhere (it is an unknown
+  argument without the option); the route lines are `[live room]` lines
+  too (15.10). The plug-in doesn't offer it to its players.
+- **Configuration.** There is no configuration file, so the options are
+  `ServerConfig::live` (`LiveConfig`) and the `o11server --live*` flags, and
+  `Server::setLiveConfig()` is the reload of 3.5: it opens or closes the UDP
+  port and gives a room whose switch nobody chose with `!live` the new
+  default. The UDP port is the TCP port's number, so a reload never moves it.
+  Out-of-range values are logged as `warning: LiveKbps N is outside 32-510,
+  using 128` (and the same for `LiveFrame`, `LiveMaxPeers`, `LivePort`) and
+  replaced by their default; those texts are ours.
+- **One room.** No lobby and no private rooms, so quirk 16 can't arise; the
+  reload applies to the one room.
+- **The room's order** (3.3) is the order the server accepted the
+  connections in, which is connection id order. The peer id is the
+  connection id.
+- **Senders** are the first `LiveMaxPeers` Live players in that order that
+  have a key and channels (quirk 17: a player without a key takes no place).
+  A player told `maxchan` 0 (a server-wide `max_channels` of 0) is a listener
+  only: it gets the message without may send, is known to the relay and can
+  bind, but is sent no audio. Hidden users (privilege `h`) are not Live
+  players.
+- **No randomness** (quirk 18). When the cookie secret can't be drawn, the
+  log says `Error opening UDP port N for Live! Could not read the system's
+  random source.` (or the warning form for Live yes and on) instead of the
+  busy-port text. A player whose key can't be drawn after four tries gets no
+  `0x07` (quirk 13 kept), and one warning line is logged.
+- **Previous epoch** (quirk 6): skipped at epoch 0 instead of wrapping.
+- **Unverified hellos** are answered and counted as dropped (`unverified
+  address (answered)`) in the traffic line, as the reference does (quirk 19).
+- **Rate tokens** are charged before the room-off, may-send and destination
+  checks (quirk 4), and the bucket starts full at a player's first datagram.
+- **Bound changes** are noticed per player and the messages compared per
+  player, so a bind sends a `0x07` only to the players whose message changed
+  (quirk 5 does not arise).
+- **Bind address.** The UDP socket binds `bind_address` like TCP (all
+  interfaces when empty).
+- **Replying from the right address** (4.9): `IP_PKTINFO` on Linux,
+  `IP_RECVDSTADDR` and `IP_SENDSRCADDR` on the BSDs and macOS. Windows has
+  neither here, so there the routing table chooses, which is right on a
+  machine with one address; test 24 (several addresses) is skipped there.
+  When the address a player was answered from disappears, the relay sends
+  from the routing table's choice until that player's next verified hello.
+- **Test hooks.** `NINJAM_LIVE_FRESH_SECONDS` and `NINJAM_LIVE_STATS_SECONDS`
+  are kept under the specification's names; they are read when the UDP port
+  opens and at each `setLiveConfig()` while it is open, and
+  `LiveConfig::fresh_seconds` / `stats_seconds` are the same knobs for code.
+  `Server::intervalTraffic()` and `Server::liveDataRelayed()` count, for the
+  tests, the interval audio relayed or refused and the Live data relayed.
+- **Texts.** The `!live` broadcasts say "O11 Session players" where the
+  reference names its own product, and say who isn't heard while Live is on
+  (`<name>'s client can't play Live, so <name> isn't heard until Live is
+  off.`, `Live has room for N, so <name> isn't heard while it is on`) where
+  the specification's players stay on intervals.
+- **Port mapping** maps UDP on the TCP port's number and ignores `LivePort`
+  (quirk 23 kept: a router forwarding another public port is the host's own
+  setup, which is what `LivePort` is for). A NAT-PMP UDP mapping on another
+  public port is kept and warned about (quirk 10). See `portmap/NOTES.md`.
+- **Tests.** Conformance test 20 (a steady stream for some time) runs for 2 s
+  instead of a minute; test 5 (listeners only) runs with a server-wide
+  `max_channels` of 0, since o11proto has no per-user channel limit. The
+  forwarding-latency test asks for p99 under 2 ms on Linux and under 20 ms
+  elsewhere, where shared build machines schedule more coarsely.
+
+### Client transport
+
+- `live::Transport` runs one network thread per Live client, for the relay
+  and the direct paths, on one socket bound to a port of its own and not
+  `connect()`ed: what comes from the relay's address and port is the
+  relay's, anything else must carry a pair's key (15.10). The thread is a
+  network thread (`thread::makeNetworkThread()`: on macOS the
+  time-constraint policy, where an ordinary or user-interactive thread's
+  wakes came tens of ms late on a loaded machine; latency-critical
+  elsewhere). It waits on the socket and on a wake pipe, and runs a pass of
+  its own at least every `Options::wait_ms`; `on_tick` follows each pass.
+  The engine sets 10 ms and calls `wake()` from the audio thread for each
+  block it queues, so its source sends as the audio comes, without a 1 ms
+  poll (Windows has no wake pipe: 1 ms there). The specification's
+  informative layout (a receiving thread and a sending thread woken by the
+  audio thread) is folded into that one thread. `timing()` measures the
+  wakes and the timed waits for diagnostics.
+- `send()` is allowed only on the network thread, which owns the socket and
+  closes it after `on_closing`; so no send can race with the close (6.1), and
+  the source's `/stop`s go out before the socket closes (quirk 21).
+- `Options::test_receive_loss` drops that fraction of received data
+  datagrams before `on_data`: a test hook for the engine's loss tests.
+- A Live client whose TCP connection is IPv6 can't start (`serverAddress()`
+  is empty): `no peer ID or server address`, as 4.1 says.
+
+### Engine
+
+The audio layer and the client's behaviour (Live spec sections 5 and 6) are
+in the engine: `ENGINE.md` section 16, with its choices in `engine/NOTES.md`
+("Live mode").
+
 ## Tools
 
 - `o11cli` always prints JSON lines (`--json` is accepted and changes nothing)
@@ -244,6 +383,13 @@ implemented as written and no longer listed as a choice.
   without `--bpm-interval` the file is uploaded once after login. `o11cli`
   does not implement the 7.1 rule of sending the previous interval's end at
   the boundary; it ends each upload right away.
+- `o11server`'s thread relays every Live datagram as it comes, so it is a
+  network thread (`o11proto/realtime.h`: real-time on macOS, where an
+  ordinary one on a loaded Mac ran 30-40 ms late and ran every listener's
+  10-20 ms buffer dry), and it logs `[o11server] the server's thread:
+  real-time (time-constraint)` (or `latency-critical`, `its scheduling
+  unchanged`). `o11jam`'s host thread is an audio thread
+  (`thread::makeAudioThread()`).
 - `o11server --user name:pass:privs`: `privs` is the letter string documented
   in README.md; a missing privilege part means `cv`. `--anon-multi` gives
   anonymous users the multiple-logins privilege; `--max-pending T P` sets the

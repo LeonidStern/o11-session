@@ -156,16 +156,17 @@ private:
 // a tempo as the editor writes it: "120", "109.6", "120.25"
 std::string bpmText(double bpm);
 
-// What to call the host: "Live" for Ableton Live, else its name (or "The DAW")
+// What to call the host: "Ableton" for Ableton Live (not "Live", the room's mode), else its name (or "The DAW" when it doesn't say)
 std::string shortHostName(const std::string &hostName);
 
-// The host's name where there is little room (the transport bar): shortHostName() if it is
-// short, else "Host"
+// The host's name where there is little room (the transport bar): shortHostName() without a
+// maker or version in it, or its first word, if that fits in ten characters ("Ableton", "Bitwig",
+// "Cubase", "REAPER"), else "DAW"
 std::string hostChipName(const std::string &hostName);
 
 // The line the editor shows when the host's tempo isn't the room's, such as
-// "Live is at 120 BPM, the room at 95: set Live to 95", or "" when they agree. suggestLink:
-// Link would lead the host if it were on there ("turn on Link in Live, or set it to 95").
+// "Ableton is at 120 BPM, the room at 95: set Ableton to 95", or "" when they agree. suggestLink:
+// Link would lead the host if it were on there ("turn on Link in Ableton, or set it to 95").
 std::string hostTempoNote(const std::string &hostName, double hostTempo, int roomBpm, bool following, bool suggestLink = false);
 
 // Ableton Link, while Sync is on (linksync.h). Off: Sync is off, so the plug-in isn't in Link.
@@ -175,7 +176,7 @@ std::string hostTempoNote(const std::string &hostName, double hostTempo, int roo
 // couldn't start.
 enum class LinkState { Off, Waiting, Leading, OtherInstance, Contested, Unavailable };
 
-// "Turn on Link in Live: ...", when Link sees no other app (the chat says it once, the Sync
+// "Turn on Link in Ableton: ...", when Link sees no other app (the chat says it once, the Sync
 // button's tooltip while it lasts)
 std::string linkHint(const std::string &hostName);
 

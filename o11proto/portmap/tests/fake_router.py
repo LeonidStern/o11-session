@@ -9,6 +9,8 @@ Scenarios:
   permanent   AddPortMapping answers error 725 unless the lease is 0
   refuse718   AddPortMapping answers error 718; NAT-PMP responder up (3600 s)
   natpmp10    no IGD (root description is a 404); NAT-PMP grants 10 s leases
+  udp718      like public, but a UDP AddPortMapping answers error 718 (Live)
+  natpmpshift no IGD; NAT-PMP grants 3600 s, but UDP at the asked port + 1 (Live)
 
 Serves the IGD root description at GET /rootDesc.xml and SOAP control at
 POST /ctl/IPConn on an ephemeral 127.0.0.1 port, and NAT-PMP (RFC 6886) on
@@ -16,9 +18,9 @@ UDP 127.0.0.1:5351 when the scenario has a responder. Prints
 "READY <http-port>" on stdout once everything listens. Bookkeeping endpoints:
 
   GET /mappings   one line per held mapping and per NAT-PMP mapping request:
-                    upnp TCP <ext> <int> <client> <lease> <desc>
-                    natpmp TCP <private> <public> <lifetime>
-                    natpmp_request <seconds-since-start> <private> <public> <lifetime>
+                    upnp <TCP|UDP> <ext> <int> <client> <lease> <desc>
+                    natpmp <TCP|UDP> <private> <public> <lifetime>
+                    natpmp_request <seconds-since-start> <private> <public> <lifetime> <TCP|UDP>
   GET /quit       stops the fake router
 
 Standard library only.
@@ -37,6 +39,10 @@ SCENARIOS = {
     "permanent": dict(upnp=True, external="93.184.216.34", add_error=725, natpmp=False, natpmp_lease=3600),
     "refuse718": dict(upnp=True, external="93.184.216.34", add_error=718, natpmp=True, natpmp_lease=3600),
     "natpmp10": dict(upnp=False, external="93.184.216.34", add_error=0, natpmp=True, natpmp_lease=10),
+    "udp718": dict(upnp=True, external="93.184.216.34", add_error=0, udp_error=718, natpmp=False,
+                   natpmp_lease=3600),
+    "natpmpshift": dict(upnp=False, external="93.184.216.34", add_error=0, natpmp=True, natpmp_lease=3600,
+                        udp_shift=1),
 }
 
 NATPMP_PUBLIC = "93.184.216.34"
@@ -45,7 +51,7 @@ START = time.monotonic()
 state_lock = threading.Lock()
 upnp_mappings = {}      # (proto, ext_port) -> (int_port, client, lease, desc)
 natpmp_mappings = {}    # (proto, private_port) -> (public_port, lifetime)
-natpmp_requests = []    # (t, private_port, public_port, lifetime)
+natpmp_requests = []    # (t, private_port, public_port, lifetime, proto)
 
 
 def report_lines():
@@ -55,8 +61,8 @@ def report_lines():
             out.append("upnp %s %d %d %s %d %s" % (proto, ext, iport, client, lease, desc))
         for (proto, priv), (pub, life) in natpmp_mappings.items():
             out.append("natpmp %s %d %d %d" % (proto, priv, pub, life))
-        for (t, priv, pub, life) in natpmp_requests:
-            out.append("natpmp_request %.3f %d %d %d" % (t, priv, pub, life))
+        for (t, priv, pub, life, proto) in natpmp_requests:
+            out.append("natpmp_request %.3f %d %d %d %s" % (t, priv, pub, life, proto))
     return "\n".join(out) + "\n"
 
 
@@ -188,6 +194,8 @@ class Handler(BaseHTTPRequestHandler):
             lease = int(arg(body, "NewLeaseDuration") or 0)
             desc = arg(body, "NewPortMappingDescription")
             err = sc["add_error"]
+            if proto == "UDP" and sc.get("udp_error"):
+                err = sc["udp_error"]
             if err == 725 and lease != 0:
                 self._send(500, soap_fault(725, "OnlyPermanentLeasesSupported"))
             elif err == 718:
@@ -231,12 +239,14 @@ def natpmp_loop(sock, scenario, stop):
             _, _, _, priv, pub, life = struct.unpack("!BBHHHI", data[:12])
             proto = "UDP" if op == 1 else "TCP"
             with state_lock:
-                natpmp_requests.append((time.monotonic() - START, priv, pub, life))
+                natpmp_requests.append((time.monotonic() - START, priv, pub, life, proto))
                 if life == 0:
                     natpmp_mappings.pop((proto, priv), None)
                     granted_pub, granted_life = pub, 0
                 else:
                     granted_pub = pub if pub else priv
+                    if proto == "UDP":
+                        granted_pub += scenario.get("udp_shift", 0)
                     granted_life = min(life, scenario["natpmp_lease"])
                     natpmp_mappings[(proto, priv)] = (granted_pub, granted_life)
             resp = struct.pack("!BBHIHHI", 0, 128 + op, 0, epoch, priv, granted_pub, granted_life)

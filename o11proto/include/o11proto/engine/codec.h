@@ -52,9 +52,9 @@ std::int16_t floatToInt16(float v, DitherRng& rng);
 // The same for a whole buffer, into 32-bit integers (libFLAC's input type).
 void floatToInt16(const float* in, std::int32_t* out, std::size_t n, DitherRng& rng);
 
-// Levinson-Durbin fit of `order` coefficients to `n` samples (with a mild lag
-// window and bandwidth expansion), then `count` extrapolated samples that
-// continue `history`. Silence extrapolates to silence.
+// Burg's fit of `order` coefficients to `n` samples (with bandwidth
+// expansion), then `count` extrapolated samples that continue `history`.
+// Silence extrapolates to silence.
 void lpcExtrapolate(const float* history, int n, int order, float* out, int count);
 
 // Windowed-sinc resampler for interleaved float audio whose state persists

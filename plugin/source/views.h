@@ -8,20 +8,24 @@
 /*
 
   The editor's own views, drawn in code (no bitmaps), in the look of Ableton
-  Live's devices: grey strips, dark value boxes, flat toggles in Live's
-  yellow, orange and blue, segmented meters.
+  Live's devices and Max for Live's controls: grey strips, dark value boxes,
+  flat toggles in Live's yellow, orange and blue, thin meters, small type
+  (Inter, built in).
 
   - Strip: a rectangle of one colour (strips, panes, separators), with or without children
   - FlatButton: a toggle or a push button
   - Led: a small round light
   - DragNumberBox: Live's tempo box: drag it up or down, or double-click and type
-  - MenuBox: a value box with a menu (BPI, bitrate)
+  - MenuBox: a value box with a menu (interval, codec, bitrate)
   - FaderBox: a horizontal volume box, filled to the level, with its dB
-  - ArcKnob: a small knob with an arc (pan, click volume)
-  - SegmentMeter: a 7-segment level meter
+  - ArcKnob: a small dial with an arc (pan, click volume)
+  - LevelMeter: a thin level meter with a peak mark and a clip light
+  - NameCell: a name, its channel and a short status in colour, cut to fit
+  - Chip: a coloured note with a name at the right (a change the room waits to make)
+  - EventList: lines and how long ago, newest first; the mouse wheel scrolls
   - BeatCells: one cell per beat of the interval
-  - AddressBox: an address and its Copy button
-  - TextLinesView: wrapped scrolling text (chat, license)
+  - AddressBox: an address to copy, its label and a Copy button
+  - TextLinesView: wrapped scrolling text (the server's licence)
   - LookAndFeel: the text boxes, menus, tooltips and scrollbars JUCE draws
 
   Cut, Copy, Paste and Select All in the text boxes, and the clipboard, are
@@ -41,45 +45,53 @@
 namespace o11 {
 namespace ui {
 
+// a UTF-8 std::string as a juce::String
+inline juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
+
 struct Colors
 {
-  static juce::Colour window() { return juce::Colour(0xff2b2b2b); }
-  static juce::Colour strip() { return juce::Colour(0xff363636); }
+  static juce::Colour window() { return juce::Colour(0xff242424); }
+  static juce::Colour strip() { return juce::Colour(0xff2f2f2f); }
   static juce::Colour pane() { return juce::Colour(0xff1f1f1f); }
-  static juce::Colour row() { return juce::Colour(0xff2a2a2a); }
-  static juce::Colour myRow() { return juce::Colour(0xff33302a); }
-  static juce::Colour box() { return juce::Colour(0xff1c1c1c); }
-  static juce::Colour boxLine() { return juce::Colour(0xff121212); }
-  static juce::Colour buttonOff() { return juce::Colour(0xff4a4a4a); }
-  static juce::Colour buttonText() { return juce::Colour(0xffd0d0d0); }
-  static juce::Colour separator() { return juce::Colour(0xff4a4a4a); }
-  static juce::Colour label() { return juce::Colour(0xff8c8c8c); }
-  static juce::Colour value() { return juce::Colour(0xffe6e6e6); }
-  static juce::Colour text() { return juce::Colour(0xffc9c9c9); }
-  static juce::Colour status() { return juce::Colour(0xff9a9a9a); }
-  static juce::Colour placeholder() { return juce::Colour(0xff6c6c6c); }
-  static juce::Colour dark() { return juce::Colour(0xff1c1c1c); } // text on a lit button
+  static juce::Colour myRow() { return juce::Colour(0xff30291f); }
+  static juce::Colour box() { return juce::Colour(0xff171717); }
+  static juce::Colour buttonOff() { return juce::Colour(0xff424242); }
+  static juce::Colour buttonPressed() { return juce::Colour(0xff5e5e5e); }
+  static juce::Colour buttonText() { return juce::Colour(0xffdadada); }
+  static juce::Colour separator() { return juce::Colour(0xff454545); }
+  static juce::Colour label() { return juce::Colour(0xff8c8c8c); }  // labels, quiet text
+  static juce::Colour faint() { return juce::Colour(0xff5f5f5f); }  // placeholders, ages
+  static juce::Colour value() { return juce::Colour(0xffdadada); }  // values, names
+  static juce::Colour dark() { return juce::Colour(0xff161616); }   // text on a lit button
   static juce::Colour yellow() { return juce::Colour(0xffffb532); }
   static juce::Colour yellowLine() { return juce::Colour(0xffc98a1e); }
   static juce::Colour orange() { return juce::Colour(0xffff7d3b); }
-  static juce::Colour orangeLine() { return juce::Colour(0xffc45a26); }
   static juce::Colour blue() { return juce::Colour(0xff6fb2ee); }
-  static juce::Colour blueLine() { return juce::Colour(0xff4a86bd); }
   static juce::Colour green() { return juce::Colour(0xff5fd16a); }
+  static juce::Colour amber() { return juce::Colour(0xffe2a333); }
+  static juce::Colour red() { return juce::Colour(0xffff5c5c); }
   static juce::Colour purple() { return juce::Colour(0xffb99ff0); }
-  static juce::Colour red() { return juce::Colour(0xffe85f55); }
-  static juce::Colour pastBeat() { return juce::Colour(0xff5a4a2a); }
-  static juce::Colour downbeat() { return juce::Colour(0xff262626); }
-  static juce::Colour faderFill() { return juce::Colour(0xff6b6b6b); }
-  static juce::Colour meterOff() { return juce::Colour(0xff2a2a2a); }
-  static juce::Colour meterYellow() { return juce::Colour(0xffffd23a); }
-  static juce::Colour knobRing() { return juce::Colour(0xff555555); }
+  static juce::Colour purpleDim() { return juce::Colour(0xff8f80b3); }
+  static juce::Colour chip() { return juce::Colour(0xff382f4d); }
+  static juce::Colour ledOff() { return juce::Colour(0xff5a5a5a); }
+  static juce::Colour pastBeat() { return juce::Colour(0xff54442a); }
+  static juce::Colour pastDownbeat() { return juce::Colour(0xff6b5530); }
+  static juce::Colour downbeat() { return juce::Colour(0xff2b2b2b); }
+  static juce::Colour faderFill() { return juce::Colour(0xff474747); }
+  static juce::Colour faderHandle() { return juce::Colour(0xffa8a8a8); }
+  static juce::Colour meterTrack() { return juce::Colour(0xff2b2b2b); }
+  static juce::Colour peakMark() { return juce::Colour(0xffe6e6e6); }
+  static juce::Colour lampOff() { return juce::Colour(0xff333333); }
+  static juce::Colour knobRing() { return juce::Colour(0xff4f4f4f); }
 };
 
+// Inter, built into the plug-in (SIL Open Font License 1.1, see fonts/Inter-LICENSE.txt), at
+// Max for Live's small sizes: 10 px values, 9 px labels
 struct Fonts
 {
-  juce::Font value, label, bold, small, tiny, button, chat, chatBold, mono, menu;
-  Fonts(); // Arial (11 px values, 10 px labels, ...), a monospace font for addresses
+  juce::Typeface::Ptr regular, semiBold;
+  juce::Font title, value, valueBold, label, labelBold, small, button, tiny, text, mono, menu;
+  Fonts();
 };
 
 // the width of text in a font
@@ -106,7 +118,7 @@ public:
   FlatButton(const std::string &title, Kind kind, const juce::Font &font);
   void setTitle(const std::string &title);
   const std::string &title() const { return m_title; }
-  void setOnColors(juce::Colour fill, juce::Colour line) { m_onFill = fill; m_onLine = line; repaint(); }
+  void setOnColor(juce::Colour fill) { m_onFill = fill; repaint(); } // lit in yellow by default
   void setValue(bool on);   // a toggle's state, without onChange
   bool value() const { return m_on; }
   float preferredWidth() const;
@@ -121,7 +133,7 @@ private:
   std::string m_title;
   Kind m_kind;
   juce::Font m_font;
-  juce::Colour m_onFill, m_onLine;
+  juce::Colour m_onFill;
   bool m_on = false, m_pressed = false;
 };
 
@@ -169,15 +181,15 @@ private:
   int m_startY = 0, m_dragValue = 0;
 };
 
-// a value box that opens a menu of choices ("16 ▾")
+// a value box that opens a menu of choices ("16 beats ▾")
 class MenuBox : public juce::Component, public juce::SettableTooltipClient
 {
 public:
   explicit MenuBox(const juce::Font &font);
-  void addEntry(const std::string &text) { m_entries.push_back(text); }
+  void addEntry(const std::string &text) { m_entries.push_back(text); m_entryEnabled.push_back(true); }
+  void setEntryEnabled(int index, bool enabled); // a greyed entry can't be picked
   void setShown(const std::string &text); // what the box says (the room's value may not be one of the choices)
   void setCurrentIndex(int index) { m_current = index; } // the checked entry, -1 for none
-  int currentIndex() const { return m_current; }
   std::function<void(int)> onSelect; // an entry was picked
   void paint(juce::Graphics &g) override;
   void mouseDown(const juce::MouseEvent &e) override;
@@ -187,6 +199,7 @@ private:
   std::string m_shown;
   juce::Font m_font;
   std::vector<std::string> m_entries;
+  std::vector<bool> m_entryEnabled;
   int m_current = -1;
 };
 
@@ -216,7 +229,7 @@ protected:
   bool m_editing = false;
 };
 
-// a horizontal volume box: grey up to the level, the value (dB) at the right
+// a horizontal volume box: grey up to the level, with a light edge there, and the value (dB) at the left
 class FaderBox : public DragControl
 {
 public:
@@ -228,8 +241,8 @@ private:
   juce::Font m_font;
 };
 
-// a small knob: a dark disc in a grey ring, with a yellow arc from the top (bipolar: pan) or
-// from the start of its travel (a volume)
+// a small dial: a grey ring with a yellow arc from the top (bipolar: pan) or from the start of
+// its travel (a volume), and a pointer at the value
 class ArcKnob : public DragControl
 {
 public:
@@ -240,16 +253,87 @@ private:
   bool m_bipolar;
 };
 
-// a meter of 7 segments, left to right: five green, two yellow
-class SegmentMeter : public juce::Component
+// A thin level meter, -60 dB to 0 dB (uitext::meterFraction): green, amber from -12 dB, red
+// from -3 dB; a mark at the peak of the last moments; a light at the right that turns red when
+// the level reaches 0 dB and stays red until clicked.
+class LevelMeter : public juce::Component, public juce::SettableTooltipClient
 {
 public:
-  SegmentMeter() { setInterceptsMouseClicks(false, false); }
-  void setPeak(float peak); // linear
+  LevelMeter() = default;
+  void setLevel(float peak, double now); // the latest peak (linear), at now (seconds)
+  void paint(juce::Graphics &g) override;
+  void mouseDown(const juce::MouseEvent &e) override; // puts the clip light out
+
+private:
+  float m_level = 0, m_peak = 0; // fractions of the meter
+  double m_last = 0, m_peakAt = 0;
+  bool m_clip = false;
+};
+
+// A name, its channel after a dot (quieter) and a short status in its colour: "Anna · guitar
+// joined 12 s ago". What doesn't fit is cut: the status first, then the channel, then the name.
+class NameCell : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+  NameCell(const juce::Font &nameFont, const juce::Font &statusFont, float statusGap);
+  void setPlayer(const std::string &name, const std::string &channel);
+  void setStatus(const std::string &status, juce::Colour color);
+  void setNameColor(juce::Colour c);
   void paint(juce::Graphics &g) override;
 
 private:
-  int m_lit = 0;
+  juce::Font m_nameFont, m_statusFont;
+  float m_gap;
+  std::string m_name, m_channel, m_status;
+  juce::Colour m_nameColor = Colors::value(), m_statusColor = Colors::label();
+};
+
+// a change the room waits to make, on purple: "BPM 100 from next interval", and who asked for it
+// at the right when it is known
+class Chip : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+  explicit Chip(const juce::Font &font);
+  void set(const std::string &text, const std::string &who);
+  void paint(juce::Graphics &g) override;
+  void mouseUp(const juce::MouseEvent &e) override;
+
+  std::function<void()> onClick; // when set, the chip is a button (a hand over it)
+  void setClick(std::function<void()> click);
+
+private:
+  juce::Font m_font;
+  std::string m_text, m_who;
+};
+
+// lines of what happened, newest first, each with how long ago at the right ("12 s"); a line
+// that doesn't fit is cut and shows whole in its tooltip; the mouse wheel scrolls
+class EventList : public juce::Component, public juce::TooltipClient
+{
+public:
+  struct Event
+  {
+    std::string text;
+    juce::Colour color;
+    double time = 0; // when (seconds, the clock of now in setNow)
+  };
+  static constexpr int LINE_H = 16;
+  explicit EventList(const juce::Font &font);
+  void setEvents(const std::vector<Event> &events); // newest first
+  void setPlaceholder(const std::string &text);       // shown when there are none
+  void setNow(double now);                            // the ages are counted to now
+  void paint(juce::Graphics &g) override;
+  void mouseWheelMove(const juce::MouseEvent &e, const juce::MouseWheelDetails &wheel) override;
+  juce::String getTooltip() override;
+
+private:
+  int visibleLines() const;
+  juce::Font m_font;
+  std::vector<Event> m_events;
+  std::string m_placeholder;
+  double m_now = 0;
+  long m_shownSecond = -1;
+  int m_scroll = 0; // lines from the newest
 };
 
 // one cell per beat of the interval: the current one yellow, the ones before it brown, the
@@ -265,8 +349,8 @@ private:
   int m_beat = -1, m_bpi = 0;
 };
 
-// "LAN 192.168.1.20:2049 [Copy]": a box with a label, an address (monospace) and a Copy button;
-// onCopy() when Copy is clicked
+// "LAN [192.168.1.20:2049] [Copy]": a label (none if empty), a box with the address and a Copy
+// button; onCopy() when Copy is clicked
 class AddressBox : public juce::Component, public juce::SettableTooltipClient
 {
 public:
@@ -283,12 +367,14 @@ public:
 
 private:
   juce::Rectangle<float> copyRect() const;
+  float boxLeft() const;
   juce::Font m_keyFont, m_monoFont, m_buttonFont;
   std::string m_key, m_address, m_placeholder, m_copyTitle = "Copy";
   bool m_pressed = false;
 };
 
-// lines of text, wrapped to the width, newest at the bottom; the mouse wheel scrolls back
+// lines of text, wrapped to the width, newest at the bottom (or a document from the top); the
+// mouse wheel scrolls
 class TextLinesView : public juce::Component
 {
 public:

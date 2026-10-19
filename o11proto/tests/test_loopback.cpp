@@ -50,6 +50,14 @@ struct Recorder {
             if (c.fields[0] == cmd && (f1 == "*" || c.fields[1] == f1) && (f2 == "*" || c.fields[2] == f2)) ++n;
         return n;
     }
+    // Index of the first chat with this command and user whose text contains
+    // `needle`, or -1.
+    int firstChat(const std::string& cmd, const std::string& user, const std::string& needle) const {
+        for (std::size_t i = 0; i < chats.size(); ++i)
+            if (chats[i].fields[0] == cmd && chats[i].fields[1] == user && chats[i].fields[2].find(needle) != std::string::npos)
+                return static_cast<int>(i);
+        return -1;
+    }
     bool chatContains(const std::string& cmd, const std::string& needle) const {
         for (const auto& c : chats)
             if (c.fields[0] == cmd && (c.fields[1].find(needle) != std::string::npos ||
@@ -548,30 +556,77 @@ TEST(admin_commands_and_privileges) {
 }
 
 TEST(voting) {                                   // acceptance 8
-    Harness h(quickConfig());
-    Client a, b, c;
-    Recorder ra, rb, rc;
+    ServerConfig cfg = quickConfig();
+    cfg.users.push_back({"novote", "n", kPrivChat});
+    Harness h(cfg);
+    Client a, b, c, nv;
+    Recorder ra, rb, rc, rnv;
     CHECK(h.login(a, ra, "anonymous:a"));
     CHECK(h.login(b, rb, "anonymous:b"));
     CHECK(h.login(c, rc, "anonymous:c"));
+    CHECK(h.login(nv, rnv, "novote", "n"));
     h.settle();
-    // Three users at 50 % -> 2 votes needed (1.5 rounds to 2).
+    // Four users at 50 % -> 2 votes needed.
     a.say("!vote bpm 100");
     CHECK(h.until([&] { return rb.chatContains("MSG", "leading candidate: 1/2 votes for 100 BPM"); }));
     CHECK_EQ(h.server.bpm(), 120);
-    b.say("!vote bpm 100");
+    // The room sees who voted, as the voter's own MSG, before the voting-system line.
+    int said = rb.firstChat("MSG", "a@127.0.0.1", "!vote bpm 100");
+    int lead = rb.firstChat("MSG", "", "[voting system] leading candidate: 1/2 votes for 100 BPM");
+    CHECK(said >= 0 && lead >= 0 && said < lead);
+    CHECK(h.until([&] { return ra.countChat("MSG", "a@127.0.0.1", "!vote bpm 100") == 1; }));   // the voter too
+    CHECK(h.until([&] { return rnv.countChat("MSG", "a@127.0.0.1", "!vote bpm 100") == 1; }));
+    // The echo is the command as typed, trimmed.
+    b.say("!Vote bpm 100 \t");
     CHECK(h.until([&] { return rc.countChat("MSG", "", "[voting system] setting BPM to 100") == 1; }));
+    said = rc.firstChat("MSG", "b@127.0.0.1", "!Vote bpm 100");
+    int set = rc.firstChat("MSG", "", "[voting system] setting BPM to 100");
+    CHECK(said >= 0 && said < set);
+    CHECK_EQ(rc.countChat("MSG", "b@127.0.0.1", "!Vote bpm 100"), 1);
     CHECK(h.until([&] { return a.bpm() == 100 && b.bpm() == 100 && c.bpm() == 100; }));
     CHECK_EQ(rc.configs.size(), 2u);
-    // Out of range values are refused to the sender only.
+    // Out of range values are refused to the sender only, and the room isn't told of the attempt.
     c.say("!vote bpm 999");
     CHECK(h.until([&] { return rc.countChat("MSG", "", "[voting system] !vote requires <bpm|bpi> <value> parameters") == 1; }));
+    // No vote privilege: refused the same way.
+    nv.say("!vote bpm 90");
+    CHECK(h.until([&] { return rnv.countChat("MSG", "", "[voting system] No vote permission") == 1; }));
+    // Other ! commands are not shown to the room either.
+    b.say("!topic");
+    CHECK(h.until([&] { return rb.countChat("TOPIC", "") == 2; }));
     h.settle();
     CHECK(!ra.chatContains("MSG", "!vote requires"));
+    CHECK(!rnv.chatContains("MSG", "!vote requires"));
+    for (const Recorder* r : {&ra, &rb, &rc, &rnv}) {
+        CHECK_EQ(r->countChat("MSG", "c@127.0.0.1"), 0);
+        CHECK_EQ(r->countChat("MSG", "novote"), 0);
+        CHECK_EQ(r->countChat("MSG", "b@127.0.0.1", "!topic"), 0);
+    }
+    CHECK_EQ(ra.countChat("MSG", "", "[voting system] No vote permission"), 0);
     // BPI votes too.
     a.say("!vote bpi 16");
     c.say("!vote bpi 16");
     CHECK(h.until([&] { return b.bpi() == 16; }));
+    CHECK_EQ(rb.countChat("MSG", "a@127.0.0.1", "!vote bpi 16"), 1);
+    CHECK_EQ(rb.countChat("MSG", "c@127.0.0.1", "!vote bpi 16"), 1);
+    said = rb.firstChat("MSG", "c@127.0.0.1", "!vote bpi 16");
+    CHECK(said >= 0 && said < rb.firstChat("MSG", "", "[voting system] setting BPI to 16"));
+
+    // With voting off a vote is refused to the sender only; nobody sees it.
+    ServerConfig off = quickConfig();
+    off.vote_threshold_percent = 101;
+    Harness h2(off);
+    Client x, y;
+    Recorder rx, ry;
+    CHECK(h2.login(x, rx, "anonymous:x"));
+    CHECK(h2.login(y, ry, "anonymous:y"));
+    h2.settle();
+    x.say("!vote bpm 100");
+    CHECK(h2.until([&] { return rx.countChat("MSG", "", "[voting system] Voting not enabled") == 1; }));
+    h2.settle();
+    CHECK_EQ(rx.countChat("MSG", "x@127.0.0.1"), 0);
+    CHECK_EQ(ry.countChat("MSG", "x@127.0.0.1"), 0);
+    CHECK(!ry.chatContains("MSG", "[voting system]"));
 }
 
 TEST(codec_mask_and_silence_substitution) {     // acceptance 9
@@ -999,7 +1054,10 @@ TEST(send_to_reset_peer_is_an_error) {
     REQUIRE(afd != kInvalidSocket);
     Connection conn(afd);
     resetClose(peer);
-    bool failed = false, saw_epipe = false;
+    bool failed = false;
+#ifndef _WIN32
+    bool saw_epipe = false;
+#endif
     std::vector<std::uint8_t> chunk(1000, 0x55);
     for (int i = 0; i < 200; ++i) {
         // Through the Connection, then a bare compat::send with no flags:

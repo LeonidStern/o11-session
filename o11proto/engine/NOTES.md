@@ -20,7 +20,11 @@ specification leaves room, the choice is listed here.
   check and the `OPUr` byte-at-a-time / truncated-stream checks of 8.1), `engine/tests/test_engine_clock.cpp` (13.5-13.9),
   `engine/tests/test_engine_e2e.cpp` (13.10-13.13, two engines against the
   in-process `Server` with a simulated audio clock, plus duplex rooms where
-  both engines send and listen with offset interval clocks, FLAC and Opus).
+  both engines send and listen with offset interval clocks, FLAC and Opus;
+  13.15-13.16, one engine fed by a plain o11proto client that uploads FLAC
+  intervals on cue, for the level meter and the dropout count; 13.17, two
+  engines with offset clocks voting to another tempo, which counts no
+  dropouts).
 - `tools/o11jam.cpp`: the command-line client of section 14.
 - `tools/o11bench.cpp`: a CPU benchmark for profiling (not part of the
   specification): a sender and a listener on an in-process server with a
@@ -112,7 +116,11 @@ specification leaves room, the choice is listed here.
   the `0x100` capability (`codecCapForFourcc`), as PROTOCOL.md 7.8 says, and
   `o11cli` takes `.opur` files as `OPUr` (`.opus` still passes through as
   `OPUS`).
-- `pre_skip` is `OPUS_GET_LOOKAHEAD` after the encoder is created. Each
+- `pre_skip` is `OPUS_GET_LOOKAHEAD` after the encoder is created, plus the
+  240-sample pre-roll: each stream begins with the last 240 resampled
+  samples before it (kept in the encoder's 1024-sample history, zeros
+  before the first), so a freshly reset encoder's poor first samples fall
+  inside the pre-skip and the crossfade into the stream is clean. Each
   interval: `OPUS_RESET_STATE`, then the 12-byte header (version 1, channels,
   pre-skip, the input rate, reserved 0) written at once, each packet as `u16`
   length + bytes as soon as it is encoded, and the trailer `u16` 0 + `u32`
@@ -126,11 +134,15 @@ specification leaves room, the choice is listed here.
   input frames and every interval of N input frames yields exactly
   `floor(N * 48000 / rate)` frames (positions are kept as integers, no drift);
   the stream of one interval begins exactly where the previous ended.
-- Padding: `real + pre_skip` rounded up to a multiple of 960, minus `real`,
-  from a Levinson-Durbin fit of order 24 on the last 1024 resampled samples
-  per channel (Gaussian lag window of about 20 Hz, bandwidth expansion
-  0.998^k, white-noise correction 1e-5), 128 samples at full level then a
-  raised-cosine fade to 0. The trailer's `real` is the resampled frame count.
+- Padding: `real + pre_skip` rounded up to a multiple of 960, minus `real`
+  and the pre-roll, from Burg's fit of order 24 on the last 1024 resampled
+  samples per channel (no window, bandwidth expansion 0.998^k, each sample
+  clamped to ±4), 128 samples at full level then a raised-cosine fade to 0.
+  The trailer's `real` is the resampled frame count. Burg's fit replaced an
+  autocorrelation (Levinson-Durbin) fit like libvorbis' `lpc.c`, whose
+  extrapolation kinks where the audio changes within the 1024 samples: an
+  interval boundary 270 frames after a note's onset ticked in the crossfade
+  (test 13.18; the autocorrelation fit kinks about 4 times as much).
 - Decoder: the header is parsed once 12 bytes are in (version != 1 or
   channels not 1 or 2: bad, nothing decoded); each packet is decoded once its
   length and all its bytes are in, so partial deliveries (down to one byte at
@@ -188,7 +200,71 @@ specification leaves room, the choice is listed here.
   The phase is reset at each boundary (the new stream starts at its frame 0).
 - A late or short stream: skip what is available, add the shortfall to the
   drop count, output nothing for the piece; the drop count is reset at the
-  boundary.
+  boundary. `RemoteChannel::drop_count` is that shortfall in source frames
+  (what the stream owes and skips once the data is there, to stay in time),
+  not a count of dropouts.
+- Level meter (8.6, `channelLevel`): `RemoteChannel::level[2]`, atomics next
+  to `peak[2]`, decayed together. The mixing loop runs for every channel with
+  a decoder and volume >= 1e-7, muted or not; it always raises the level and
+  only writes the output and raises the peak when the channel is heard, so
+  while it is heard the two hold identical values.
+- Dropouts (8.7, `channelDropouts`): `RemoteChannel::dropouts` is an atomic
+  `long`, written in the audio context (and reset to 0 by the control
+  context when the channel appears), both under `remote_mutex_`; queries
+  take the mutex only to find the user, like the peaks. Per channel,
+  `audio_expected` is set when an audio or undecodable interval becomes
+  current and cleared by a silent one or `discardChannelIntervals`;
+  `first_audio` marks an audio interval that became current while nothing
+  was expected; `dropped` limits the count to one per interval. A download
+  with no decoder (`makeDecoder` returns null: Vorbis, Ogg Opus) used to be
+  left out of the queue; it now takes its slot as an undecodable entry,
+  which plays nothing as before and counts once when it becomes current,
+  first interval and clock changes or not.
+- Late data counts only while the decoder has not `finished()`: a stream
+  that has all arrived never counts, however short (a joiner's partial first
+  interval, an interval recorded at the old tempo, a host that stopped). The
+  check is in the 8.5 underrun branch: what the rest of the interval needs
+  (`interval_len_ - interval_pos_`, mapped to source frames with the
+  resampler's phase) minus `available()`, more than `kDropoutSlackFrames`
+  (64). The slack is no longer about rounding (a finished stream is out
+  anyway); it keeps a stream that is still arriving its last few frames
+  before the boundary from counting. 8.5 still plays nothing in the last
+  piece of an interval whose stream is a few frames short (an Opus stream
+  from a 44.1 kHz sender at 110 BPM / 16 BPI, say); that is unchanged here
+  and not counted.
+- A missing interval counts at the boundary when slot 0 is empty, the
+  channel is subscribed, present and expecting audio, unless the outgoing
+  stream ran long: before it goes to `garbage_`, the boundary decodes it to
+  `drop_count + 65` frames past the read position (`decodeUntil`, cheap: the
+  data is there or it isn't) and, when more than `drop_count + 64` are
+  available, the sender's interval was longer than ours (its `setIntervalEnd`
+  moved the end, or it switched to a slower tempo first) and its next one is
+  due later.
+- Clock grace: `clockSteady()` is false while `clock_grace_` (samples, audio
+  context) is above 0, while `clock_moved_` is set (`setIntervalEnd` changed
+  the length of the interval in progress) and while the server's BPM or BPI
+  differ from the active ones (a CONFIG_CHANGE waiting for the boundary).
+  The boundary that changes BPM, BPI or the length, or ends a moved
+  interval, sets the grace to the old usual length plus the new one; each
+  piece takes its length off. Neither late data nor missing intervals count
+  while the clock is not steady. That covers both orders of switching: a
+  listener that goes to a slower tempo first gets the sender's shorter last
+  old-tempo interval (finished, not counted) and then the sender's first
+  new one late; one that goes to a faster tempo first ends an interval
+  before the sender sends anything for it, and the next plays silence (test
+  13.17 measures four seconds of it). Starting to run is not a change (no
+  grace at the first boundary), and a sample-rate change counts as one
+  because it changes the length.
+- Left out of the count on purpose: intervals replaced in slot 1 of a full
+  queue (the listener's own audio stalled: every channel would count the
+  same, and the count is meant to tell which player's audio is not coming
+  through) and audio cut off by a boundary. Counted although nobody's network
+  is at fault: in a room whose mask fell to Vorbis, every interval (another
+  engine sends nothing, so they are missing; a legacy client sends Vorbis,
+  which is undecodable), because the listener hears nothing from them. A
+  listener whose own `process()` stalled can still count the missing
+  intervals right after it resumes; from inside the engine that looks the
+  same as a sender's.
 - The fade-out is the previous decoder's lapping frames followed by what it
   still has available, up to 128 frames; for FLAC that is empty when the
   stream was exactly the interval long. The fade-in is applied in place to
@@ -230,12 +306,224 @@ specification leaves room, the choice is listed here.
 - `--wav` reads 16-bit PCM or 32-bit float WAV (mono, or the first channel)
   and resamples it linearly to `--srate`.
 
+## Live mode (section 16)
+
+Clean-room implementation of the Live mode specification, revision 2
+(2026-10-17), sections 5 and 6. The only inputs were that document,
+`PROTOCOL.md`, `ENGINE.md`, the o11proto sources and the public header of
+libopus; no AOO, NINJAM or Jamsa source was read, and no AOO code is in it.
+Live is o11proto's own ecosystem: nothing here exists only to talk to the
+reference build, but the wire formats are the specification's.
+
+**Files.** `engine/src/live_aoo.*` (the messages of Live 5.4-5.6),
+`engine/src/live_sink.*` (the queues between the contexts and one sink's
+buffer, decoder and resampler), `engine/src/live_layer.*` (the shared state,
+the slots and health, the network thread's source and sinks, the audio
+entry point), `engine/src/engine_live.cpp` (the `Engine` side: lifecycle, the room's
+mode, the report and the advice, mixing, `/live`). Hooks in `engine.cpp`:
+`run()` calls `liveControl()` after the client's poll; `process()` calls
+`liveAudioBlock()` before the pieces and `mixLive()` after `mixRemote()` in
+each piece; the boundary calls `liveBoundary()` before `uploadBoundary()`
+and the new-interval step; `mixRemote()` leaves channel 0 of a user with a
+Live mixer to `mixLive()`, which plays both its paths.
+
+**Where o11proto differs from the Live spec, and why:**
+
+- **One mode for the room** (Live 6.4, 6.5, 6.6, 6.8), deliberately. The
+  room's mode is its `!live` switch alone, for everyone (PROTOCOL.md 15.11):
+  no player is moved to intervals for its health, neither per slot nor for
+  the room, and the health reports only give advice, which a UI shows as a
+  suggestion to switch the room to intervals. There is no interval audio at
+  all while the room is Live (none uploaded, none relayed, none mixed), so a
+  player who can't play Live (an older client, no UDP, the room full)
+  neither hears nor is heard then. `!live on` stops the intervals at the
+  boundary where Live starts; `!live off` is silent until the players' first
+  interval after Live (one to two intervals), which fades in over 20 ms. In
+  the Live spec's conformance tests that makes 34 (the ninth player isn't
+  heard, rather than heard through intervals), 36 (`!live off` has the
+  silent first interval), 37 and 44 (an unhealthy stream isn't moved to
+  intervals: the advice names it) deviations.
+- **All to all** (PROTOCOL.md 15.10): the source sends to each peer
+  directly where the pair's path is up, through the relay to a peer without
+  paths, and not at all where the room is direct only and the path isn't up
+  (but for make before break: a peer the relay has carried the stream to
+  for 1 s or more keeps getting it that way while its new path opens,
+  ENGINE.md 16.5); once to destination 0 when no peer would get it
+  directly.
+- **The automatic jitter buffer** (Live 6.8, whose setting defaults to 20
+  ms): each stream starts at 10 ms and falls back to 20 ms at its second late
+  dropout within 10 s, for the stream's life; a fixed setting (`/live buffer
+  N`) stays possible, and the plug-in offers it only to tests.
+  A late dropout is late audio a larger buffer would have saved; a block
+  lost for good, or asked for again (its answer comes a round trip late), is
+  not one, so loss alone never falls back.
+- **Back on its delay after a gap** (Live 5.9 buffers afresh after every
+  underrun). A stream that ran dry comes back on the delay it had: blocks
+  too late for their turn are dropped, early ones wait. So after a gap it is
+  in time with the other players again, rather than later by however long
+  the new buffering took. It buffers afresh only when it is more than its
+  room ahead, or late for good (nothing in time for *B*: its sender's host
+  stopped), which counts an overrun.
+- **Concealment by prediction, and a primed decoder** (Live 5.9 leaves the
+  concealment to Opus). Opus's own concealment at 5 ms frames fades a held
+  note within 40 ms and makes a burst of its own where the loss begins, so
+  the sink predicts the stream (least squares over 60 ms, 24 near lags and 8
+  far ones that hold a kick's tail) and, when the audio comes back, primes
+  its decoder by coding the last 1024 samples of its best guess (CELT's
+  longest pitch period) with an encoder of its own: a decoder that only
+  starts afresh decodes the first frames far too loud or soft (a burst of
+  noise, a held note that dips by 8 dB), because the stream's encoder codes
+  each frame's energies from the frame before. The primer costs one
+  encode and decode of up to 1920 samples per resume. The stream's encoder
+  keeps libopus's defaults, as Live 5.7 says.
+- **While the host catches up** on a stall, a sink holds more than the
+  capacity of Live 5.9 (the capacity plus what came while the host was
+  behind, at most 1 s), and doesn't buffer afresh for that: the stream is no
+  later for it.
+- **Clock drift by the buffer's fill, not a time DLL** (Live 6.9). Each sink
+  resamples 48 kHz to the host rate with a cubic. The fill is smoothed over
+  0.5 s, its level after 1 s of playing is kept, and while the smoothed fill
+  is more than 2 ms from that level the step is corrected by 0.1 per second
+  of the distance beyond the 2 ms, within ±0.5 %. It keeps a sink from slowly
+  filling up or running dry, which is what the DLL is for, without time
+  stamps on every 64-sample block. The kept level is the one buffering gave,
+  not *B*: regulating to *B* made the pitch wander by up to 0.1 % for tens of
+  seconds after each start (a 997 Hz tone came out at 998 Hz), and the dead
+  band keeps the fill's own jitter (whole blocks arriving at once) from
+  moving the pitch at all, so a steady tone keeps its phase (`o11jam --two`
+  on a Live server: SNR about 43 dB over two intervals at 48 kHz, 45 at
+  44.1). In return the source writes the nominal 48000.0 into every `/data`
+  instead of a measured rate, and a sink ignores the rate it receives (after
+  checking it is finite and positive). Nobody between o11proto clients reads
+  it. The level is kept for the stream's life, through its later bufferings
+  (an overflow, late for good), so the speed brings the delay back to it;
+  while the host catches up on a stall the estimate holds, since the fill
+  then says nothing of the clocks. To make up for 200 ppm the fill sits 4 ms
+  off the level (the 2 ms dead band, and 2 ms more at 0.1 per second), which
+  it takes some 30 s to reach, so on such clocks the delay still moves a
+  little at first.
+- **The source's resampler** (host rate to 48 kHz) is a plain cubic, with no
+  low-pass. That is right for 44.1 kHz (upsampling); at 88.2 or 96 kHz and up
+  content above 24 kHz can alias. Hosts at 48 kHz skip it.
+- **Buffering drops a burst.** When a sink starts playing it drops the oldest
+  blocks above the latency's number, so a burst that arrived while it waited
+  (a host that delivered several blocks at once) doesn't make it play later
+  than *B*. The buffer figure is then at most *B* + a frame + a host block,
+  as revision 2 asks.
+- **Giving up after 4 × *B*** (Live 5.9) counts one underrun and starts
+  waiting again; it doesn't start playing with fewer blocks than the latency.
+- **Limits.** A sink's ring holds 256 blocks and its capacity is capped at
+  250 (a 200 ms buffer with frame 120 and long host blocks could ask for
+  more). Host blocks over 16384 frames get no Live audio (and while the room
+  is Live, no interval audio either): the slots' output buffers are
+  allocated for that size.
+- **Accepted payloads.** The OSC forms of `/data` and of the data request are
+  dropped (no Live client sends them); blocks split into frames are treated
+  as lost (Live 5.4 allows it); channel onsets other than 0 are dropped
+  (senders must send 0); `/start` block sizes other than 120, 240 and 480 are
+  refused (quirk 25).
+- **Threads.** One network thread (`live::Transport`'s) both receives and
+  sends, in place of the reference's receiving and sending threads
+  (informative in Live 6.1). It wakes for each datagram and for each block
+  the audio thread queues (`wake()`), and at least every 10 ms for its own
+  housekeeping (1 ms on Windows). It is a network thread (`realtime.h`): on
+  macOS the time-constraint policy, since an ordinary or user-interactive
+  thread's wakes there came up to tens of ms late on a loaded machine;
+  `liveTestTiming()` reports its wakes and waits.
+- **Texts** say "O11 Session" where the reference names its own product, in
+  `/live`, the offer and the slot-limit line.
+- **The quirks** (Live 10), where a new client may or should choose: stop
+  requests are answered at most once per 100 ms per peer (20); the source's
+  `/stop`s go out before the socket closes (21); the stream time of a later
+  `/start` counts 48 kHz samples at 48 kHz (22); a sink sends at most one
+  request message per 10 ms (24); answer limits run on the steady clock, which
+  keeps running while the stream is stopped (28); `/live buffer30` is read as
+  `buffer 30` (12); slots go to the first listed peers (27); `/live` shows the
+  latest server round trip (14) and keeps the reference's dropout count,
+  underruns + overruns + lost blocks, while health counts underruns, overruns
+  and xrun gaps (15).
+
+**Ambiguities in the Live spec and how they were read:**
+
+- *"After every underrun or overrun, the sink buffers … It gives up after 4 ×
+  its latency and counts an underrun"* (5.9): what it does after giving up
+  isn't said. Read as above: it counts the underrun and keeps waiting.
+- *"If that needs more room than is free, it is an overrun"* (5.9): the room
+  is counted from the next block to play to the new block, against the
+  capacity in blocks.
+- *"Its stream is active"* (6.4) is taken as the sink playing: not idle, not
+  buffering and not dry. *"Healthy since"* restarts whenever health is lost.
+- *"The report comes at the first block that doesn't arrive early"* (6.9):
+  the late block itself is only noted; the gap is reported at the next block
+  that isn't early, if the host is still behind by more than the threshold.
+  So a host that misses time and doesn't catch up reports it one block late;
+  one that catches up reports nothing.
+- *"The host's announced largest block"* (6.8, the capacity): an engine has
+  no announcement, so *H* (the longest block of the last 30 s) is used.
+- *"The queue … holds max(25 ms, 2 × the host's largest block / rate + 10
+  ms)"* (6.7): the capture queue is a fixed 1024 chunks of 64 frames (1.4 s
+  at 48 kHz), which covers every host block up to the 16384-frame limit;
+  chunks that don't fit are dropped.
+- *"Stop requests … The first underrun starts the 1 s"* (5.9): measured from
+  the last `/data` the sink took, which is the same moment.
+- *"Live off … at the next boundary"*: when the room's Live goes off (or
+  Live stops playing here) the mixer plays intervals at once (6.5, "At
+  once"), not at a boundary; a room message is taken at the first boundary
+  half a second after it came. Nothing else falls back.
+- *"Health … about every 30 ms"* (6.4): worked out at every `run()` pass, which
+  ENGINE.md section 2 asks for at least every 50 ms; the reference's network
+  loop runs every 10 ms or so, and so does `o11jam`'s.
+
+**Tests.** `test_engine_live_units`, `test_engine_live`,
+`test_engine_live_room`, `test_engine_live_tone` and `test_engine_live_paths`
+(ENGINE.md 16.11).
+
+- **The harness** (`engine/tests/live_harness.h`, and its own in
+  `test_engine_live`): `o11server` on a thread of its own, the engines'
+  control contexts on the main thread, and one host thread that calls every
+  engine's `process()` each block and records what each plays. The host
+  thread is an audio thread; the server's thread and the watcher below are
+  network threads (`makeNetworkThread()`), as the engines' Live threads are
+  (latency-critical ones woke up to 42.7 ms late on a CI runner). A test
+  server whose UDP port is taken moves to another. The timing lines
+  (`describe()`, `liveTestTiming()`) are printed once per process.
+  `O11_TEST_TIMER_SLACK_US=n` (Linux) lets every thread's timed waits end up
+  to *n* µs late, as macOS's timer coalescing does on a loaded machine;
+  threads made audio or network threads take the least slack again.
+- **The machine's hiccups.** Machines that stall a thread for tens of
+  milliseconds (virtual machines and CI runners do) make a listener's
+  buffer run dry for real. A wake more than 10 ms late of the host thread,
+  or of a thread scheduled as the server's that watches, is a hiccup;
+  the checks that need a steady stream are made only when there was none,
+  and advice that follows a hiccup (within 3 s) is excused. The room tests'
+  advice may then also count more players (`findAdvice()` accepts `and N
+  more`).
+- **The tone check** (`test_engine_live_tone`), the way to tell a correction
+  heard from a concealment: the tone heard is demodulated (4 ms Hann
+  windows, 1 ms apart); a window more than 5 % off the run's median level, or
+  whose phase bends by more than 0.05 rad within 4 ms on either side (the
+  phase's second difference: a tone heard at a slightly different rate only
+  drifts), is a dip. A dip must come with a concealment in the listener's
+  log; a concealment within 250 ms after the machine stalled (either host,
+  the server's thread, a network-scheduled thread, or a loopback datagram
+  more than 3 ms late) is the machine's, and two listeners that begin to
+  conceal within 10 ms of each other are too. Dips and the log are matched
+  in the listener's output, not by the clock: after a stall a host plays the
+  blocks it missed back to back. A stream whose automatic buffer fell back
+  for the machine before the recording starts again (a fixed buffer, then
+  automatic) so that the recording begins as the test means it to. The
+  jittery stream of the fallback case is a link held back every 0.5-1.5 s
+  (`setLiveTestSendHold()`).
+
 ## Efficiency notes
 
 - The metronome keeps only its beat clock when muted or below 0.0001 (no
   per-sample loop); the master stage leaves the samples alone at unity gain
   and only meters them; decoders write straight into their output buffer
   (`reserveOutput`), the Opus decoder in runs rather than frame by frame.
+- A muted (or soloed-away) remote channel still goes through the resampling
+  and gain loop, without writing the output, so that its level meter stays
+  live (8.6); before, a muted channel only had its frames skipped.
 - Of what remains, libopus (complexity 10, as 6.4 says) is about 85 % of a
   `o11jam --two` Opus run; the engine's own mixing, meters and buffer clearing
   are a few percent. A FLAC run shows more system time than an Opus run with

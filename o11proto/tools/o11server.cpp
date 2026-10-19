@@ -3,20 +3,22 @@
 //   o11server <port> [--anon] [--user name:pass:privs]... [--bpm N] [--bpi N]
 //            [--allow-codecs opus,flac] [--require-codec opus] [--opus-kbps N]
 //            [--keepalive N] [--max-users N] [--topic TEXT] [--motd LINE]
-//            [--licence FILE] [--mask-ip] [--vote-threshold PCT] [--port-map] [--quiet]
+//            [--licence FILE] [--mask-ip] [--vote-threshold PCT] [--port-map]
+//            [--live no|yes|on|require] [--live-kbps N] [--live-frame N]
+//            [--live-max-peers N] [--live-port N] [--live-strict-address yes|no] [--quiet]
 //
 // Privilege letters: t topic, c chat, b bpm/bpi, k kick, r reserved slot,
 // m multiple logins, h hidden, v vote, p see private rooms, s status account,
 // * all of t..p.
+#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
-#include <iostream>
 #include <sstream>
 #include <string>
 
+#include "o11proto/realtime.h"
 #include "o11proto/server.h"
 #include "socket_compat.h"
 #ifdef O11PROTO_HAVE_PORTMAP
@@ -49,6 +51,13 @@ static void usage() {
         "  --vote-threshold PCT   percent of users for a vote to pass (default 50; >100 disables)\n"
         "  --login-timeout N      seconds to wait for AUTH_USER (default 30)\n"
         "  --port-map             ask the router to forward the port (UPnP-IGD, then NAT-PMP)\n"
+        "  --live MODE            Live mode, real-time audio over UDP on the same port number:\n"
+        "                         no (default), yes (starts off), on, require (fail without UDP)\n"
+        "  --live-kbps N          Live Opus bitrate, 32-510 (default 128)\n"
+        "  --live-frame N         Live Opus frame at 48 kHz: 120, 240 or 480 (default 240)\n"
+        "  --live-max-peers N     players per room who play Live, 1-64 (default 8)\n"
+        "  --live-port N          UDP port to announce instead of the real one (default 0: don't)\n"
+        "  --live-strict-address yes|no  UDP must come from the player's TCP address (default yes)\n"
         "  --quiet                no log output\n"
         "privileges: t topic, c chat, b bpm/bpi, k kick, r reserve, m multi-login,\n"
         "            h hidden, v vote, p private rooms, s status account, * all\n");
@@ -145,6 +154,29 @@ int main(int argc, char** argv) {
         else if (a == "--vote-threshold") cfg.vote_threshold_percent = std::atoi(need(i));
         else if (a == "--login-timeout") cfg.login_timeout_seconds = std::atoi(need(i));
         else if (a == "--port-map") portMap = true;
+        else if (a == "--live") {
+            std::string v = need(i);
+            for (auto& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (v == "no") cfg.live.mode = LiveMode::No;
+            else if (v == "yes") cfg.live.mode = LiveMode::Yes;
+            else if (v == "on") cfg.live.mode = LiveMode::On;
+            else if (v == "require") cfg.live.mode = LiveMode::Require;
+            else {
+                std::fprintf(stderr, "--live wants no, yes, on or require\n");
+                return 2;
+            }
+        } else if (a == "--live-kbps") cfg.live.kbps = std::atoi(need(i));
+        else if (a == "--live-frame") cfg.live.frame = std::atoi(need(i));
+        else if (a == "--live-max-peers") cfg.live.max_peers = std::atoi(need(i));
+        else if (a == "--live-port") cfg.live.announce_port = std::atoi(need(i));
+        else if (a == "--live-strict-address") {
+            std::string v = need(i);
+            if (v != "yes" && v != "no") {
+                std::fprintf(stderr, "--live-strict-address wants yes or no\n");
+                return 2;
+            }
+            cfg.live.strict_address = v == "yes";
+        }
         else if (a == "--quiet") quiet = true;
         else if (a == "-h" || a == "--help") {
             usage();
@@ -178,11 +210,27 @@ int main(int argc, char** argv) {
         mapper.log = [&cfg](const std::string& s) {
             if (cfg.log) cfg.log(s);
         };
-        mapper.start(server.port());
+        mapper.start(server.port(), server.liveUdpOpen());   // UDP too, for Live
     }
 #else
-    if (portMap) std::fprintf(stderr, "[o11server] --port-map is not available in this build (O11PROTO_BUILD_PORTMAP)\n");
+    if (portMap) {
+        const unsigned p = server.port();
+        std::fprintf(stderr, "[o11server] --port-map is not available in this build (O11PROTO_BUILD_PORTMAP). "
+                     "Forward TCP port %u on your router to this machine by hand", p);
+        if (server.liveUdpOpen()) std::fprintf(stderr, ", and UDP port %u for Live", p);
+        std::fprintf(stderr, ".\n");
+    }
 #endif
+    // This thread relays Live's datagrams as they come: it is a network
+    // thread, as the players' Live threads are (realtime.h). An ordinary one
+    // on a loaded Mac ran 30-40 ms late, and every listener's 10-20 ms
+    // buffer ran dry each time.
+    const thread::NetworkScheduling sched = thread::makeNetworkThread();
+    if (!quiet)
+        std::fprintf(stderr, "[o11server] the server's thread: %s\n",
+                     sched == thread::NetworkScheduling::Realtime          ? "real-time (time-constraint)"
+                     : sched == thread::NetworkScheduling::LatencyCritical ? "latency-critical"
+                                                                            : "its scheduling unchanged");
     while (!g_stop) server.poll(200);
 #ifdef O11PROTO_HAVE_PORTMAP
     mapper.stop();

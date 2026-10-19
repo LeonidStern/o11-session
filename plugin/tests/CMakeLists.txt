@@ -26,3 +26,24 @@ add_test(NAME o11_e2e_test COMMAND o11_e2e_test)
 # The room is on this computer, on any free port (another test or program may hold 2049): the
 # router isn't asked to forward it, nor a service on the internet for the public address.
 set_tests_properties(o11_e2e_test PROPERTIES TIMEOUT 300 RESOURCE_LOCK ableton_link ENVIRONMENT "O11_HOST_PORT=0;O11_PORTMAP=off;O11_WHATSMYIP=off")
+
+# o11_editor_shots (O11_EDITOR_SHOTS=ON): not a test, it needs a display (xvfb-run gives one).
+# The editor in a room on this computer, one instance hosting and others joining, painted to PNGs
+# for looking at the layout:
+#   O11_HOST_PORT=0 O11_PORTMAP=off O11_WHATSMYIP=off xvfb-run -a ./o11_editor_shots <folder>
+option(O11_EDITOR_SHOTS "Build o11_editor_shots, pictures of the editor" OFF)
+if(O11_EDITOR_SHOTS)
+    juce_add_console_app(o11_editor_shots PRODUCT_NAME "o11_editor_shots")
+    target_sources(o11_editor_shots PRIVATE
+        o11_editor_shots.cpp
+        ../source/processor.cpp
+        ../source/editor.cpp
+        ../source/views.cpp
+    )
+    target_compile_definitions(o11_editor_shots PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    target_link_libraries(o11_editor_shots
+        PRIVATE o11_core o11_fonts juce::juce_audio_processors juce::juce_gui_basics
+        PUBLIC juce::juce_recommended_config_flags
+    )
+    o11_warnings(o11_editor_shots)
+endif()

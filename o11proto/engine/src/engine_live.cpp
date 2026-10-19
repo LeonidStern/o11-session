@@ -1,0 +1,1215 @@
+// o11proto engine - Live mode inside the engine (ENGINE.md section 16):
+// the Live client's life, the health report and the room's mode, mixing
+// each user's channel 0 from its live and interval audio with seamless
+// switches, and the /live texts. The state and the network side are in
+// live_layer.cpp. Section numbers are the live-mode spec's.
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "live_layer.h"
+#include "o11proto/engine.h"
+
+namespace o11proto {
+namespace engine {
+
+namespace {
+
+float clip1(float v) { return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v); }
+
+std::int64_t steadyNs(TimePoint t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+}
+
+std::string num(double v, int decimals = 0) {    // rounded as printf rounds (section 1)
+    char b[48];
+    std::snprintf(b, sizeof(b), decimals ? "%.1f" : "%.0f", v);
+    return b;
+}
+
+std::string trimmed(const std::string& s) {
+    std::size_t a = s.find_first_not_of(" \t"), b = s.find_last_not_of(" \t");
+    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+}
+
+std::string lowered(std::string s) {
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return s;
+}
+
+// The buffer setting in words (6.8): "40 ms", or the automatic buffer.
+std::string bufferSettingText(int setting_ms) {
+    if (setting_ms != Engine::kLiveBufferAutomatic) return std::to_string(setting_ms) + " ms";
+    return "automatic: " + std::to_string(kLiveAutoBufferMs) + " ms, or " + std::to_string(kLiveFallbackBufferMs) +
+           " ms for a player whose audio comes late";
+}
+
+std::string longBlockText(int host_block, int rate) {
+    return "Your DAW's audio buffer (" + std::to_string(host_block) + " samples) needs at least " +
+           std::to_string(liveBufferNeed(host_block, rate)) +
+           " ms, more than Live can use (200 ms), so expect dropouts: " + std::to_string(liveLongestGoodBlock(rate)) +
+           " samples or less plays well.";
+}
+
+// Live plays here: the room's switch, the Live client and the server's
+// answer to it, a place among the senders, and the host rendering in real
+// time. Else this engine plays the room on intervals: while the room is
+// Live there is no interval audio, so it hears no one.
+bool liveOn(const LiveLayer& L) {
+    return L.room_on.load() && L.running.load() && L.serverAnswered() && L.may_send.load() &&
+           !L.host_offline.load();
+}
+
+// The advice's notices (live_room.h): whose trouble, and that it is over.
+std::string adviceText(o11proto::live::Advice a, const std::string& who, bool mine, int count) {
+    std::string s = a == o11proto::live::Advice::CantLive
+                        ? (mine ? std::string("Your client can't play Live, so while the room is Live you hear no one, "
+                                              "and no one hears you")
+                                : who + " can't play Live and isn't heard while the room is Live")
+                        : (mine ? std::string("Your connection has dropouts") : who + "'s connection has dropouts");
+    if (count > 1)
+        s += ", and " + std::to_string(count - 1) + (count == 2 ? " more player has" : " more players have") +
+             " trouble";
+    return s + ": Intervals may sound better (switch with /live off).";
+}
+
+std::string clearText(o11proto::live::Advice a, const std::string& who, bool mine) {
+    if (a == o11proto::live::Advice::CantLive)
+        return mine ? std::string("Your client can play Live now.") : who + " can play Live now.";
+    return mine ? std::string("Your connection is clean again.") : who + "'s connection is clean again.";
+}
+
+}  // namespace
+
+void Engine::LiveDeleter::operator()(LiveLayer* p) const { delete p; }
+void Engine::LiveMixDeleter::operator()(LiveMix* p) const { delete p; }
+
+void Engine::liveInit() { live_.reset(new LiveLayer); }
+
+void Engine::liveNotice(const std::string& text, bool error) {
+    if (onLiveNotice) onLiveNotice(text, error);
+}
+
+// ------------------------------------------------------- control context
+
+void Engine::liveMessage(const live::ServerLive& m) { live_->apply(m); }
+
+void Engine::liveRawMessage(const RawMessage& m) {
+    if (!client_.loggedIn()) return;
+    if (m.type == live::kMsgServerLivePaths) {  // all-to-all: the direct paths
+        live::LivePaths p;
+        if (live_enabled_.load() && live::decode(m.payload, p)) live_->applyPaths(p);
+        return;
+    }
+    live::LiveRoom r;
+    if (m.type != live::kMsgServerLiveRoom || !live::decode(m.payload, r)) return;
+    live_->applyRoom(r, Clock::now());
+}
+
+void Engine::liveReset() { live_->forget(); }
+
+void Engine::setLiveBufferMs(int ms) {
+    live_setting_ms_.store(ms == kLiveBufferAutomatic ? kLiveBufferAutomatic
+                                                      : std::max(kLiveMinBufferMs, std::min(kLiveMaxBufferMs, ms)));
+}
+
+int Engine::liveBufferInUseMs() const {
+    const int s = live_setting_ms_.load();
+    return liveBufferInUse(s == kLiveBufferAutomatic ? kLiveAutoBufferMs : s, live_->host_block.load(),
+                           live_->host_rate.load());
+}
+
+bool Engine::parseLiveBufferSetting(const std::string& value, int* ms) {
+    if (value == "auto") {
+        *ms = kLiveBufferAutomatic;
+        return true;
+    }
+    long v = 0;
+    if (!parseWholeNumber(value, &v)) return false;
+    *ms = v == 0 ? kLiveBufferAutomatic
+                 : static_cast<int>(std::max<long>(kLiveMinBufferMs, std::min<long>(kLiveMaxBufferMs, v)));
+    return true;
+}
+
+void Engine::setLiveHostState(bool playing, bool offline) {
+    live_->host_playing.store(playing);
+    live_->host_offline.store(offline);
+}
+
+bool Engine::liveRunning() const { return live_->running.load(); }
+
+void Engine::setLiveTestLoss(double fraction) { live_->setTestLoss(fraction); }
+
+void Engine::setLiveTestSendGap(int ms) { live_->setTestSendGap(ms); }
+
+void Engine::setLiveTestSendHold(int ms) { live_->setTestSendHold(ms); }
+
+void Engine::setLiveTestForceRelay(bool on) { live_->setTestForceRelay(on); }
+
+void Engine::setLiveTestBlockPeer(const std::string& name, bool blocked) { live_->setTestBlocked(name, blocked); }
+
+const char* liveRouteName(LiveRoute route) {
+    switch (route) {
+    case LiveRoute::Direct: return "direct";
+    case LiveRoute::Relay: return "relay";
+    case LiveRoute::None: break;
+    }
+    return "none";
+}
+
+LiveRoomRoute Engine::liveRoomRoute() const {
+    const LiveLayer& L = *live_;
+    LiveRoomRoute r;
+    if (!L.has_room) return r;
+    switch (L.room.route) {
+    case live::RoomRoute::Direct: r.route = LiveRoute::Direct; break;
+    case live::RoomRoute::Relay: r.route = LiveRoute::Relay; break;
+    default: return r;
+    }
+    if (r.route != LiveRoute::Relay) return r;
+    switch (L.room.why) {
+    case live::RelayWhy::NoPath: r.reason = LiveRelayReason::NoPath; break;
+    case live::RelayWhy::NoDirect: r.reason = LiveRelayReason::NoDirectClient; break;
+    case live::RelayWhy::RelayOnly: r.reason = LiveRelayReason::RelayOnly; break;
+    default: break;
+    }
+    r.user_a = L.room.why_a;
+    r.user_b = L.room.why_b;
+    r.direct_possible = L.room.direct_possible;
+    return r;
+}
+
+std::string Engine::liveRoomRouteText() const {
+    const LiveRoomRoute r = liveRoomRoute();
+    if (r.route != LiveRoute::Relay) return liveRouteName(r.route);
+    const std::string a = liveDisplayName(r.user_a), b = liveDisplayName(r.user_b);
+    std::string s = "relay";
+    switch (r.reason) {
+    case LiveRelayReason::NoPath: s += ": " + a + " and " + b + " had no direct path"; break;
+    case LiveRelayReason::NoDirectClient: s += ": " + a + "'s client doesn't send directly"; break;
+    case LiveRelayReason::RelayOnly: s += ": " + a + "'s client sends through the relay only"; break;
+    default: break;
+    }
+    if (r.direct_possible) s += "; everyone can connect directly again";
+    return s;
+}
+
+void Engine::setLiveRoomDirect() {
+    if (status_.load() == Status::Ok && client_.loggedIn()) say("!live direct");
+}
+
+bool Engine::liveUserHasDirectPath(int user) const {
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u) return false;
+        name = u->name;
+    }
+    const std::uint32_t id = live_->peerId(name);
+    return id && live_->pathUp(id);
+}
+
+double Engine::liveUserProbeRttMs(int user) const {
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u) return -1;
+        name = u->name;
+    }
+    const std::uint32_t id = live_->peerId(name);
+    return id ? live_->probeRttMs(id) : -1;
+}
+
+std::string Engine::liveTestTiming() const {
+    const live::Transport::Timing t = live_->networkTiming();
+#if defined(__APPLE__)
+    const char* plain = "user-interactive QoS";
+#else
+    const char* plain = "the least timer slack";
+#endif
+    char b[384];
+    std::snprintf(b, sizeof(b),
+                  "the Live network thread: %s; woken %llu times, the longest wake-up delay %.1f ms, %llu over 5 ms; "
+                  "%llu timed waits of %d ms ran out, the longest %.1f ms, %llu over 5 ms past their time",
+                  t.realtime ? "real-time (time-constraint)" : t.latency_critical ? plain : "its scheduling unchanged",
+                  static_cast<unsigned long long>(t.wakes), t.wake_longest_ms,
+                  static_cast<unsigned long long>(t.wake_over_5ms), static_cast<unsigned long long>(t.timeouts),
+                  t.wait_ms, t.longest_ms, static_cast<unsigned long long>(t.over_5ms));
+    return b;
+}
+
+long Engine::liveTestConcealedFrom(int user) const {
+    std::lock_guard<std::mutex> lock(remote_mutex_);
+    RemoteUser* u = userAt(user);
+    if (!u || u->live_want < 0) return -1;
+    return static_cast<long>(live_->concealed_from[u->live_want].load());
+}
+
+bool Engine::userLive(int user) const {
+    std::lock_guard<std::mutex> lock(remote_mutex_);
+    RemoteUser* u = userAt(user);
+    return u && u->live_now.load();
+}
+
+bool Engine::liveRoomLive() const { return live_->room_applied.load() == 1; }
+
+Engine::LiveAdvice Engine::liveAdviceReason() const {
+    const LiveLayer& L = *live_;
+    if (!L.has_msg || !L.msg.roomOn() || !L.has_room || !L.room.live || L.room.user.empty()) return LiveAdvice::None;
+    switch (L.room.advice) {
+    case live::Advice::Dropouts: return LiveAdvice::Dropouts;
+    case live::Advice::CantLive: return LiveAdvice::CantLive;
+    default: return LiveAdvice::None;
+    }
+}
+
+std::string Engine::liveAdviceUser() const {
+    return liveAdviceReason() == LiveAdvice::None ? std::string() : live_->room.user;
+}
+
+int Engine::liveAdviceCount() const {
+    return liveAdviceReason() == LiveAdvice::None ? 0 : std::max<int>(1, live_->room.count);
+}
+
+bool Engine::liveServerHas() const { return live_->has_msg && live_->msg.udpOpen(); }
+
+bool Engine::liveRoomSwitchOn() const { return live_->has_msg && live_->msg.roomOn(); }
+
+int Engine::liveHeardMs() const {
+    const LiveLayer& L = *live_;
+    if (!liveRoomLive()) return -1;
+    std::vector<double> v;
+    for (int s = 0; s < kLiveSlots; ++s) {
+        const SinkStats& st = L.sinks[s]->stats;
+        if (!L.slot_peer[s] || st.gen.load() != L.gen[s].load() || !st.active.load()) continue;
+        const double ms = liveOneWayMs(s, nullptr, nullptr, nullptr);
+        if (ms >= 0) v.push_back(ms);
+    }
+    if (v.empty()) return -1;
+    std::sort(v.begin(), v.end());
+    const std::size_t k = v.size() / 2;
+    const double median = v.size() % 2 ? v[k] : (v[k - 1] + v[k]) / 2;
+    return static_cast<int>(std::nearbyint(median));   // rounded as num() rounds
+}
+
+// The one-way estimate of 6.10 for a slot, or -1 without a round trip.
+double Engine::liveOneWayMs(int slot, double* buffer_ms, double* network_ms, double* codec_ms) const {
+    LiveLayer& L = *live_;
+    const SinkStats& st = L.sinks[slot]->stats;
+    double rtt = -1;
+    std::int32_t source_latency = 0;
+    int block = 240;
+    {
+        std::lock_guard<std::mutex> lock(L.net_mutex);
+        rtt = L.net[slot].rtt_ms;
+        source_latency = L.net[slot].source_latency;
+        block = L.net[slot].block;
+    }
+    const double h = L.host_rate.load() > 0 ? L.host_rate.load() : 48000.0;
+    const double codec_samples =
+        source_latency * h / 48000.0 + std::max(0.0, 64.0 - block * h / 48000.0) + 2.0 * h / 48000.0;
+    const double codec = codec_samples / h * 1000.0;
+    const double buffer = std::max(0, st.buffer_us.load()) / 1000.0;
+    const double network = rtt > 0 ? rtt / 2 : 0;
+    if (buffer_ms) *buffer_ms = buffer;
+    if (network_ms) *network_ms = network;
+    if (codec_ms) *codec_ms = codec;
+    if (rtt < 0) return -1;
+    return network + codec + buffer + 64.0 / h * 1000.0;
+}
+
+double Engine::liveUserBufferMs(int user) const {
+    int slot = -1;
+    std::uint32_t g = 0;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u || u->live_want < 0) return -1;
+        slot = u->live_want;
+        g = u->live_want_gen;
+    }
+    const LiveLayer& L = *live_;
+    const SinkStats& st = L.sinks[slot]->stats;
+    if (L.gen[slot].load() != g || st.gen.load() != g || !st.active.load()) return -1;
+    const std::int32_t us = st.fill_us.load();
+    return us < 0 ? -1 : us / 1000.0;
+}
+
+double Engine::liveUserHeardMs(int user) const {
+    const double fill = liveUserBufferMs(user);
+    if (fill < 0) return -1;
+    int slot = -1;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u || u->live_want < 0) return -1;
+        slot = u->live_want;
+    }
+    double buffer = 0;
+    const double oneway = liveOneWayMs(slot, &buffer, nullptr, nullptr);
+    return oneway < 0 ? -1 : oneway - buffer + fill;
+}
+
+const char* liveEventName(LiveEventKind kind) {
+    switch (kind) {
+    case LiveEventKind::None: break;
+    case LiveEventKind::Stream: return "stream";
+    case LiveEventKind::Play: return "play";
+    case LiveEventKind::Late: return "late";
+    case LiveEventKind::Lost: return "lost";
+    case LiveEventKind::Dry: return "dry";
+    case LiveEventKind::Rejoin: return "rejoin";
+    case LiveEventKind::Overflow: return "overflow";
+    case LiveEventKind::Rebuffer: return "rebuffer";
+    case LiveEventKind::Skip: return "skip";
+    case LiveEventKind::HostGap: return "host gap";
+    case LiveEventKind::Xrun: return "xrun";
+    case LiveEventKind::SpeedOn: return "speed on";
+    case LiveEventKind::SpeedOff: return "speed off";
+    case LiveEventKind::End: return "end";
+    case LiveEventKind::Fallback: return "fallback";
+    case LiveEventKind::Route: return "route";
+    }
+    return "none";
+}
+
+bool Engine::liveUserCounters(int user, LiveCounters* out) const {
+    int slot = -1;
+    std::uint32_t g = 0;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u || u->live_want < 0) return false;
+        slot = u->live_want;
+        g = u->live_want_gen;
+    }
+    const LiveLayer& L = *live_;
+    const SinkStats& st = L.sinks[slot]->stats;
+    if (L.gen[slot].load() != g || st.gen.load() != g) return false;
+    LiveCounters c;
+    c.late = st.late.load();
+    const std::uint32_t lost = st.lost.load(), came = st.late_missed.load();
+    c.lost = lost > came ? lost - came : 0;
+    c.concealed_frames = st.concealed48.load();
+    c.underruns = st.underruns.load();
+    c.overflows = st.overruns.load();
+    c.xrun_gaps = st.xrun_gaps.load();
+    c.resent = st.resent.load();
+    c.skips = st.skips.load();
+    c.skipped_frames = st.skipped48.load();
+    c.host_gaps = st.host_gaps.load();
+    c.host_gap_frames = st.host_gap48.load();
+    c.speed_changes = st.speed_changes.load();
+    c.speed_moved_ms = st.speed_moved_ns.load() / 1e6;
+    c.speed_ppm = st.speed_ppm.load();
+    const std::int32_t fill = st.active.load() ? st.fill_us.load() : -1;
+    c.fill_ms = fill < 0 ? -1 : fill / 1000.0;
+    const std::int32_t b = st.buffer_ms.load();
+    c.buffer_ms = b > 0 ? b : -1;
+    c.fell_back = st.fell_back.load();
+    c.route = static_cast<LiveRoute>(st.route.load());
+    if (st.gen.load() != g) return false;        // cleared meanwhile
+    *out = c;
+    return true;
+}
+
+int Engine::liveUserBufferInUseMs(int user) const {
+    LiveCounters c;
+    return liveUserCounters(user, &c) ? c.buffer_ms : -1;
+}
+
+bool Engine::liveUserBufferFellBack(int user) const {
+    LiveCounters c;
+    return liveUserCounters(user, &c) && c.fell_back;
+}
+
+std::vector<LiveEvent> Engine::liveUserEvents(int user, std::size_t max) const {
+    std::vector<LiveEvent> v;
+    int slot = -1;
+    std::uint32_t g = 0;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        RemoteUser* u = userAt(user);
+        if (!u || u->live_want < 0) return v;
+        slot = u->live_want;
+        g = u->live_want_gen;
+    }
+    const LiveLayer& L = *live_;
+    const SinkStats& st = L.sinks[slot]->stats;
+    if (L.gen[slot].load() != g || st.gen.load() != g) return v;
+    const std::uint32_t n = st.events_n.load(std::memory_order_acquire);
+    const std::uint32_t k = static_cast<std::uint32_t>(std::min<std::size_t>(max, SinkStats::kEvents));
+    v.reserve(k);
+    for (std::uint32_t i = n > k ? n - k : 0; i < n; ++i) {
+        LiveEvent e;
+        std::uint8_t kind = 0;
+        if (!st.readEvent(i, &e.steady_ns, &kind, &e.value)) continue;   // written over meanwhile
+        e.kind = static_cast<LiveEventKind>(kind);
+        v.push_back(e);
+    }
+    if (st.gen.load() != g) v.clear();
+    return v;
+}
+
+void Engine::liveControl() {
+    LiveLayer& L = *live_;
+    const TimePoint now = Clock::now();
+
+    // 6.8: the buffer in use, B, and the automatic buffer's fallback (0
+    // for a fixed one), each raised for long host blocks. A change
+    // restarts the buffering of the sinks it changes; one while Live runs
+    // is what /live counts dropouts since (before the Live
+    // client starts below, so that its first buffers aren't a change).
+    {
+        const int S = live_setting_ms_.load(), H = L.host_block.load(), sr = L.host_rate.load();
+        const bool automatic = S == kLiveBufferAutomatic;
+        const int B = liveBufferInUse(automatic ? kLiveAutoBufferMs : S, H, sr);
+        int F = automatic ? liveBufferInUse(kLiveFallbackBufferMs, H, sr) : 0;
+        if (F <= B) F = 0;
+        const std::uint32_t bufs = static_cast<std::uint32_t>(B) | (static_cast<std::uint32_t>(F) << 16);
+        if (bufs != L.buffers.load(std::memory_order_relaxed)) {
+            L.latency_ms.store(B);
+            L.buffers.store(bufs, std::memory_order_release);
+            if (L.running.load()) {
+                L.buffer_changed = true;
+                L.buffer_changed_at = now;
+                for (int s = 0; s < kLiveSlots; ++s) {
+                    const SinkStats& st = L.sinks[s]->stats;
+                    L.changed_gen[s] = st.gen.load();
+                    L.changed_drops[s] = st.underruns.load() + st.overruns.load() + st.lost.load();
+                }
+            }
+        }
+    }
+
+    // 6.1: the Live client runs while connected and the message has UDP open.
+    if (client_.loggedIn() && L.has_msg && L.msg.udpOpen()) {
+        const std::string addr = client_.serverAddress();
+        const std::uint16_t port = L.msg.udp_port ? L.msg.udp_port : client_.serverPort();
+        const bool changed = addr != L.addr || port != L.port || L.msg.peer_id != L.id || L.msg.key != L.key;
+        if (changed || (!L.running.load() && now >= L.retry_at)) {
+            if (changed) L.no_answer_said = false;   // said again after a restart for a new id, key, address or port
+            std::string err;
+            if (L.start(addr, port, err)) {
+                L.started_at = now;
+            } else {
+                L.retry_at = now + std::chrono::seconds(10);
+                if (!L.start_failed_said) {
+                    L.start_failed_said = true;
+                    liveNotice("Live mode can't start here (" + err + "): while the room is Live you hear no one, "
+                               "and no one hears you.",
+                               true);
+                }
+            }
+        }
+    } else if (L.running.load() || !L.addr.empty()) {
+        L.stop();
+        L.addr.clear();
+        L.port = 0;
+    }
+
+    // All-to-all: once a Live client has its socket and the server has
+    // sent the paths, its LAN address, for the players on its network.
+    if (client_.loggedIn() && L.has_paths && L.running.load() && !L.lan_sent) {
+        live::LiveLan lan;
+        L.localAddress(&lan.ip, &lan.port);
+        if (lan.port != 0) client_.sendRaw(live::kMsgClientLiveLan, live::encode(lan));
+        L.lan_sent = true;
+    }
+    // And how each of its paths stands, whenever that changes: the server
+    // works out the room's route from these.
+    std::vector<std::uint8_t> paths_report;
+    if (client_.loggedIn() && L.pathsReport(&paths_report)) client_.sendRaw(live::kMsgClientLivePaths, paths_report);
+
+    // 6.4: health. Then each user's slot, and a mixer for each user's
+    // channel 0 once the server has Live (made here, outside the lock).
+    L.health(now);
+    const bool room = L.room_on.load() && L.running.load();
+    std::size_t need = 0;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        for (auto& up : users_) {
+            RemoteUser& u = *up;
+            const int slot = room ? L.slotOf(u.name) : -1;
+            u.live_want = slot;
+            u.live_want_gen = slot >= 0 ? L.gen[slot].load() : 0;
+            if (L.has_msg && !u.live_mix) ++need;
+        }
+    }
+    if (need > 0) {
+        std::vector<std::unique_ptr<LiveMix, LiveMixDeleter>> made;
+        for (std::size_t i = 0; i < need; ++i) made.emplace_back(new LiveMix);
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        for (auto& up : users_)
+            if (!up->live_mix && !made.empty()) {
+                up->live_mix = std::move(made.back());
+                made.pop_back();
+            }
+    }
+
+    // 16.7: the health report, when it changes, at most 4 times a second.
+    if (client_.loggedIn() && L.has_msg) {
+        const live::LiveReport r = L.report(now);
+        if ((!L.report_ever || r != L.report_sent) && now - L.report_at >= std::chrono::milliseconds(250)) {
+            client_.sendRaw(live::kMsgClientLiveReport, live::encode(r));
+            L.report_sent = r;
+            L.report_ever = true;
+            L.report_at = now;
+        }
+    }
+    liveRoomNotices();
+
+    // 6.12: the offer, and the lack of an answer.
+    if (L.running.load()) {
+        const std::string p = std::to_string(L.port);
+        if (!L.msg.roomOn() && !L.offer_said) {
+            L.offer_said = true;
+            liveNotice("This server has Live mode: type !live on, and the O11 Session players in the room hear each "
+                       "other in real time (it needs UDP to the server's port " + p + ").", false);
+        }
+        if (L.msg.roomOn() && !L.serverAnswered() && now - L.started_at >= std::chrono::seconds(5) &&
+            !L.no_answer_said) {
+            L.no_answer_said = true;
+            liveNotice("Live: the server doesn't answer on UDP port " + p +
+                       ", so while the room is Live you hear no one, and no one hears you. A firewall or router "
+                       "may block UDP; whoever "
+                       "hosts the server needs UDP port " + p + " forwarded too.", true);
+        }
+    }
+}
+
+// The room as this engine plays it: a line when it goes Live (none when the
+// room's Live goes off: the server says that in the chat), and the advice
+// (live_room.h): a line when it names someone (again when more players have
+// trouble), and when that player's trouble is over while they are still
+// here.
+void Engine::liveRoomNotices() {
+    LiveLayer& L = *live_;
+    const int applied = L.room_applied.load();
+    if (applied != 1) L.room_notice_by = TimePoint{};
+    if (applied != L.room_noticed) {
+        // How late it hears the others needs a stream that plays and its
+        // round trip. At the switch a stream may only just be starting (its
+        // first audio and the boundary can come together), or be dry for
+        // a moment (the machine's hiccup), so the line waits for an
+        // estimate, up to kLiveNoticeWaitMs.
+        const TimePoint now = Clock::now();
+        const int heard = applied == 1 ? liveHeardMs() : -1;
+        if (applied == 1 && L.room_notice_by == TimePoint{})
+            L.room_notice_by = now + std::chrono::milliseconds(kLiveNoticeWaitMs);
+        if (applied != 1 || heard >= 0 || now >= L.room_notice_by) {
+            if (applied == 1)
+                liveNotice("The room is Live now" +
+                               (heard >= 0 ? ", about " + std::to_string(heard) + " ms late." : std::string(".")),
+                           false);
+            L.room_noticed = applied;
+            L.room_notice_by = TimePoint{};
+        }
+    }
+    const LiveAdvice a = liveAdviceReason();
+    const std::string u = liveAdviceUser();
+    const int count = liveAdviceCount();
+    const live::Advice reason = a == LiveAdvice::None ? live::Advice::None : L.room.advice;
+    if (u == L.advice_said && reason == L.advice_said_reason) {
+        if (count > L.advice_said_count && !u.empty())
+            liveNotice(adviceText(reason, liveDisplayName(u), u == client_.username(), count), false);
+        L.advice_said_count = count;
+        return;
+    }
+    const std::string& was = L.advice_said;
+    if (!was.empty() && was != u && L.msg.roomOn()) {
+        bool here = was == client_.username();
+        {
+            std::lock_guard<std::mutex> lock(remote_mutex_);
+            for (auto& up : users_) here = here || up->name == was;
+        }
+        if (here) liveNotice(clearText(L.advice_said_reason, liveDisplayName(was), was == client_.username()), false);
+    }
+    if (!u.empty()) liveNotice(adviceText(reason, liveDisplayName(u), u == client_.username(), count), false);
+    L.advice_said = u;
+    L.advice_said_reason = reason;
+    L.advice_said_count = count;
+}
+
+// ------------------------------------------------------- `/live` (6.10, 6.11)
+
+bool Engine::liveCommand(const std::string& text) {
+    if (text.size() < 5 || lowered(text.substr(0, 5)) != "/live" || (text.size() > 5 && text[5] != ' ')) return false;
+    const std::string rest = lowered(trimmed(text.substr(5)));
+    if (rest.empty()) {
+        liveStatus();
+        return true;
+    }
+    if (rest == "on" || rest == "off") {
+        if (status_.load() != Status::Ok || !client_.loggedIn())
+            liveNotice("Not connected: Live mode is the room's, so join a room first.", true);
+        else
+            say("!live " + rest);
+        return true;
+    }
+    if (rest.compare(0, 6, "buffer") == 0) {
+        const std::string n = trimmed(rest.substr(6));   // "buffer30" reads as "buffer 30" (quirk 12)
+        const int old = live_setting_ms_.load();
+        const std::string was = old == kLiveBufferAutomatic ? std::string("automatic") : std::to_string(old) + " ms";
+        if (n.empty()) {
+            liveNotice(old == kLiveBufferAutomatic
+                           ? "Live's jitter buffer is " + bufferSettingText(old) +
+                                 ". Type /live buffer 30 to fix it (5 to 200)."
+                           : "Live's jitter buffer is " + std::to_string(old) +
+                                 " ms. Type /live buffer 30 to change it (5 to 200), or /live buffer auto.",
+                       false);
+            return true;
+        }
+        long v = 0;
+        if (n == "auto") {
+            v = kLiveBufferAutomatic;
+        } else if (!parseWholeNumber(n, &v) || v < kLiveMinBufferMs || v > kLiveMaxBufferMs) {
+            liveNotice("/live buffer takes a number of ms from 5 to 200, such as /live buffer 30, or auto.", true);
+            return true;
+        }
+        setLiveBufferMs(static_cast<int>(v));
+        const int H = live_->host_block.load(), sr = live_->host_rate.load();
+        const int least = v == kLiveBufferAutomatic ? kLiveAutoBufferMs : static_cast<int>(v);
+        const int B = liveBufferInUse(least, H, sr);
+        std::string s = v == kLiveBufferAutomatic
+                            ? "Live's jitter buffer is automatic now (it was " + was + "): " +
+                                  std::to_string(kLiveAutoBufferMs) + " ms, or " +
+                                  std::to_string(kLiveFallbackBufferMs) + " ms for a player whose audio comes late."
+                            : "Live's jitter buffer is " + std::to_string(v) + " ms now (it was " +
+                                  (old == kLiveBufferAutomatic ? was : std::to_string(old)) +
+                                  "). Less is less late, more has fewer dropouts: type /live to see them.";
+        if (liveBufferNeed(H, sr) > kLiveMaxBufferMs)
+            s += " " + longBlockText(H, sr);
+        else if (B > least)
+            s += " Your DAW's audio buffer (" + std::to_string(H) + " samples) needs at least " + std::to_string(B) +
+                 (v != kLiveBufferAutomatic                 ? " ms, so Live uses " + std::to_string(B) + " ms."
+                  : B < liveBufferInUse(kLiveFallbackBufferMs, H, sr) ? " ms, so Live starts at " + std::to_string(B) + " ms."
+                                                                    : " ms, so Live uses " + std::to_string(B) +
+                                                                          " ms for everyone.");
+        liveNotice(s, false);
+        return true;
+    }
+    liveNotice("Type /live to see how the Live players sound, or /live buffer 30 to set Live's jitter buffer (ms).", true);
+    return true;
+}
+
+void Engine::liveStatus() {
+    LiveLayer& L = *live_;
+    const int S = live_setting_ms_.load();
+    if (status_.load() != Status::Ok || !client_.loggedIn()) {
+        liveNotice("Not connected. In a room with Live mode, /live shows how late you hear each O11 Session player. "
+                   "Live's jitter buffer is " + bufferSettingText(S) +
+                       (S == kLiveBufferAutomatic ? " (/live buffer N to fix it)." : " (/live buffer N to change it)."),
+                   false);
+        return;
+    }
+    if (!L.has_msg) return liveNotice("This server doesn't have Live mode, so everyone plays through intervals.", false);
+    if (!L.msg.udpOpen())
+        return liveNotice("This server's Live mode is off, so everyone plays through intervals.", false);
+    if (!L.msg.roomOn())
+        return liveNotice("Live is off in this room. Type !live on, and the O11 Session players here hear each other "
+                          "in real time.",
+                          false);
+    if (!L.running.load())
+        return liveNotice("Live is on in this room, but yours couldn't start, so you hear no one, and no one hears "
+                          "you.",
+                          false);
+
+    // The head line.
+    const int H = L.host_block.load(), sr = L.host_rate.load() > 0 ? L.host_rate.load() : 48000;
+    const bool automatic = S == kLiveBufferAutomatic;
+    const int least = automatic ? kLiveAutoBufferMs : S;
+    const int B = liveBufferInUse(least, H, sr), F = liveBufferInUse(kLiveFallbackBufferMs, H, sr);
+    std::string head = "Live is on. Jitter buffer " + std::to_string(B) + " ms";
+    if (automatic && F > B)
+        head = "Live is on. Jitter buffer automatic: " + std::to_string(B) + " ms, or " + std::to_string(F) +
+               " ms for a player whose audio comes late";
+    if (liveBufferNeed(H, sr) > B)
+        head += ". " + longBlockText(H, sr) + " ";
+    else if (B > least)
+        head += automatic ? std::string(" (your DAW's audio buffer, ") + std::to_string(H) + " samples, needs " +
+                                std::to_string(B) + " ms at least). "
+                          : ": your DAW's audio buffer (" + std::to_string(H) + " samples) needs that much, more "
+                            "than the " + std::to_string(S) + " ms you set. ";
+    else
+        head += automatic ? " (/live buffer N to fix it). " : " (/live buffer N to change it). ";
+    head += L.serverAnswered() ? "Round trip to the server " + num(L.serverRoundTripMs(), 1) + " ms."
+                               : std::string("The server doesn't answer over UDP yet.");
+    bool transmit = false;
+    {
+        std::lock_guard<std::mutex> lock(local_mutex_);
+        auto it = locals_.find(0);
+        transmit = it != locals_.end() && it->second->s.broadcast;
+    }
+    if (!L.msg.maySend())
+        head += " The room has no room for more Live players, so while it is Live you hear no one, and no one hears "
+                "you.";
+    else if (!transmit)
+        head += " Transmit is off, so you send nothing.";
+    else if (!L.host_playing.load())
+        head += " The host is stopped, so you send nothing until it plays.";
+
+    // The room's mode first (16.7), and the advice.
+    std::string room;
+    if (liveRoomLive())
+        room = "The room is Live.";
+    else if (L.has_room && L.room.live && liveOn(L))
+        room = "The room goes Live at the next interval.";
+    else if (L.has_room && L.room.live)
+        room = "The room is Live, but Live can't play here, so you hear no one, and no one hears you.";
+    else
+        room = "The room is on intervals.";
+    const LiveAdvice advice = liveAdviceReason();
+    if (advice != LiveAdvice::None) {
+        const std::string u = liveAdviceUser();
+        room += " " + adviceText(L.room.advice, liveDisplayName(u), u == client_.username(), liveAdviceCount());
+    }
+    liveNotice(room, false);
+    liveNotice(head, false);
+
+    // One line per listed peer.
+    struct Listed {
+        std::string name;
+        int slot;
+        bool sending, bound;
+    };
+    std::vector<Listed> listed;
+    {
+        std::lock_guard<std::mutex> lock(L.net_mutex);
+        for (const auto& p : L.peers) listed.push_back({p.name, p.slot, p.sending, p.bound});
+    }
+    const TimePoint now = Clock::now();
+    const std::int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    const std::string off = liveRoomLive() ? "not heard" : "intervals";   // while Live, no one's intervals
+    for (const auto& p : listed) {
+        std::string line = liveDisplayName(p.name) + ": ";
+        if (p.slot < 0) {
+            line += off + " (O11 Session hears 8 Live players at most).";
+            liveNotice(line, false);
+            continue;
+        }
+        if (!p.bound) {
+            line += off + " (their Live doesn't reach the server over UDP).";
+            liveNotice(line, false);
+            continue;
+        }
+        const SinkStats& st = L.sinks[p.slot]->stats;
+        const bool counts = st.gen.load() == L.gen[p.slot].load();
+        if (!counts || !st.active.load()) {
+            line += p.sending ? "no real-time audio from them" : "not sending (their host is stopped or Transmit is off)";
+        } else {
+            bool live_now = false;
+            {
+                std::lock_guard<std::mutex> lock(remote_mutex_);
+                for (auto& up : users_)
+                    if (up->name == p.name) live_now = up->live_now.load();
+            }
+            line += live_now ? std::string("live")
+                             : off + (L.slot_health[p.slot].healthy ? ", their real-time audio sounds clean"
+                                                                    : ", their real-time audio has dropouts");
+            double buffer = 0, network = 0, codec = 0;
+            double oneway = liveOneWayMs(p.slot, &buffer, &network, &codec);
+            if (oneway < 0) oneway = network + codec + buffer + 64.0 / sr * 1000.0;
+            const int block = st.block.load() > 0 ? st.block.load() : 240;
+            const double since = (now_ns - st.active_since_ns.load()) / 1e9;
+            double loss = 0;
+            if (since >= block / 48000.0) {
+                const double bad = double(st.lost.load() - st.lost_at_active.load()) +
+                                   double(st.resent.load() - st.resent_at_active.load());
+                loss = std::min(100.0, 100.0 * bad / (since * 48000.0 / block));
+            }
+            line += ", about " + num(oneway) + " ms late (buffer " + num(buffer) + " ms, network " + num(network) +
+                    " ms, codec " + num(codec) + " ms), " + num(loss, 1) + "% of the packets lost";
+            if (st.fell_back.load())
+                line += "; their audio came late, so their buffer is " + std::to_string(st.buffer_ms.load()) + " ms";
+        }
+        const std::uint32_t u = counts ? st.underruns.load() : 0, o = counts ? st.overruns.load() : 0,
+                            d = counts ? st.lost.load() : 0;
+        const std::uint32_t all = u + o + d;
+        const std::string parts = " (" + std::to_string(u) + " ran dry, " + std::to_string(o) + " overflowed, " +
+                                  std::to_string(d) + " packets lost for good)";
+        if (L.buffer_changed) {
+            const std::uint32_t before = L.changed_gen[p.slot] == st.gen.load() ? L.changed_drops[p.slot] : 0;
+            const double t = std::chrono::duration<double>(now - L.buffer_changed_at).count();
+            line += ". Dropouts: " + std::to_string(all - before) + " in the " + num(t) + " s since the buffer changed, " +
+                    std::to_string(all) + " in all" + parts;
+        } else {
+            line += ". Dropouts: " + std::to_string(all) + parts;
+        }
+        liveNotice(line + ".", false);
+    }
+    // Then everyone else in the room.
+    std::vector<std::string> others;
+    {
+        std::lock_guard<std::mutex> lock(remote_mutex_);
+        for (auto& up : users_) {
+            bool is_listed = false;
+            for (const auto& p : listed) is_listed |= p.name == up->name;
+            if (!is_listed) others.push_back(up->name);
+        }
+    }
+    for (const auto& n : others)
+        liveNotice(liveDisplayName(n) + ": " + (liveRoomLive() ? "not heard while the room is Live" : "intervals") +
+                       " (not a Live player: an older client, or the room is full)",
+                   false);
+}
+
+// --------------------------------------------------------- audio context
+
+// At the start of process(), both mutexes held.
+void Engine::liveAudioBlock(const float* const* in, int numIn, int frames, int sampleRate) {
+    LiveLayer& L = *live_;
+    const float* l = nullptr;
+    const float* r = nullptr;
+    bool transmit = false;
+    auto it = locals_.find(0);                   // Live sends channel 0 only (6.7)
+    if (it != locals_.end() && maxchan_.load() > 0) {
+        const LocalChannel& s = it->second->s;
+        transmit = s.broadcast;
+        if (s.source >= 0 && s.source < numIn) {
+            l = in[s.source];
+            r = s.stereo && s.source + 1 < numIn ? in[s.source + 1] : l;
+        }
+    }
+    L.audioBlock(l, r, transmit, frames, sampleRate);
+    // 16.8, at once: when Live stops playing here, this mixer plays the
+    // room on intervals from this block (each user crossfades).
+    if (!liveOn(L)) {
+        L.mix_live = false;
+        L.room_applied.store(0);
+    }
+}
+
+// 16.7: the mixer takes the room's latest mode at the first boundary half a
+// second after it came, for every user at once; before 6.3's uploads (none
+// while the room is Live) and 8.2's steps.
+void Engine::liveBoundary() {
+    LiveLayer& L = *live_;
+    const std::uint64_t a = L.room_announce.load(std::memory_order_acquire);
+    if (a != L.mix_announce && steadyNs(Clock::now()) >= L.room_due_ns.load()) {
+        L.mix_announce = a;
+        L.mix_mode = (a & 1) != 0;
+    }
+    L.mix_live = L.mix_mode && liveOn(L);
+    L.room_applied.store(L.mix_live ? 1 : 0);
+    if (!L.mix_live) return;
+    for (auto& u : users_) {
+        const int want = u->live_want;
+        if (want >= 0 && L.gen[want].load() == u->live_want_gen) {
+            u->live_slot = want;
+            u->live_gen = u->live_want_gen;
+        }
+    }
+}
+
+// The room is Live, as this engine took it at its last boundary, and its
+// switch is still on: no interval audio is uploaded, even when Live can't
+// play here (the server relays none).
+bool Engine::liveHoldsIntervals() const { return live_->mix_mode && live_->room_on.load(); }
+
+// Channel 0's interval audio for `len` frames, as mixRemote() plays it but
+// before volume and pan: interleaved stereo into `dst`, silence when there
+// is none.
+void Engine::liveIntervalAudio(RemoteUser& u, int len, int sampleRate, float* dst) {
+    std::fill(dst, dst + 2 * static_cast<std::size_t>(len), 0.0f);
+    RemoteChannel& rc = u.ch[0];
+    if (!rc.present || rc.ignoresIntervals() || !rc.current) return;
+    Decoder& dec = *rc.current;
+    const int srcRate = dec.rate();
+    const int needed = rc.rs.needed(srcRate, sampleRate, len);
+    dec.decodeUntil(static_cast<std::size_t>(needed) + 2);
+    if (rc.drop_count > 0) {
+        std::size_t drop = std::min(static_cast<std::size_t>(rc.drop_count), dec.available());
+        dec.skip(drop);
+        rc.drop_count -= static_cast<long>(drop);
+        dec.decodeUntil(static_cast<std::size_t>(needed) + 2);
+    }
+    if (dec.available() < static_cast<std::size_t>(needed)) {
+        rc.drop_count += needed - static_cast<long>(dec.available());
+        dec.skip(dec.available());
+        rc.rs.advance(srcRate, sampleRate, len, needed);
+        return;
+    }
+    const int ch = dec.channels();
+    float* src = const_cast<float*>(dec.data());
+    const std::size_t avail = dec.available();
+    for (std::size_t i = 0; i < static_cast<std::size_t>(needed) * static_cast<std::size_t>(ch); ++i) src[i] = clip1(src[i]);
+    const bool same = srcRate == sampleRate;
+    const double ratio = static_cast<double>(srcRate) / sampleRate;
+    for (int i = 0; i < len; ++i) {
+        float s1, s2;
+        if (same) {
+            const float* f = src + static_cast<std::size_t>(i) * static_cast<std::size_t>(ch);
+            s1 = f[0];
+            s2 = ch > 1 ? f[1] : f[0];
+        } else {
+            double p = rc.rs.phase + i * ratio;
+            std::size_t i0 = static_cast<std::size_t>(p);
+            float frac = static_cast<float>(p - static_cast<double>(i0));
+            std::size_t i1 = std::min(i0 + 1, avail - 1);
+            if (i0 >= avail) i0 = avail - 1;
+            const float* a = src + i0 * static_cast<std::size_t>(ch);
+            const float* b = src + i1 * static_cast<std::size_t>(ch);
+            s1 = a[0] + (b[0] - a[0]) * frac;
+            s2 = ch > 1 ? a[1] + (b[1] - a[1]) * frac : s1;
+        }
+        dst[2 * i] = s1;
+        dst[2 * i + 1] = s2;
+    }
+    dec.skip(static_cast<std::size_t>(needed));
+    rc.rs.advance(srcRate, sampleRate, len, needed);
+}
+
+namespace {
+
+// 16.8: before path `in` fades in against the other, it is read so far
+// behind that the two line up when they carry the same sound (one held
+// note, heard an interval apart and live), and `rho` says how alike they
+// are then. Equal-power gains keep the level of two unlike sounds; the
+// mixer scales them down by the likeness, so two alike ones keep theirs too.
+void lineUp(LiveMix& m, int in, int rate) {
+    const int o = 1 - in;
+    if (m.pos[in] > 0) return;                   // still heard: its delay stays
+    m.delay[in] = 0;
+    m.rho = 0;
+    if (m.pos[o] <= 0) return;                   // nothing to cross with
+    constexpr int R = LiveMix::kRing - 1;
+    const int W = std::max(16, std::min(512, rate * 8 / 1000));   // 8 ms compared
+    const int T = std::max(8, std::min(256, rate * 4 / 1000));    // over lags up to 4 ms
+    float x[512];
+    double ex = 0;
+    for (int k = 0; k < W; ++k) {
+        const int f = (m.w - m.delay[o] - W + k) & R;
+        x[k] = m.ring[o][2 * f] + m.ring[o][2 * f + 1];
+        ex += static_cast<double>(x[k]) * x[k];
+    }
+    if (ex < W * 1e-8) return;                   // silence going out
+    double r[257];
+    double best = -2;
+    for (int d = 0; d <= T; ++d) {
+        double c = 0, ey = 0;
+        for (int k = 0; k < W; ++k) {
+            const int f = (m.w - d - W + k) & R;
+            const float y = m.ring[in][2 * f] + m.ring[in][2 * f + 1];
+            c += static_cast<double>(x[k]) * y;
+            ey += static_cast<double>(y) * y;
+        }
+        r[d] = ey > W * 1e-8 ? c / std::sqrt(ex * ey) : 0.0;
+        best = std::max(best, r[d]);
+    }
+    if (best >= 0.8) {                           // alike: the shortest lag that lines them up
+        int lag = 0;
+        while (r[lag] < best - 0.02) ++lag;
+        m.delay[in] = lag;
+        m.rho = static_cast<float>(std::min(1.0, r[lag]));
+    } else {                                     // unlike (music an interval apart): no lag
+        m.rho = static_cast<float>(std::max(0.0, std::min(1.0, r[0])));
+    }
+}
+
+// mixLive()'s loop while both fades are at rest: path p heard at gain g[p]
+// (0 or 1) throughout, from its ring `delay[p]` frames back, or straight
+// from the frames just written there (ibuf, lbuf) when neither path has a
+// delay. The same arithmetic as mixLive()'s own loop, without the fades.
+template <bool Mono, bool Direct>
+void mixAtRestAs(const LiveMix& m, int n, float vol, float gl, float gr, float* o0, float* o1, float* pk0,
+                 float* pk1) {
+    constexpr int R = LiveMix::kRing - 1;
+    const float g0 = m.pos[0], g1 = m.pos[1];
+    const float* r0 = m.ring[0].get();
+    const float* r1 = m.ring[1].get();
+    float p0 = *pk0, p1 = *pk1;
+    for (int i = 0; i < n; ++i) {
+        const float* a;
+        const float* b;
+        if (Direct) {
+            a = m.ibuf + 2 * i;
+            b = m.lbuf + 2 * i;
+        } else {
+            a = r0 + 2 * ((m.w + i - m.delay[0]) & R);
+            b = r1 + 2 * ((m.w + i - m.delay[1]) & R);
+        }
+        const float s1 = g0 * a[0] + g1 * b[0];
+        const float s2 = g0 * a[1] + g1 * b[1];
+        if (Mono) {
+            const float v = clip1((s1 + s2) * 0.5f * vol);
+            o0[i] += v;
+            p0 = std::max(p0, std::fabs(v));
+        } else {
+            const float lv = clip1(s1 * vol * gl), rv = clip1(s2 * vol * gr);
+            o0[i] += lv;
+            o1[i] += rv;
+            p0 = std::max(p0, std::fabs(lv));
+            p1 = std::max(p1, std::fabs(rv));
+        }
+    }
+    *pk0 = p0;
+    *pk1 = p1;
+}
+
+void mixAtRest(const LiveMix& m, int n, float vol, float gl, float gr, bool mono, float* o0, float* o1, float* pk0,
+               float* pk1) {
+    const bool direct = m.delay[0] == 0 && m.delay[1] == 0;
+    if (mono) {
+        if (direct) mixAtRestAs<true, true>(m, n, vol, gl, gr, o0, o1, pk0, pk1);
+        else mixAtRestAs<true, false>(m, n, vol, gl, gr, o0, o1, pk0, pk1);
+    } else {
+        if (direct) mixAtRestAs<false, true>(m, n, vol, gl, gr, o0, o1, pk0, pk1);
+        else mixAtRestAs<false, false>(m, n, vol, gl, gr, o0, o1, pk0, pk1);
+    }
+}
+
+}  // namespace
+
+// 6.6 and 16.8: channel 0 of every user with a mixer, from its interval
+// audio and its slot's live audio, with channel 0's settings, into its
+// pair. The path the room's mode picks is heard; each switch crossfades
+// over 20 ms on an equal-power curve, and while the room is Live a slot
+// without audio is concealed for kLiveConcealBuffers x B (to the frame,
+// from where its concealment is heard), then fades out, and fades in again
+// when its audio comes back. Interval audio is never
+// heard while the room is Live (and none is sent then): a user without a
+// slot here isn't heard.
+void Engine::mixLive(float* const* out, int numOut, int len, int at, int sampleRate) {
+    LiveLayer& L = *live_;
+    const bool any_solo = any_solo_.load();
+    const int offset = remote_offset_.load();
+    const float step = static_cast<float>(1000.0 / (kLiveFadeMs * sampleRate));
+    const auto holdFor = [&](int ms) { return static_cast<int>(kLiveConcealBuffers * ms * sampleRate / 1000.0); };
+    const int hold_b = holdFor(L.latency_ms.load());
+    const int spare = static_cast<int>(kLiveConcealSpareMs * sampleRate / 1000.0);
+    constexpr int R = LiveMix::kRing - 1;
+    constexpr float kPi = 3.14159265359f, kHalfPi = 1.57079632679f;
+    for (auto& up : users_) {
+        RemoteUser& u = *up;
+        if (!u.live_mix) continue;
+        LiveMix& m = *u.live_mix;
+        RemoteChannel& rc = u.ch[0];
+        if (!rc.present) {                       // no channel 0: nothing to play, and a fresh start
+            m.pos[0] = 1.0f;
+            m.pos[1] = 0.0f;
+            m.delay[0] = m.delay[1] = 0;
+            m.rho = 0;
+            m.path_live = false;
+            m.quiet = 1 << 30;
+            u.live_slot = -1;
+            u.live_now.store(false);
+            continue;
+        }
+        const float vol = std::min(4.0f, std::max(0.0f, u.volume * rc.volume));
+        const float pan = std::min(1.0f, std::max(-1.0f, u.pan + rc.pan));
+        const bool muted = any_solo ? !rc.solo : (rc.mute || u.mute);
+        const bool audible = !muted && vol >= 1e-7f && numOut > 0;
+        int idx = 0;
+        bool mono = false;
+        if (numOut > 0) outputPair(rc.outChannel, offset, numOut, &idx, &mono);
+        float gl, gr;
+        panGains(pan, &gl, &gr);
+        float pk0 = 0, pk1 = 0;
+        for (int done = 0; done < len;) {
+            const int n = std::min(LiveMix::kChunk, len - done);
+            liveIntervalAudio(u, n, sampleRate, m.ibuf);
+            // The live path: the slot it plays, else the user's slot, so
+            // that its audio is there to line up with when it comes in.
+            int src = u.live_slot;
+            if (src < 0 && u.live_want >= 0 && L.gen[u.live_want].load() == u.live_want_gen) src = u.live_want;
+            if (src >= 0 && L.available(src)) {
+                const float* p = L.out(src) + 2 * static_cast<std::size_t>(at + done);
+                for (int k = 0; k < 2 * n; ++k) m.lbuf[k] = clip1(p[k]);
+            } else {
+                std::fill(m.lbuf, m.lbuf + 2 * n, 0.0f);
+            }
+            const bool slot_ok = u.live_slot >= 0 && L.gen[u.live_slot].load() == u.live_gen;
+            const bool live = L.mix_live;
+            if (live != m.path_live) {
+                m.path_live = live;
+                lineUp(m, live ? LiveMix::kLive : LiveMix::kIntervals, sampleRate);
+            }
+            // The hold counts from the frame where the slot's concealment
+            // began, and the live path is heard m.delay[1] frames after it
+            // is written: so every gap is held for the same time. It is
+            // kLiveConcealBuffers x the buffer the slot's stream plays with
+            // (its fallback, if it fell back), as its sink conceals.
+            const int slot_ms = slot_ok ? L.sinks[u.live_slot]->stats.buffer_ms.load(std::memory_order_relaxed) : 0;
+            const int keep = (slot_ms > 0 ? holdFor(slot_ms) : hold_b) + std::min(m.delay[1], spare);
+            const int quiet0 = std::min(m.quiet, 1 << 29);
+            const auto quietAt = [&](int i) {
+                return slot_ok ? L.quietAt(u.live_slot, at + done + i) : quiet0 + i + 1;
+            };
+            float target[2] = {live ? 0.0f : 1.0f, 0.0f};
+            for (int k = 0; k < n; ++k) {
+                const int f = (m.w + k) & R;
+                m.ring[0][2 * f] = m.ibuf[2 * k];
+                m.ring[0][2 * f + 1] = m.ibuf[2 * k + 1];
+                m.ring[1][2 * f] = m.lbuf[2 * k];
+                m.ring[1][2 * f + 1] = m.lbuf[2 * k + 1];
+            }
+            // At rest, as nearly always: each fade already where it is going
+            // and staying there for this whole piece, so nothing moves and
+            // each path is heard at 0 or 1 throughout.
+            bool rest = m.pos[0] == target[0] && (m.pos[1] == 0.0f || m.pos[1] == 1.0f);
+            for (int i = 0; rest && i < n; ++i)
+                rest = (live && slot_ok && quietAt(i) <= keep ? 1.0f : 0.0f) == m.pos[1];
+            if (rest && audible)
+                mixAtRest(m, n, vol, gl, gr, mono, out[idx] + done, mono ? nullptr : out[idx + 1] + done, &pk0, &pk1);
+            for (int i = 0; !rest && i < n; ++i) {
+                target[1] = live && slot_ok && quietAt(i) <= keep ? 1.0f : 0.0f;
+                float g[2];
+                for (int p = 0; p < 2; ++p) {
+                    float& q = m.pos[p];
+                    if (q < target[p]) q = std::min(target[p], q + step);
+                    else if (q > target[p]) q = std::max(target[p], q - step);
+                    // Equal power, sin(pi/2 x s) with s a raised cosine of the
+                    // position: no step in the slope at either end, where a
+                    // plain sin(pi/2 x q) starts or stops with one (a tick).
+                    const float sq = 0.5f - 0.5f * std::cos(kPi * q);
+                    g[p] = q >= 1.0f ? 1.0f : (q <= 0.0f ? 0.0f : std::sin(kHalfPi * sq));
+                }
+                if (m.rho > 0 && g[0] > 0 && g[0] < 1 && g[1] > 0 && g[1] < 1) {
+                    const float e = g[0] * g[0] + g[1] * g[1];
+                    const float k = std::sqrt(e / (e + 2.0f * m.rho * g[0] * g[1]));
+                    g[0] *= k;
+                    g[1] *= k;
+                }
+                if (!audible) continue;
+                const int f0 = (m.w + i - m.delay[0]) & R, f1 = (m.w + i - m.delay[1]) & R;
+                const float s1 = g[0] * m.ring[0][2 * f0] + g[1] * m.ring[1][2 * f1];
+                const float s2 = g[0] * m.ring[0][2 * f0 + 1] + g[1] * m.ring[1][2 * f1 + 1];
+                float* o0 = out[idx] + done;
+                if (mono) {
+                    const float v = clip1((s1 + s2) * 0.5f * vol);
+                    o0[i] += v;
+                    pk0 = std::max(pk0, std::fabs(v));
+                } else {
+                    const float lv = clip1(s1 * vol * gl), rv = clip1(s2 * vol * gr);
+                    o0[i] += lv;
+                    out[idx + 1][done + i] += rv;
+                    pk0 = std::max(pk0, std::fabs(lv));
+                    pk1 = std::max(pk1, std::fabs(rv));
+                }
+            }
+            m.quiet = quietAt(n - 1);
+            m.w = (m.w + n) & R;
+            // Silent paths can move without a sound, but not the live one
+            // while the room is Live: a slot that fades out in a gap comes
+            // back on the delay it had (16.6), lined up as it was.
+            if (m.pos[0] <= 0) m.delay[0] = 0;
+            if (m.pos[1] <= 0 && !m.path_live) m.delay[1] = 0;
+            if (m.pos[0] <= 0 || m.pos[1] <= 0) m.rho = 0;
+            done += n;
+        }
+        if (!m.path_live && m.pos[1] <= 0) u.live_slot = -1;   // faded out: no longer this user's to play
+        u.live_now.store(m.path_live && u.live_slot >= 0);
+        if (audible) {
+            raisePeak(rc.peak[0], pk0);
+            raisePeak(rc.peak[1], mono ? pk0 : pk1);
+        }
+    }
+}
+
+}  // namespace engine
+}  // namespace o11proto

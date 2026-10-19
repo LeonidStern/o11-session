@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <vector>
 
 namespace o11 {
 
@@ -219,8 +220,8 @@ std::string shortHostName(const std::string &hostName)
   const std::string name = hostName.substr(a, b - a);
   std::string lower = name;
   for (auto &c : lower) c = (char)tolower((unsigned char)c);
-  if (lower.find("ableton") != std::string::npos || lower == "live" || lower.compare(0, 5, "live ") == 0) return "Live";
-  if (name.empty()) return "The DAW";
+  if (lower.find("ableton") != std::string::npos || lower == "live" || lower.compare(0, 5, "live ") == 0) return "Ableton"; // not "Live": that is the room's mode
+  if (name.empty() || lower == "unknown") return "The DAW"; // JUCE says "Unknown" for a host it doesn't know
   size_t n = std::min<size_t>(name.size(), 32);
   while (n < name.size() && n > 0 && ((unsigned char)name[n] & 0xc0) == 0x80) n--; // not inside a UTF-8 character
   return name.substr(0, n);
@@ -230,16 +231,16 @@ std::string hostTempoNote(const std::string &hostName, double hostTempo, int roo
 {
   if (hostTempo <= 0 || roomBpm <= 0 || fabs(hostTempo - roomBpm) <= BarSync::SAME_TEMPO) return "";
   const std::string host = shortHostName(hostName), room = std::to_string(roomBpm);
-  const bool live = host == "Live";
+  const bool live = host == "Ableton";
   std::string s = host + " is at " + bpmText(hostTempo) + " BPM, the room at " + room + ": ";
   if (following && suggestLink)
-    s += live ? "turn on Link in Live, or set it to " + room : "turn on its Link if it has one, or set its tempo to " + room;
-  else s += std::string("set ") + (live ? "Live" : "its tempo") + " to " + room;
+    s += live ? "turn on Link in Ableton, or set it to " + room : "turn on its Link if it has one, or set its tempo to " + room;
+  else s += std::string("set ") + (live ? "Ableton" : "its tempo") + " to " + room;
   if (!following) s += ", or turn on Sync";
   return s;
 }
 
-// "Live", "Bitwig Studio", or "your DAW" when the host doesn't say its name
+// "Ableton", "Bitwig Studio", or "your DAW" when the host doesn't say its name
 static std::string hostInSentence(const std::string &hostName)
 {
   const std::string host = shortHostName(hostName);
@@ -249,7 +250,7 @@ static std::string hostInSentence(const std::string &hostName)
 std::string linkHint(const std::string &hostName)
 {
   const std::string host = hostInSentence(hostName);
-  if (host == "Live") return "Turn on Link in Live: then Live takes the room's tempo, and its bars start with the intervals.";
+  if (host == "Ableton") return "Turn on Link in Ableton: then Ableton takes the room's tempo, and its bars start with the intervals.";
   return "Turn on Link in " + host + " if it has Link: then it takes the room's tempo, and its bars start with the intervals.";
 }
 
@@ -258,12 +259,12 @@ std::string syncTooltip(const std::string &hostName, LinkState link, int peers)
   const std::string host = hostInSentence(hostName);
   const std::string lead = "Sync with " + host + ": when you change its tempo, vote the room to it; and while it plays, "
                            "start the intervals on its bars (a multiple of BPI beats from bar 1)";
-  const std::string its = host == "Live" ? "Live's" : "its";
+  const std::string its = host == "Ableton" ? "Ableton's" : "its";
   switch (link)
   {
     case LinkState::Waiting:
-      return lead + ". In a room, with Link on in " + host + (host == "Live" ? "" : " (if it has Link)") + ", " +
-             (host == "Live" ? "Live" : "it") + " takes the room's tempo instead, and its bars start with the intervals";
+      return lead + ". In a room, with Link on in " + host + (host == "Ableton" ? "" : " (if it has Link)") + ", " +
+             (host == "Ableton" ? "Ableton" : "it") + " takes the room's tempo instead, and its bars start with the intervals";
     case LinkState::Leading:
       if (peers > 0)
         return "Sync with " + host + " through Link: " + host + " takes the room's tempo, and its bars start with the intervals; "
@@ -278,12 +279,45 @@ std::string syncTooltip(const std::string &hostName, LinkState link, int peers)
   }
 }
 
+static size_t utf8Chars(const std::string &s)
+{
+  size_t chars = 0;
+  for (unsigned char c : s) chars += (c & 0xc0) != 0x80;
+  return chars;
+}
+
 std::string hostChipName(const std::string &hostName)
 {
   const std::string name = shortHostName(hostName);
-  size_t chars = 0;
-  for (unsigned char c : name) chars += (c & 0xc0) != 0x80;
-  return chars <= 10 && name != "The DAW" ? name : "Host";
+  if (name == "The DAW") return "DAW";
+  // its words, without the maker in front ("Steinberg Cubase 10.5") or a version after ("Cubase 10.5")
+  std::vector<std::string> words;
+  size_t i = 0;
+  while (i < name.size())
+  {
+    while (i < name.size() && name[i] == ' ') i++;
+    const size_t start = i;
+    while (i < name.size() && name[i] != ' ') i++;
+    if (i > start) words.push_back(name.substr(start, i - start));
+  }
+  static const char *const makers[] = { "steinberg", "tracktion", "magix", "apple", "adobe", "presonus", "image-line" };
+  if (words.size() > 1)
+  {
+    std::string first = words[0];
+    for (auto &c : first) c = (char)tolower((unsigned char)c);
+    for (const char *m : makers)
+      if (first == m)
+      {
+        words.erase(words.begin());
+        break;
+      }
+  }
+  while (words.size() > 1 && isdigit((unsigned char)words.back()[0])) words.pop_back();
+  std::string joined;
+  for (const std::string &w : words) joined += (joined.empty() ? "" : " ") + w;
+  if (!joined.empty() && utf8Chars(joined) <= 10) return joined;
+  if (!words.empty() && utf8Chars(words[0]) <= 10) return words[0]; // "Bitwig Studio": "Bitwig"
+  return "DAW";
 }
 
 void barAndBeat(double ppq, int num, int den, int *bar, int *beat, bool *onBeat)

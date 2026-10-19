@@ -8,9 +8,10 @@
 /*
 
   What the editor's controls show and take, without JUCE (so the unit test
-  can check it): the BPM box (dragged or typed), the BPI choices, the volume
-  boxes' dB, the meters' segments, the beat box, and the host bar's address and
-  port texts.
+  can check it): the BPM box (dragged or typed), the interval choices, the
+  volume boxes' dB, the meters' scale, the beat box, the players' and the room
+  panel's texts (what happened in the room, and how long ago), and the host
+  bar's address and port texts.
 
 */
 
@@ -23,10 +24,13 @@ namespace o11 {
 namespace uitext {
 
 constexpr int BPM_MIN = 40, BPM_MAX = 240;           // what the BPM box votes for
-constexpr int BPI_CHOICES[] = { 2, 4, 8, 12, 16, 24, 32, 48, 64 }; // 2 to 64, as the server allows
-constexpr int NUM_BPI_CHOICES = 9;
+constexpr int BPI_CHOICES[] = { 2, 4, 8, 12, 16 }; // Leo's list; a typed /bpi can still set up to 64
+constexpr int NUM_BPI_CHOICES = 5;
 constexpr double PIXELS_PER_BPM = 2.0;               // dragging the BPM box up or down (4 times as far with Shift)
-constexpr int METER_SEGMENTS = 7;
+// the level meters show -60 dB to 0 dB: green, amber from -12 dB, red from -3 dB
+constexpr float METER_FLOOR_DB = -60.0f, METER_AMBER = 0.8f, METER_RED = 0.95f;
+constexpr double JOINED_SECONDS = 30.0;              // a player's row says "joined" this long
+constexpr double DROPOUT_SECONDS = 60.0;             // and how many dropouts it had, this long after one
 
 // the BPM box dragged dy pixels up (down when negative) from start, within BPM_MIN..BPM_MAX
 int dragBpm(int start, double dy, bool fine);
@@ -37,12 +41,60 @@ bool parseBpm(const std::string &text, int *bpm);
 std::string bpmBoxText(double bpm);
 // a gain (1 = 0 dB) as a volume box shows it: "-12.0 dB", "0.0 dB", "+6.0 dB", "-inf dB"
 std::string dbText(float gain);
-// how many of a meter's segments a peak level (linear) lights; the last two are yellow
-int litSegments(float peak);
+// a peak level (linear) on a meter: 0 at METER_FLOOR_DB and below, 1 at 0 dB and above
+float meterFraction(float peak);
 // the beat box: "3 / 16"; a dash for the beat when no interval plays ("– / 16"), and for both without a room
 std::string beatText(int pos, int length, int bpi);
 // an Opus bitrate in the bitrate box: "128k"
 std::string kbpsText(int kbps);
+// an interval's length in the Interval box: "16 beats"
+std::string beatsText(int beats);
+// the room panel's count, you included: "just you", "4 players"
+std::string playersText(int players);
+// a player's row, seconds after they joined: "just joined", "joined 12 s ago"
+std::string joinedText(double seconds);
+// a player's gaps in their audio: "1 dropout", "3 dropouts"
+std::string dropoutsText(long n);
+// a delay in the Mode box, its tooltip and the room's events: "28 ms"
+std::string msText(int ms);
+// the Mode box: "Live 28 ms" while the room plays Live ("Live" until the delay is known), else
+// "Intervals"
+std::string liveModeText(bool live, int heardMs);
+// the Mode menu's choice "Intervals · 4 beats", and the box's shorter "Intervals · 4" (just "Intervals" for 0)
+std::string intervalsModeText(int beats, bool unit);
+// the advice while the room is Live (the Snapshot's liveReason: 1 a connection's dropouts, 2 a
+// client that can't play Live), whose ("You" for yours) and how many more, suggesting
+// Intervals: "Anna drops out: try Intervals", "Your connection drops out: try Intervals",
+// "Carol and 1 more can't play Live: try Intervals"; "" for no reason
+std::string liveAdviceText(int reason, const std::string &who, int others);
+// how long ago something happened, in the room panel: "now", "12 s", "2 min", "1 h"
+std::string ageText(double seconds);
+// a server's line with the players' addresses taken out: "anna@203.0.113.9 set ..." is "anna set ..."
+std::string withoutAddresses(const std::string &text);
+
+// The room panel's list of what happened in the room, from the lines the engine keeps (its
+// chat, with the plug-in's own notes and the server's messages): who came and went, what
+// changed (tempo, interval, codec, bitrate), and what the server says. The kinds are the
+// engine's (ChatLine): the plug-in's notes, the server's messages, the built-in server's log,
+// joins, leaves, what players say (only their votes are shown), the engine's Live lines (the
+// room went Live, or back on intervals), anything else (errors the editor shows elsewhere).
+enum class LineKind { Note, Server, HostLog, Join, Leave, Chat, Live, Other };
+struct RoomEvent
+{
+  enum Tone { Plain, Change, Warn }; // grey, purple, amber
+  bool shown = false;
+  Tone tone = Plain;
+  std::string text;
+};
+// who: the display name of who joined, left or said it; hosting: you host the room; voter: who
+// cast the vote a voting system line is about ("You" for you), "" when not known
+RoomEvent roomEvent(LineKind kind, const std::string &who, const std::string &text, bool hosting,
+                    const std::string &voter = "");
+
+// A player's vote as the server passes it on ("!vote bpm 100"): BPM or interval, and the value.
+bool parseVote(const std::string &text, bool *bpm, int *value);
+// Whether a voting system line is about that vote: the room set to its value, or its value leading.
+bool voteMatches(bool bpm, int value, const std::string &serverText);
 
 // The host bar while hosting, from what the built-in server knows (the Snapshot's host fields).
 struct HostInfo
@@ -63,13 +115,16 @@ struct HostBar
   std::string address;     // empty: the placeholder shows
   std::string placeholder; // "looking it up..." while asking, else "not known"
   std::string addressTip;
-  // the port's state on the right
-  enum Port { Open, Asking, Forward };
+  // the port's state on the right; Blocked: the router forwards it, but its own address is in
+  // the internet provider's shared range (carrier-grade NAT), so only your network can join
+  enum Port { Open, Asking, Forward, Blocked };
   Port port = Forward;
-  std::string portText;    // "Port open", "Asking the router...", "Forward port 2049"
+  std::string portText;    // "Port open", "Asking the router...", "Forward port 2049", "Only your network can join"
   std::string portTip;     // the whole story, with the router's note when it failed
 };
 HostBar hostBar(const HostInfo &h);
+// an address as people type it: without the port when it is the usual 2049 ("203.0.113.7")
+std::string roomAddress(const std::string &address);
 
 } // namespace uitext
 } // namespace o11

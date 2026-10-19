@@ -28,6 +28,7 @@
 #include <chrono>
 
 #include "o11proto/portmap.h"
+#include "o11proto/realtime.h"
 #include "o11proto/server.h"
 
 namespace o11 {
@@ -75,6 +76,9 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
   cfg.anonymous_privs = o11proto::kPrivChat | o11proto::kPrivVote;
   cfg.bpm = DEFAULT_BPM;
   cfg.bpi = DEFAULT_BPI;
+  // benchmarks and tests: the hosted room's tempo
+  if (const char *v = getenv("O11_HOST_BPM")) if (atoi(v) > 0) cfg.bpm = (std::uint16_t)atoi(v);
+  if (const char *v = getenv("O11_HOST_BPI")) if (atoi(v) > 0) cfg.bpi = (std::uint16_t)atoi(v);
   cfg.max_users = MAX_USERS;
   cfg.allow_codecs = o11proto::kCapOpus | o11proto::kCapFlac;
   cfg.chosen_codec = o11proto::kCapOpus;
@@ -82,23 +86,38 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
   cfg.vote_threshold_percent = 1; // a single vote changes BPM or BPI
   cfg.log = [this](const std::string &line) { onLog(line); };
 
+  // Live (real-time audio over UDP, on the TCP port's number): first a port whose UDP is free
+  // too, then any port without Live. The room starts with Live on.
+  cfg.live.mode = env_is_off("O11_LIVE") ? o11proto::LiveMode::No : o11proto::LiveMode::Require;
+  // benchmarks: the room's Live Opus frame in samples at 48 kHz (120, 240 or 480; others: the default)
+  if (const char *v = getenv("O11_HOST_FRAME")) cfg.live.frame = atoi(v);
   std::unique_ptr<o11proto::Server> server(new o11proto::Server);
   int port = 0;
   const char *fixedPort = getenv("O11_HOST_PORT"); // the tests: 0 for any free port
-  for (int i = 0; i < PORTS_TO_TRY; i ++)
+  for (int pass = cfg.live.mode == o11proto::LiveMode::No ? 1 : 0; pass < 2 && !port; pass ++)
   {
-    cfg.port = (std::uint16_t)(fixedPort ? atoi(fixedPort) : FIRST_PORT + i);
-    if (server->start(cfg))
+    if (pass == 1) cfg.live.mode = o11proto::LiveMode::No;
+    for (int i = 0; i < PORTS_TO_TRY; i ++)
     {
-      port = server->port();
-      break;
+      cfg.port = (std::uint16_t)(fixedPort ? atoi(fixedPort) : FIRST_PORT + i);
+      if (server->start(cfg))
+      {
+        port = server->port();
+        break;
+      }
+      if (fixedPort) break;
     }
-    if (fixedPort) break;
   }
   if (!port)
   {
     if (error) *error = "Ports " + std::to_string(FIRST_PORT) + " to " + std::to_string(FIRST_PORT + PORTS_TO_TRY - 1) + " are in use by other programs.";
     return false;
+  }
+  const bool live = cfg.live.mode != o11proto::LiveMode::No && server->liveUdpOpen();
+  if (live)
+  {
+    cfg.live.mode = o11proto::LiveMode::On;
+    server->setLiveConfig(cfg.live);
   }
 
   const bool portmap = !env_is_off("O11_PORTMAP");
@@ -123,7 +142,7 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
   {
     m_mapper.reset(new o11proto::PortMapper);
     m_mapper->log = [this](const std::string &line) { onLog(line); };
-    m_mapper->start(port);
+    m_mapper->start(port, live); // with Live, its UDP port too
   }
   m_lookupStop = false;
   m_lookup = std::thread([this, port]() { lookUpPublicAddress(port); });
@@ -132,6 +151,9 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
 
 void HostServer::threadProc()
 {
+  // it relays Live's datagrams too: on macOS an ordinary thread's waits run up to 24 ms late,
+  // and every late relay is a dropout for the players it forwards to
+  o11proto::thread::makeNetworkThread();
   while (!m_quit)
   {
     m_server->poll(20);

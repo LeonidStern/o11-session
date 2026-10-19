@@ -1,6 +1,6 @@
 # Router port mapping specification
 
-Revision 1c, 2026-10-17. Companion to `PROTOCOL.md`. Describes the small
+Revision 1d, 2026-10-18. Companion to `PROTOCOL.md`. Describes the small
 library a hosted room uses to ask the home router to forward its TCP port, so
 that other players can reach a server behind NAT without the host configuring
 the router by hand. Written from the behaviour of the Jamsa server's port
@@ -25,7 +25,7 @@ class PortMapper {
 public:
     PortMapper();
     ~PortMapper();                  // Stop()
-    void start(int port);           // non-blocking; replaces any mapping for a previous port
+    void start(int port, bool udp = false);   // non-blocking; replaces any mapping for a previous port
     void stop();                    // blocks until the mapping is removed (bounded by router timeouts)
     std::function<void(const std::string&)> log;   // one line per event, no trailing newline
 };
@@ -36,7 +36,12 @@ bool isPrivateIPv4(const std::string& dotted);
 internet: 10/8, 172.16/12, 192.168/16, carrier-grade NAT 100.64/10, loopback
 127/8, link-local 169.254/16, and anything that is not a dotted IPv4 address.
 
-Every log line starts with `[portmap] `. The application shows the last line
+With `udp` (a server whose Live UDP port is open), the UDP port of the same
+number is mapped too (section 5); the application calls `start()` again when
+either changes.
+
+Every log line starts with `[portmap] `, except the Live warning of section
+5. The application shows the last line
 to the user and parses nothing else, except that it treats a line containing
 `people can connect to <addr>:<port>` as success with that address, and any
 other line as "still trying" or a reason.
@@ -117,6 +122,27 @@ report it, return the granted lifetime.
 
 If neither works, return -1.
 
+**UDP for Live** (with `start(port, true)`; PROTOCOL.md 15.8). Right after
+the TCP mapping and at every renewal, by the same method: UPnP with the same
+ports, address, description and lease as TCP (0 with a permanent-only
+router); NAT-PMP asking for the public port TCP was granted, lifetime 3600,
+counted as working only when the router grants exactly that port. A UDP
+failure never fails the TCP mapping. The `router forwards` lines of section 7
+say `TCP and UDP port` while UDP works, and the `removed the forward` lines
+of section 6 when UDP was removed too; the first line
+says `asking the router to forward TCP and UDP port <port> to this machine`
+whenever UDP is asked for, and the no-router line asks to forward `TCP port
+<port> on your router to this machine by hand, and UDP port <port> for Live,
+or turn on UPnP …`. A failure is logged once, until UDP works again, and not
+as a `[portmap] ` line (a hosting plug-in keeps showing the address people
+connect to): `warning: Live: the router did not forward UDP port <port>
+(<why>), so players outside your network can't play Live with you: while the
+room is Live they hear no one, and no one hears them (!live off puts everyone
+on intervals)`, with `<why>` one of `UPnP: the router forwards it to another
+machine`, `UPnP error <n>`, `NAT-PMP: the router did not answer`, `NAT-PMP
+error <n>`, `NAT-PMP: it gave public port <p>, not <q>`. When removing, UDP
+goes first, quietly.
+
 ## 6. Removing
 
 UPnP: DeletePortMapping for the port; log `[portmap] UPnP: removed the forward
@@ -175,6 +201,11 @@ written in C++ or as a Python script started by the test, and a `NOTES.md`
 line for anything this document left open.
 
 ## 10. Revision history
+
+- **1d** (2026-10-18): the UDP port for Live (sections 2 and 5), as the
+  library does it: `start(port, udp)`, the `TCP and UDP` lines, and the Live
+  warning, which says that while the room is Live the players outside the
+  network hear no one and no one hears them.
 
 - **1c** (2026-10-17): the mapping thread blocks SIGPIPE for itself (section 4).
 
