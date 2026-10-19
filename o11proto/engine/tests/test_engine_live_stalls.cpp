@@ -4,7 +4,7 @@
 // a delay: a hole in the sender's audio makes the block its host's first
 // block after the stall completes late, and two late dropouts within 10 s
 // fall back to the larger buffer, a case of its own), in rooms with Live
-// frames of 120 and of 240. The host
+// frames of 120 and of 240, each case in a room of its own. The host
 // stops calling one player's process(), or both players', for a while, as
 // a host that stalls does; each player's engine finds its own gap, and the
 // sender's xrun blocks tell the listener of its gap (6.4). A stall that
@@ -173,7 +173,17 @@ void print(const char* who, int frame, const View& v) {
     (void)frame;
 }
 
-void stalls(int frame) {
+// Each case in a room of its own. A stall that one host alone misses moves
+// a listener's delay: a listener whose sender's host stalled conceals the
+// hole and the frame that came late after it (as before this host's gaps
+// changed), and one whose own host stalled skips the time missed to the
+// nearest block. The speed then takes the delay back to its level over tens
+// of seconds (6.9: 0.1 of the fill's error a second, past a 2 ms dead band).
+// A case after it in the same room found the delay some ms up and still
+// moving: a few hundred ppm slide it 5-10 frames over the half second its
+// lag is found from, which smears the noise's correlation (sharp to a few
+// frames) to 0.6 or less; and what each case left added up.
+void stallCase(int frame, const Case& c) {
     Options o;
     o.block = 128;
     o.live_frame = frame;
@@ -188,17 +198,80 @@ void stalls(int frame) {
     REQUIRE(r.roomIs(true, 30));
     Players p(r, frame);
     REQUIRE(r.until([&] { return (p.u[0] = userIndex(r[0], "bob")) >= 0 && (p.u[1] = userIndex(r[1], "alice")) >= 0; }, 5));
-    r.wait(2.5);                                 // the automatic buffer settles
+    r.wait(2.5);                                 // the buffer settles
     {
         const long now = r.frames.load();
         for (int l = 0; l < 2; ++l) {
-            double c = 0;
-            const long d = p.lag(l, now - 24000, now - 4800, 0, 9600, &c);
-            std::printf("    frame %d: %s hears %s %.1f ms late (correlation %.2f)\n", frame, r[l].name.c_str(),
-                        r[1 - l].name.c_str(), d / 48.0, c);
-            REQUIRE(c > 0.6);
+            double cr = 0;
+            const long d = p.lag(l, now - 24000, now - 4800, 0, 9600, &cr);
+            std::printf("    frame %d, %s: %s hears %s %.1f ms late (correlation %.2f)\n", frame, c.what,
+                        r[l].name.c_str(), r[1 - l].name.c_str(), d / 48.0, cr);
+            REQUIRE(cr > 0.6);
         }
     }
+    r.wait(2.0);                                 // the buffering's dropouts, if any, are 2 s old (6.4)
+    const bool advice_before = !noAdvice(r[0]) || !noAdvice(r[1]);
+    View v[2];
+    const bool calm = p.run(c, v);
+    std::printf("    frame %d, %s%s\n", frame, c.what, calm ? "" : " (the machine had a hiccup: not checked)");
+    for (int l = 0; l < 2; ++l) {
+        char who[64];
+        std::snprintf(who, sizeof(who), "%s hears %s", r[l].name.c_str(), r[1 - l].name.c_str());
+        print(who, frame, v[l]);
+    }
+    if (!calm) return;
+    for (int l = 0; l < 2; ++l) {
+        if (v[l].stray) continue;
+        // Listener l, its host's stall `mine`, the sender's `theirs`.
+        const Stall mine = c.s[l], theirs = c.s[1 - l];
+        const long missed = mine.blocks * 128L, sent = theirs.blocks * 128L;
+        const long m0 = mine.from * 128L, m1 = m0 + missed, s0 = theirs.from * 128L, s1 = s0 + sent;
+        const long both = mine.blocks && theirs.blocks ? std::max(0L, std::min(m1, s1) - std::max(m0, s0)) : 0;
+        const View& w = v[l];
+        CHECK(w.corr_before > 0.6 && w.corr_after > 0.6);
+        CHECK_EQ(w.d.overflows, 0);
+        CHECK_EQ(w.d.lost, 0);
+        CHECK_EQ(w.d.skips, 0);
+        CHECK_EQ(w.d.host_gaps, mine.blocks ? 1 : 0);
+        if (mine.blocks && mine.blocks == theirs.blocks && both > 0) {
+            // 1: alike, also a block or two apart: not heard.
+            CHECK_EQ(w.d.concealed, 0);
+            CHECK_EQ(w.d.underruns, 0);
+            CHECK_EQ(w.d.xruns, 0);
+            CHECK_EQ(w.d.late, 0);
+            CHECK_EQ(w.d.host_gap_frames, 0);
+            CHECK(std::labs(w.after - w.before) <= 128);
+        } else if (mine.blocks && !theirs.blocks) {
+            // 2: this host's alone: as much skipped, the delay kept.
+            CHECK_EQ(w.d.concealed, 0);
+            CHECK_EQ(w.d.underruns, 0);
+            CHECK(std::labs(w.d.host_gap_frames - missed) <= frame / 2);
+            CHECK(std::labs(w.after - w.before) <= frame / 2 + 128);
+        } else if (!mine.blocks && theirs.blocks) {
+            // 3: the sender's alone: the hole concealed, as before this
+            // host's gaps changed. In real time, and so in the cases
+            // below, a little more: the frames its host's first block
+            // after the stall completes (one or two) come after their
+            // turn, late, and the xrun blocks after them.
+            CHECK_EQ(w.d.xruns, 1);
+            CHECK(w.d.concealed >= sent - frame && w.d.concealed <= sent + 3 * frame);
+            CHECK(std::labs(w.after - w.before) <= frame + 128);
+        } else {
+            // 4: in between.
+            CHECK(w.d.concealed <= std::max(0L, sent - missed) + 3 * frame);
+            CHECK(w.d.host_gap_frames <= std::max(0L, missed - sent) + frame);
+            CHECK(std::labs(w.after - w.before) <= frame + 2 * 128);
+        }
+    }
+    // No dropout, so no advice (16.7).
+    if (c.s[0].blocks && c.s[0].blocks == c.s[1].blocks && !advice_before && !v[0].stray && !v[1].stray) {
+        const bool none = noAdvice(r[0]) && noAdvice(r[1]);
+        std::printf("      advice: %s\n", none ? "none" : "some");
+        CHECK(none);
+    }
+}
+
+void stalls(int frame) {
     const Case cases[] = {
         {"both hosts miss 32 ms", {{0, 12}, {0, 12}}},
         {"both hosts miss 80 ms", {{0, 30}, {0, 30}}},
@@ -209,68 +282,7 @@ void stalls(int frame) {
         {"alice's host misses 32 ms, bob's 45 ms", {{0, 12}, {0, 17}}},
         {"alice's host misses 53 ms, bob's 21 ms within it", {{0, 20}, {6, 8}}},
     };
-    for (const Case& c : cases) {
-        r.wait(2.0);                             // the last case's dropouts are 2 s old (6.4)
-        const bool advice_before = !noAdvice(r[0]) || !noAdvice(r[1]);
-        View v[2];
-        const bool calm = p.run(c, v);
-        std::printf("    frame %d, %s%s\n", frame, c.what, calm ? "" : " (the machine had a hiccup: not checked)");
-        for (int l = 0; l < 2; ++l) {
-            char who[64];
-            std::snprintf(who, sizeof(who), "%s hears %s", r[l].name.c_str(), r[1 - l].name.c_str());
-            print(who, frame, v[l]);
-        }
-        if (!calm) continue;
-        for (int l = 0; l < 2; ++l) {
-            if (v[l].stray) continue;
-            // Listener l, its host's stall `mine`, the sender's `theirs`.
-            const Stall mine = c.s[l], theirs = c.s[1 - l];
-            const long missed = mine.blocks * 128L, sent = theirs.blocks * 128L;
-            const long m0 = mine.from * 128L, m1 = m0 + missed, s0 = theirs.from * 128L, s1 = s0 + sent;
-            const long both = mine.blocks && theirs.blocks ? std::max(0L, std::min(m1, s1) - std::max(m0, s0)) : 0;
-            const View& w = v[l];
-            CHECK(w.corr_before > 0.6 && w.corr_after > 0.6);
-            CHECK_EQ(w.d.overflows, 0);
-            CHECK_EQ(w.d.lost, 0);
-            CHECK_EQ(w.d.skips, 0);
-            CHECK_EQ(w.d.host_gaps, mine.blocks ? 1 : 0);
-            if (mine.blocks && mine.blocks == theirs.blocks && both > 0) {
-                // 1: alike, also a block or two apart: not heard.
-                CHECK_EQ(w.d.concealed, 0);
-                CHECK_EQ(w.d.underruns, 0);
-                CHECK_EQ(w.d.xruns, 0);
-                CHECK_EQ(w.d.late, 0);
-                CHECK_EQ(w.d.host_gap_frames, 0);
-                CHECK(std::labs(w.after - w.before) <= 128);
-            } else if (mine.blocks && !theirs.blocks) {
-                // 2: this host's alone: as much skipped, the delay kept.
-                CHECK_EQ(w.d.concealed, 0);
-                CHECK_EQ(w.d.underruns, 0);
-                CHECK(std::labs(w.d.host_gap_frames - missed) <= frame / 2);
-                CHECK(std::labs(w.after - w.before) <= frame / 2 + 128);
-            } else if (!mine.blocks && theirs.blocks) {
-                // 3: the sender's alone: the hole concealed, as before this
-                // host's gaps changed. In real time, and so in the cases
-                // below, a little more: the frames its host's first block
-                // after the stall completes (one or two) come after their
-                // turn, late, and the xrun blocks after them.
-                CHECK_EQ(w.d.xruns, 1);
-                CHECK(w.d.concealed >= sent - frame && w.d.concealed <= sent + 3 * frame);
-                CHECK(std::labs(w.after - w.before) <= frame + 128);
-            } else {
-                // 4: in between.
-                CHECK(w.d.concealed <= std::max(0L, sent - missed) + 3 * frame);
-                CHECK(w.d.host_gap_frames <= std::max(0L, missed - sent) + frame);
-                CHECK(std::labs(w.after - w.before) <= frame + 2 * 128);
-            }
-        }
-        // No dropout, so no advice (16.7).
-        if (c.s[0].blocks && c.s[0].blocks == c.s[1].blocks && !advice_before && !v[0].stray && !v[1].stray) {
-            const bool none = noAdvice(r[0]) && noAdvice(r[1]);
-            std::printf("      advice: %s\n", none ? "none" : "some");
-            CHECK(none);
-        }
-    }
+    for (const Case& c : cases) stallCase(frame, c);
 }
 
 }  // namespace
