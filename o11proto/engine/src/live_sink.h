@@ -269,7 +269,27 @@ public:
     // plays out, then the concealment, for the mixer to fade out (16.8).
     void drop();
     void apply(const SinkItem& it, std::int64_t now_ns);
-    void hostGap(int host_frames, int host_rate, std::int64_t now_ns);   // skip that much of the stream (6.9)
+    // This host's own gaps (6.9, ENGINE.md 16.6). A block that starts too
+    // late is reported (hostLate(): the time missed so far, which the host
+    // may still catch up), then either the gap at the next block that isn't
+    // early (hostGap(): the time missed for good) or that the host caught
+    // up after all (hostCaughtUp()). The stream goes on playing where it
+    // was: the time this host missed is owed to the stream's delay. Xrun
+    // blocks of the sender (its host missed time too) that come within
+    // kGapWindow48 of it take that time back: they are absorbed, take no
+    // turn and are neither concealed nor counted, so a stall that hits both
+    // hosts alike is neither heard nor moves the delay. What the xrun
+    // blocks don't take back is skipped of the stream's own audio once the
+    // window closes, as the delay needs: to the nearest block when no xrun
+    // blocks came; when some did, up to a block and gapSlack48() of it is
+    // their rounding and the hosts' measures differing, so what is left
+    // after the slack goes in whole blocks, rounded down, and never takes
+    // the delay below where it was by a frame or more. A stream still
+    // finding its delay skips the time missed at once.
+    void hostLate(int host_frames, int host_rate, std::int64_t now_ns);
+    void hostGap(int host_frames, int host_rate, std::int64_t now_ns);
+    void hostCaughtUp();
+    static constexpr int kGapWindow48 = 4800;   // 100 ms of the stream played
     // Before each block's apply(): how far (48 kHz samples) the host's
     // block is behind its schedule, catching up on a stall. The stream went
     // on arriving meanwhile, so the buffer holds that much more without
@@ -293,15 +313,18 @@ public:
     bool hasStream() const { return phase_ != Idle; }
     bool playing() const { return phase_ == Playing; }
     bool tailing() const { return phase_ == Idle && tail48_ > 0; }
-    int heldBlocks() const { return newest_ >= next_ ? static_cast<int>(newest_ - next_ + 1) : 0; }
+    // The blocks held from the next to play to the newest, absorbed xrun
+    // blocks left out.
+    int heldBlocks() const { return newest_ >= next_ ? static_cast<int>(newest_ - next_ + 1) - absorbed_ : 0; }
     const SinkSizes& sizes() const { return sizes_; }
     SinkStats stats;
 
 private:
     enum Phase { Idle, Buffering, Playing, Dry };
     // Passed: missing at its turn and concealed; if it comes after all, it
-    // was late, not lost.
-    enum State : std::uint8_t { Empty, Missing, Full, XrunBlock, Passed };
+    // was late, not lost. Absorbed: an xrun block that this host's own gap
+    // took back (hostGap()): it takes no turn.
+    enum State : std::uint8_t { Empty, Missing, Full, XrunBlock, Passed, Absorbed };
     struct Entry {
         std::int32_t seq = -1;
         State state = Empty;
@@ -315,17 +338,53 @@ private:
     void emptyFrom(std::int32_t seq);           // forget every block, go on from `seq`
     void take(std::int32_t seq, const SinkItem& it, std::int64_t now_ns);
     void dropBefore(std::int64_t seq);          // the blocks before `seq` go unplayed
+    // Goes on from `seq`: the blocks before it go unplayed, and the
+    // absorbed ones among them, which take no turn, bring the turns after
+    // them a block nearer each.
+    void advanceTo(std::int64_t seq);
+    bool absorbedAt(std::int64_t seq) const {
+        if (seq < next_ || seq > newest_ || seq >= next_ + kRing) return false;
+        const Entry& e = ring_[seq & (kRing - 1)];
+        return e.seq == seq && e.state == Absorbed;
+    }
+    // The position `count` blocks on from next_, absorbed blocks not
+    // counted, and past any absorbed ones there.
+    std::int64_t blocksOn(std::int64_t count) const;
     std::int64_t turn() const { return (played48_ - align_) / block_; }   // the block whose turn it is on align_
+    std::int64_t due() const;                   // the same, absorbed blocks from next_ on taking no turn
     int behindBlocks() const { return (behind48_ + block_ / 2) / block_; }
     // How many blocks from next_ it may hold: the capacity, and what came
     // while the host was behind.
     // And after a path change (all-to-all), what a shorter path brings
     // early, until the speed has played the fill back into the capacity.
+    // And while this host's gap is owed, that much more, and the absorbed
+    // xrun blocks.
     std::int64_t room() const {
         int extra = behind48_ > 0 ? (behind48_ + block_ - 1) / block_ + 1 : 0;
         if (path_room_) extra += (kPathRoom48 + block_ - 1) / block_;
+        if (gap_open_ && gap_owed48_ > 0) extra += static_cast<int>((gap_owed48_ + block_ - 1) / block_) + 1;
+        extra += absorbed_;
         return std::min(kRing - 2, sizes_.capacity_blocks + extra);
     }
+    // This host's gap (hostGap()): opens the window, or keeps it open
+    // kGapWindow48 from now, and absorbs the xrun blocks held.
+    void openGap(std::int64_t now_ns);
+    void absorbHeld();
+    void absorb(std::int64_t seq);              // an xrun block held, while the gap is owed
+    void unabsorb(std::int64_t above);          // the newest absorbed ones again, while more were absorbed than owed
+    // How far two hosts' measures of the same gap may differ: a host block
+    // (each measures it from its own blocks' starts), 1 ms at least.
+    std::int64_t gapSlack48() const {
+        return std::max<std::int64_t>(48, host_rate_ > 0 ? static_cast<std::int64_t>(host_block_) * 48000 / host_rate_ : 0);
+    }
+    // An xrun block is absorbed while more is owed than this: up to the
+    // slack less than nothing, as the sender's xrun blocks are whole frames
+    // and its measure may be the longer; once more xrun blocks came than
+    // that (the sender's gap was the longer), to the nearest block.
+    std::int64_t absorbAbove() const { return gap_longer_ ? block_ / 2 : -gapSlack48(); }
+    void closeGap(std::int64_t now_ns);         // the window closes: skips what is still owed
+    void forgetGap();                           // a new delay: nothing is owed
+    void skipBlocks(std::int64_t n, std::int64_t now_ns);   // n blocks of the stream for this host's gap
     // A path change (SinkItem::Path): a shorter path brings the blocks
     // early, which the room above takes and the speed then plays back to
     // the fill it keeps. A longer one brings them late, as any path that
@@ -427,6 +486,15 @@ private:
     int late48_ = 0;                            // 48 kHz samples of that with nothing in time for its turn
     std::int64_t last_xrun48_ = -(1LL << 40);
     int tail48_ = 0;                            // 48 kHz samples of concealment left after the stream
+    // This host's gap (hostGap()): what it owes the delay (48 kHz samples,
+    // less the xrun blocks absorbed), of that what hostLate() gave and
+    // hostGap() hasn't yet confirmed, and the window in which xrun blocks
+    // are absorbed: open until played48_ reaches gap_until48_.
+    std::int64_t gap_owed48_ = 0, gap_late48_ = 0, gap_until48_ = 0;
+    // Open; hostGap() came in it; more xrun blocks came than it owed.
+    bool gap_open_ = false, gap_confirmed_ = false, gap_longer_ = false;
+    int gap_absorbed_ = 0;                      // xrun blocks absorbed in this window
+    int absorbed_ = 0;                          // absorbed blocks from next_ to newest_
 };
 
 }  // namespace engine
