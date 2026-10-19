@@ -1239,6 +1239,61 @@ void printStall(const char* what, int frame, const StallResult& r) {
 // was. 4: in between (different lengths, one host a block or two after
 // the other, stalls that overlap in part), no more is concealed than the
 // sender's audio really misses, and no more skipped than the delay needs.
+// 6.9, after a gap is reported (GapBack): what the host caught up on, at
+// 128-frame blocks of 48 kHz. Each block is given by how late it starts
+// (ms) on the host's schedule; early is as audioBlock() has it, under
+// 90 % of a block after the block before.
+namespace {
+double gapBackMs(double report_late_ms, const std::vector<double>& late_ms) {
+    const std::int64_t dur = 128 * 1000000000LL / 48000;
+    auto at = [&](std::size_t k, double ms) { return static_cast<std::int64_t>(k) * dur + static_cast<std::int64_t>(ms * 1e6); };
+    GapBack g;
+    std::int64_t prev = at(0, report_late_ms), back = 0;
+    g.start(prev, 50000000);
+    for (std::size_t k = 1; k <= late_ms.size(); ++k) {
+        const std::int64_t now = at(k, late_ms[k - 1]);
+        back += g.block(now, dur, now - prev < dur * 9 / 10, false);
+        prev = now;
+    }
+    return back / 1e6;
+}
+}  // namespace
+
+TEST(gap_back_takes_back_only_a_catch_up) {
+    // The callbacks' jitter, no block early: nothing. (The 50 ms read
+    // before took the least late of them back: 1 ms here, which made a
+    // gap measured from a block a little late short, 1440 frames skipped
+    // for 1536 on a CI runner.)
+    CHECK_EQ(gapBackMs(1.0, {0.9, 1.1, 0.75, 0.5, 0.25, 0.0, 0.1, 0.0}), 0.0);
+    CHECK_EQ(gapBackMs(0.0, {0.2, 0.1, 0.3, 0.0, 0.2}), 0.0);
+    // Jitter with a block early (0.4 ms less late than the one before): under half a block, nothing.
+    CHECK_EQ(gapBackMs(1.0, {0.6, 0.5, 0.5}), 0.0);
+    // A wake 4 ms late at the gap's block, then the next block 0.05 ms
+    // after it (1.38 ms late) and the one after that on time, so early
+    // too: 4 ms back, read at the next, the first not early.
+    {
+        const double b = gapBackMs(4.0, {1.38, 0.0, 0.0, 0.0});
+        std::printf("    a wake 4 ms late, caught up: %.3f ms back\n", b);
+        CHECK(std::fabs(b - 4.0) < 0.01);
+    }
+    // Caught up on part of it, the next block late again by 1 ms: 3 ms back.
+    CHECK(std::fabs(gapBackMs(4.0, {1.45, 1.0, 1.0}) - 3.0) < 0.01);
+    // Late and not caught up (its device ran on): nothing.
+    CHECK_EQ(gapBackMs(4.0, {4.0, 4.0, 4.1, 3.9}), 0.0);
+    // A host that calls four blocks back to back each period, the gap's
+    // block the first of them: the next period's first is on time, nothing.
+    CHECK_EQ(gapBackMs(0.0, {-2.6, -5.25, -7.9, 0.0, -2.6}), 0.0);
+    // Another gap before the read: nothing.
+    {
+        const std::int64_t dur = 128 * 1000000000LL / 48000;
+        GapBack g;
+        g.start(4000000, 50000000);
+        CHECK_EQ(g.block(dur + 100000, dur, true, false), 0);
+        CHECK_EQ(g.block(2 * dur, dur, false, true), 0);
+        CHECK_EQ(g.block(3 * dur, dur, false, false), 0);
+    }
+}
+
 TEST(sink_host_stalls_alike_are_not_heard) {
     for (int frame : {120, 240}) {
         for (int blocks : {8, 12, 17, 30, 75}) {   // 21 to 200 ms

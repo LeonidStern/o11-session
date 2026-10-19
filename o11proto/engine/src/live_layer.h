@@ -15,6 +15,7 @@
 #ifndef O11PROTO_ENGINE_LIVE_LAYER_H
 #define O11PROTO_ENGINE_LIVE_LAYER_H
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -57,6 +58,56 @@ int liveLongestGoodBlock(int host_rate);
 bool parseWholeNumber(const std::string& s, long* out);
 // A user name as Live texts show it (6.5).
 std::string liveDisplayName(const std::string& name);
+
+// After this host reports a gap (6.9): how much of it the host then
+// caught up on, so didn't miss (audio context; LiveLayer::audioBlock(),
+// LiveSink::hostGapBack()). The block that reported the gap may itself
+// have come late, the host not yet back on its schedule after a wake some
+// ms late, and the gap is long by that much; the host then catches up with
+// blocks that come early (under 90 % of a block after the one before),
+// back to back. Only such a catch-up says anything: at the first block
+// after it that isn't early, so on the host's own schedule again, by as
+// much as that block comes before the schedule the gap's block began, the
+// gap was shorter. When the block after the gap's isn't early, there was
+// no catch-up and nothing is taken back: a block that comes a little before
+// that schedule is the callbacks' own jitter, as the block before the stall
+// that the gap is measured from may have come a little late, and taking
+// the one back without the other would make the gap short; nor is under
+// half a block, after a few early blocks. Read once; a block late again,
+// or 50 ms without one that isn't early, ends it.
+struct GapBack {
+    // The block that reported a gap of `gap_ns` began at `now_ns`.
+    void start(std::int64_t now_ns, std::int64_t gap_ns) {
+        sched_ns_ = from_ns_ = now_ns;
+        gap_ns_ = gap_ns;
+        early_ = false;
+    }
+    // Each block after it: when it began, the length of the block before
+    // it, whether it came early, and whether it is late again (a new gap
+    // noted or reported). The ns of the gap the host caught up on, read at
+    // this block; 0 at every other.
+    std::int64_t block(std::int64_t now_ns, std::int64_t prev_dur_ns, bool early, bool late) {
+        if (gap_ns_ <= 0) return 0;
+        sched_ns_ += prev_dur_ns;
+        if (late || sched_ns_ - from_ns_ > kWindowNs) {
+            gap_ns_ = 0;
+            return 0;
+        }
+        if (early) {
+            early_ = true;
+            return 0;
+        }
+        // Under half a block it is the callbacks' jitter all the same.
+        const std::int64_t back = early_ ? std::min(sched_ns_ - now_ns, gap_ns_) : 0;
+        gap_ns_ = 0;
+        return back >= prev_dur_ns / 2 ? back : 0;
+    }
+    static constexpr std::int64_t kWindowNs = 50000000LL;   // 50 ms
+
+private:
+    std::int64_t sched_ns_ = 0, from_ns_ = 0, gap_ns_ = 0;
+    bool early_ = false;                        // a block came early after the gap's: the host catching up
+};
 
 // One user's channel 0 in the mixer (audio context; ENGINE.md 16.8): its
 // interval audio and its live audio, each through a short delay line so
@@ -329,12 +380,7 @@ private:
     bool gate_open_ = false;
     std::int64_t expect_ns_ = 0, prev_start_ns_ = 0, prev_dur_ns_ = 0;
     bool late_pending_ = false;
-    // After a gap is reported: the schedule its block began, held through
-    // the blocks after it (when each is due on it), the gap, what of it the
-    // host has caught up since and so missed after all, and the host frames
-    // since, for kGapBackNs (audioBlock()).
-    std::int64_t back_sched_ns_ = 0, back_gap_ns_ = 0, back_ns_ = 0, back_frames_ = 0;
-    static constexpr std::int64_t kGapBackNs = 50000000LL;   // 50 ms
+    GapBack gap_back_;                          // after a gap is reported (audioBlock())
     // The host's schedule: when this block is due on it, held through a
     // late block and the blocks that catch up on it (audioBlock()).
     std::int64_t sched_ns_ = 0;
