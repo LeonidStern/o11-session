@@ -1129,10 +1129,10 @@ TEST(listening_file) {
     for (long n = start; n < end; ++n) heard_peak = std::max(heard_peak, std::fabs(r[2].heard[n]));
     std::printf("    what carl hears peaks at %.1f dBFS\n", 20 * std::log10(heard_peak));
     if (!tones) CHECK(heard_peak < 0.5f);
-    std::FILE* f = std::fopen(txt.c_str(), "w");
-    REQUIRE(f);
+    std::FILE* notes = std::fopen(txt.c_str(), "w");
+    REQUIRE(notes);
     if (tones)
-        std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is steady tones: alice plays\n"
+        std::fprintf(notes, "%s: what carl hears, 48 kHz mono, %.1f s. The music is steady tones: alice plays\n"
                         "440 Hz and a quiet 3520 Hz (-20 dB), bob 660 Hz, each at about -12 dBFS, from a 50 ms\n"
                         "fade-in at the players' frame 0 on, without a break; carl sends nothing. The room is at\n"
                         "%d bpm, the timeline is the drum file's (live-transitions.wav). A slot without audio is\n"
@@ -1144,7 +1144,7 @@ TEST(listening_file) {
                      wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
                      kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
     else
-        std::fprintf(f, "%s: what carl hears, 48 kHz mono, %.1f s. The music is 909-style drums, synthesized,\n"
+        std::fprintf(notes, "%s: what carl hears, 48 kHz mono, %.1f s. The music is 909-style drums, synthesized,\n"
                         "at %d bpm, one bar per interval: alice plays the kick and the snare, bob the closed and open\n"
                         "hi-hats and the clap; carl sends nothing. A slot without audio is concealed for %.0f x B =\n"
                         "%.0f ms from where carl's concealment begins (\"the gap reaches carl\"), then fades out over\n"
@@ -1154,8 +1154,8 @@ TEST(listening_file) {
                         "start.\n\n",
                      wav.c_str(), double(end - start) / o.rate, o.bpm, kLiveConcealBuffers,
                      kLiveConcealBuffers * r[2].e.liveBufferInUseMs(), kLiveFadeMs, kLiveFadeMs, start);
-    for (const Event& e : ev) std::fprintf(f, "%7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
-    std::fclose(f);
+    for (const Event& e : ev) std::fprintf(notes, "%7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
+    std::fclose(notes);
     std::printf("    wrote %s (%.1f s) and %s:\n", wav.c_str(), double(end - start) / o.rate, txt.c_str());
     for (const Event& e : ev) std::printf("      %7.3f  %s\n", double(e.frame - start) / o.rate, e.text.c_str());
 

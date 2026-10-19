@@ -325,7 +325,7 @@ TEST(sink_counters_and_log) {
     std::vector<float> pcm(2 * 240);
     long n = 0;
     auto block = [&](std::int32_t seq) {        // a 440 Hz tone, block `seq`
-        for (int i = 0; i < 240; ++i, ++n) pcm[2 * i] = pcm[2 * i + 1] = 0.3f * std::sin(2 * M_PI * 440.0 * n / 48000);
+        for (int i = 0; i < 240; ++i, ++n) pcm[2 * i] = pcm[2 * i + 1] = static_cast<float>(0.3f * std::sin(2 * M_PI * 440.0 * n / 48000));
         SinkItem it = item(SinkItem::Data, seq);
         it.len = static_cast<std::uint16_t>(opus_encode_float(enc, pcm.data(), 240, it.data, 1275));
         return it;
@@ -432,7 +432,7 @@ struct Feed {
     Feed(const Feed&) = delete;
     Feed& operator=(const Feed&) = delete;
     SinkItem block(std::int32_t s) {
-        for (int i = 0; i < 240; ++i, ++n) pcm[2 * i] = pcm[2 * i + 1] = 0.3f * std::sin(2 * M_PI * 440.0 * n / 48000);
+        for (int i = 0; i < 240; ++i, ++n) pcm[2 * i] = pcm[2 * i + 1] = static_cast<float>(0.3f * std::sin(2 * M_PI * 440.0 * n / 48000));
         SinkItem it = item(SinkItem::Data, s);
         it.len = static_cast<std::uint16_t>(opus_encode_float(enc, pcm.data(), 240, it.data, 1275));
         return it;
