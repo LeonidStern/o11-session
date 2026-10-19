@@ -9,6 +9,8 @@
 
 #include <math.h>
 
+#include <algorithm>
+
 namespace o11 {
 
 static const double PI = 3.14159265358979323846;
@@ -36,9 +38,15 @@ double Click::sample(bool accent, int n, double sampleRate)
 void Click::setSampleRate(double sampleRate)
 {
   if (sampleRate <= 0) return;
+  m_n = -1;
+  if (sampleRate == m_sampleRate && m_samples[0].size() == (size_t)m_length) return; // made already
   m_sampleRate = sampleRate;
   m_length = length(sampleRate);
-  m_n = -1;
+  for (int accent = 0; accent < 2; accent ++)
+  {
+    m_samples[accent].resize((size_t)m_length);
+    for (int n = 0; n < m_length; n ++) m_samples[accent][(size_t)n] = sample(accent != 0, n, sampleRate);
+  }
 }
 
 void Click::reset()
@@ -69,7 +77,8 @@ void Click::render(float *left, float *right, int frames, int start, int len, in
     if (k < bpi) next = beat_start(k, len, bpi);
   }
 
-  for (int i = 0; i < frames; i ++)
+  // a stretch at a time: up to the next beat, or the end of the click playing
+  for (int i = 0; i < frames; )
   {
     if (start + i == next)
     {
@@ -77,14 +86,30 @@ void Click::render(float *left, float *right, int frames, int start, int len, in
       m_accent = k == 0;
       next = ++k < bpi ? beat_start(k, len, bpi) : -1;
     }
-    if (m_n < 0) continue;
+    int until = frames;
+    const long long beat = next - start;
+    if (beat > i && beat < until) until = (int)beat;
+    if (m_n < 0)
+    {
+      i = until; // silence until then
+      continue;
+    }
+    const int count = std::min(until - i, m_length - m_n);
     if (volume > 0)
     {
-      const float v = (float)(sample(m_accent, m_n, m_sampleRate) * volume);
-      left[i] += v;
-      if (right) right[i] += v;
+      const std::vector<double> &made = m_samples[m_accent ? 1 : 0];
+      for (int j = 0; j < count; j ++)
+      {
+        const int n = m_n + j;
+        const double s = (size_t)n < made.size() ? made[(size_t)n] : sample(m_accent, n, m_sampleRate);
+        const float v = (float)(s * volume);
+        left[i + j] += v;
+        if (right) right[i + j] += v;
+      }
     }
-    if (++m_n >= m_length) m_n = -1;
+    m_n += count;
+    i += count;
+    if (m_n >= m_length) m_n = -1;
   }
 }
 

@@ -304,6 +304,13 @@ public:
   static std::string firstName(const std::string &fullName); // "Leo Stern" is "Leo"
 
 private:
+  // one setting, without a copy of the rest (the network thread reads some at each wake)
+  template <typename T> T setting(T Settings::*field) const
+  {
+    std::lock_guard<std::mutex> lock(m_settingsMutex);
+    return m_settings.*field;
+  }
+
   void threadProc();
   void post(std::function<void()> fn);
   void runCommands();
@@ -362,7 +369,7 @@ private:
   int m_maxBlock = 0;
   std::vector<float> m_bufL, m_bufR, m_spare;
   std::vector<float> m_monL, m_monR;      // the input, for your monitoring
-  std::vector<std::vector<float>> m_mix;  // the engine's outputs: the main pair, then a pair per player output
+  std::vector<std::vector<float>> m_mix;  // the engine's outputs: the main pair, then a pair per player output (one the host doesn't use)
   std::atomic<bool> m_monitor { true };
   std::atomic<bool> m_hostStopped { false }; // the host said it is stopped
   BarSync m_barSync;

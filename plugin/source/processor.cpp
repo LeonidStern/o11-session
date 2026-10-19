@@ -85,16 +85,23 @@ void O11Processor::processBlock(juce::AudioBuffer<float> &buffer, juce::MidiBuff
   const int frames = buffer.getNumSamples();
   if (frames <= 0) return;
 
+  // the buses' channels in the buffer, as getBusBuffer() finds them: the input from channel 0,
+  // the outputs one after the other from channel 0; a bus that is off has none
+  float *const *channels = buffer.getArrayOfWritePointers();
+  const int bufferChannels = buffer.getNumChannels();
+  auto busChannels = [this](bool isInput, int bus) {
+    const Bus *b = getBus(isInput, bus);
+    return b ? b->getNumberOfChannels() : 0;
+  };
+
   // the input, read before the main output is written (they may share buffers: the engine
   // copies its input first, piece by piece, and writes the output of each piece after)
-  juce::AudioBuffer<float> inBus = getBusBuffer(buffer, true, 0);
-  juce::AudioBuffer<float> outBus = getBusBuffer(buffer, false, 0);
-  if (outBus.getNumChannels() < 1) return;
+  const int mainOut = std::min(busChannels(false, 0), bufferChannels);
+  if (mainOut < 1) return;
   float *in[2] = { nullptr, nullptr };
   int numIn = 0;
-  if (getBus(true, 0)->isEnabled())
-    for (int c = 0; c < std::min(2, inBus.getNumChannels()); c ++) in[numIn++] = inBus.getWritePointer(c);
-  float *out[2] = { outBus.getWritePointer(0), outBus.getNumChannels() > 1 ? outBus.getWritePointer(1) : nullptr };
+  for (int c = 0; c < std::min({ 2, busChannels(true, 0), bufferChannels }); c ++) in[numIn++] = channels[c];
+  float *out[2] = { channels[0], mainOut > 1 ? channels[1] : nullptr };
 
   Engine::HostTiming timing;
   timing.offline = isNonRealtime();
@@ -107,18 +114,21 @@ void O11Processor::processBlock(juce::AudioBuffer<float> &buffer, juce::MidiBuff
 
   Engine::PlayerOuts players;
   float *playerChannels[Engine::NUM_PLAYER_OUTS][2];
+  int first = busChannels(false, 0); // the bus's first channel in the buffer
   for (int b = 1; b < getBusCount(false) && b <= Engine::NUM_PLAYER_OUTS; b ++)
   {
-    if (!getBus(false, b)->isEnabled()) continue;
-    juce::AudioBuffer<float> bus = getBusBuffer(buffer, false, b);
-    const int channels = std::min(2, bus.getNumChannels());
-    if (channels < 1) continue;
-    for (int c = 0; c < channels; c ++) playerChannels[b - 1][c] = bus.getWritePointer(c);
-    players.bus[b - 1] = playerChannels[b - 1];
-    players.channels[b - 1] = channels;
+    const int busCount = busChannels(false, b);
+    const int used = std::min({ 2, busCount, bufferChannels - first });
+    if (used >= 1)
+    {
+      for (int c = 0; c < used; c ++) playerChannels[b - 1][c] = channels[first + c];
+      players.bus[b - 1] = playerChannels[b - 1];
+      players.channels[b - 1] = used;
+    }
+    first += busCount;
   }
 
-  m_engine->process(in, numIn, out, outBus.getNumChannels() > 1 ? 2 : 1, frames, &timing, &players);
+  m_engine->process(in, numIn, out, mainOut > 1 ? 2 : 1, frames, &timing, &players);
 }
 
 juce::AudioProcessorEditor *O11Processor::createEditor()
