@@ -1000,8 +1000,10 @@ namespace {
 // and holds what came meanwhile, hostBehind()), the second confirms the
 // gap: the receiver's sink is told (hostGap()), and the sender sends its
 // xrun blocks (5.4: whole frames, the rest carried over), then the block's
-// audio. The sender plays a noise-like signal, sig(T), coded by Opus at the
-// room's frame; the receiver's output is kept by T.
+// audio. Or the sender's report comes at a later block (`report`), as when
+// the blocks before it came early (6.9): the frames those complete go
+// before the xrun blocks. The sender plays a noise-like signal, sig(T),
+// coded by Opus at the room's frame; the receiver's output is kept by T.
 struct StallSim {
     static constexpr int kHost = 128;
     static constexpr long kLen = 48000 * 4;      // 4 s
@@ -1030,6 +1032,8 @@ struct StallSim {
     std::int32_t seq = 0;
     double xrun48 = 0;
     int xruns_sent = 0;
+    int report = 2;                              // the sender's block after its stall that reports its gap (from 1)
+    int pre_report = 0;                          // the frames it sent after its stall before its xrun blocks
 
     explicit StallSim(int frame_size) : frame(frame_size) {
         int err = 0;
@@ -1067,7 +1071,9 @@ struct StallSim {
         const long t = b * kHost;
         if (b == 0) send(t, item(SinkItem::Start, 0, 0, static_cast<std::uint16_t>(frame)));
         if (stalled(send_stall, b)) return;
-        if (after(send_stall, b) == 2) {          // the gap: whole xrun blocks, the rest carried over
+        const long end = send_stall.from + send_stall.blocks;   // its first block after the stall
+        const bool gap = send_stall.from >= 0 && send_stall.blocks * kHost > 960;
+        if (gap && b == end + report - 1) {      // the gap: whole xrun blocks, the rest carried over
             xrun48 += send_stall.blocks * kHost + send_stall.off;
             const int n = static_cast<int>(xrun48 / frame);
             xrun48 -= static_cast<double>(n) * frame;
@@ -1078,6 +1084,7 @@ struct StallSim {
             captured[static_cast<std::size_t>(t + i)] = 1;
             pcm[2 * pcm_n] = pcm[2 * pcm_n + 1] = sig[static_cast<std::size_t>(t + i)];
             if (++pcm_n == frame) {
+                if (gap && b >= end && b < end + report - 1) ++pre_report;
                 SinkItem it = item(SinkItem::Data, seq++);
                 it.len = static_cast<std::uint16_t>(opus_encode_float(enc, pcm.data(), frame, it.data, 1275));
                 send(t, it);
@@ -1178,12 +1185,14 @@ struct StallResult {
     long before = 0, after = 0;
     double corr_before = 0, corr_after = 0;
     int xruns_sent = 0;
+    int pre_report = 0;                          // the frames the sender sent after its stall before its xrun blocks
     bool playing = false;
 };
 
 StallResult runStall(int frame, long send_at, int send_blocks, long recv_at, int recv_blocks, int net = 24,
-                     int jitter = 0, int send_off = 0, int recv_off = 0, int send_carry = 0) {
+                     int jitter = 0, int send_off = 0, int recv_off = 0, int send_carry = 0, int report = 2) {
     StallSim sim(frame);
+    sim.report = report;
     sim.xrun48 = send_carry;                     // what the sender carried over from gaps before
     sim.net = net;
     sim.jitter = jitter;
@@ -1198,6 +1207,7 @@ StallResult runStall(int frame, long send_at, int send_blocks, long recv_at, int
     r.c = Counts::of(sim.k.stats) - c0;
     r.after = sim.delay((first + 270) * StallSim::kHost, &r.corr_after);
     r.xruns_sent = sim.xruns_sent;
+    r.pre_report = sim.pre_report;
     r.playing = sim.k.playing();
     return r;
 }
@@ -1351,6 +1361,34 @@ TEST(sink_host_stalls_of_one_host) {
                 }
             }
         }
+        // 3, the sender's report of its gap put off by a block or two (6.9:
+        // the first block after the stall that doesn't come early reports
+        // it; one that comes early, its host catching up on a late wake or
+        // its callback jittering, puts it off): the frames its blocks
+        // complete until then go before its xrun blocks, their turns come
+        // in the hole, and they come late. The listener conceals their
+        // turns as well as the xrun blocks: the hole is as long as with the
+        // report on time, and the delay moves as much.
+        for (int report : {3, 4}) {
+            const long missed = 17 * 128L;
+            for (int phase = 0; phase < 3; ++phase) {
+                const StallResult r = runStall(frame, 700 + phase, 17, -1, 0, 24, 0, 0, 0, 0, report);
+                char what[112];
+                std::snprintf(what, sizeof(what), "the sender's host misses 45.3 ms, its report at its block %d after it (phase %d)",
+                              report, phase);
+                printStall(what, frame, r);
+                const long xrun = static_cast<long>(r.xruns_sent) * frame;
+                CHECK(r.playing);
+                CHECK_EQ(r.c.xruns, 1u);
+                CHECK_EQ(r.c.lost, 0u);
+                CHECK_EQ(r.c.overruns, 0u);
+                CHECK_EQ(r.c.skips, 0u);
+                CHECK(r.pre_report >= (report - 1) * 128 / frame);   // the blocks before the report complete frames
+                CHECK_EQ(static_cast<long>(r.c.late), static_cast<long>(r.pre_report));
+                CHECK_EQ(static_cast<long>(r.c.concealed), xrun + static_cast<long>(r.c.late) * frame);
+                CHECK(std::labs((r.after - r.before) - (xrun - missed)) <= 8);
+            }
+        }
     }
 }
 
@@ -1441,6 +1479,32 @@ TEST(sink_host_stalls_in_between) {
                 CHECK(static_cast<long>(r.c.concealed) <= std::max(0L, sent - missed) + 2 * frame);
                 CHECK(r.c.host_gap48 <= std::max(0L, missed - sent) + frame);
                 CHECK(r.after - r.before > -(frame + 128));
+                CHECK(r.after - r.before <= frame + 2 * 128);
+                CHECK_EQ(r.c.overruns, 0u);
+                CHECK_EQ(r.c.lost, 0u);
+            }
+        }
+        // And the sender's report put off by a block or two: the frames
+        // sent before its xrun blocks may come late (where this host's
+        // stall was the shorter); what is concealed less them stays within
+        // the bound above, and the delay and what is skipped as well.
+        for (int c : {0, 1, 3}) {
+            const Case& cs = cases[c];
+            for (int report : {3, 4}) {
+                const long at = 700;
+                const StallResult r = runStall(frame, at + cs.send_from, cs.send_blocks, at + cs.recv_from, cs.recv_blocks, 24,
+                                               0, 0, 0, 0, report);
+                char what[112];
+                std::snprintf(what, sizeof(what), "%s, the sender's report at its block %d after it", cs.what, report);
+                printStall(what, frame, r);
+                const long sent = cs.send_blocks * 128L, missed = cs.recv_blocks * 128L;
+                CHECK(r.playing);
+                CHECK(r.corr_after > 0.9);
+                CHECK(static_cast<long>(r.c.late) <= static_cast<long>(r.pre_report));
+                CHECK(static_cast<long>(r.c.concealed) - static_cast<long>(r.c.late) * frame <=
+                      std::max(0L, sent - missed) + 2 * frame);
+                CHECK(r.c.host_gap48 <= std::max(0L, missed - sent) + frame);
+                CHECK(r.after - r.before > -frame);
                 CHECK(r.after - r.before <= frame + 2 * 128);
                 CHECK_EQ(r.c.overruns, 0u);
                 CHECK_EQ(r.c.lost, 0u);

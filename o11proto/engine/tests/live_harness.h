@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -42,6 +43,7 @@ struct Side {
     std::unique_ptr<std::uint8_t[]> live;        // userLive(0) after each block
     std::unique_ptr<std::uint8_t[]> room;        // liveRoomLive() after each block
     std::unique_ptr<int[]> pos;                  // the interval position after each block
+    std::unique_ptr<std::int64_t[]> called;      // when the host called process() for each block (steady ns; 0: it didn't)
     std::atomic<long> clock_from{-1};            // the frame its interval clock started at, -1 before
     std::atomic<int> stall{0};                   // blocks the host doesn't call process() for
     // Or from the room's block `stall_at` on (-1: none), for `stall_len`
@@ -157,6 +159,7 @@ struct Room {
             s.live.reset(new std::uint8_t[static_cast<std::size_t>(max_blocks)]());
             s.room.reset(new std::uint8_t[static_cast<std::size_t>(max_blocks)]());
             s.pos.reset(new int[static_cast<std::size_t>(max_blocks)]());
+            s.called.reset(new std::int64_t[static_cast<std::size_t>(max_blocks)]());
             s.e.setMetronome(0, 0, true, 0);
             LocalChannel lc;
             lc.name = "tone";
@@ -289,6 +292,7 @@ struct Room {
                     }
                 }
                 const auto t0 = Clock::now();
+                sd.called[b] = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
                 sd.e.process(inp, 1, o, 2, B, opt.rate);
                 const long took =
                     static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
