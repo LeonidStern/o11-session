@@ -372,7 +372,6 @@ private:
   std::vector<std::vector<float>> m_mix;  // the engine's outputs: the main pair, then a pair per player output (one the host doesn't use)
   std::atomic<bool> m_monitor { true };
   std::atomic<bool> m_hostStopped { false }; // the host said it is stopped
-  float m_roomGain = 1.0f; // audio thread: the room in our outputs, faded to 0 while the host is stopped
   BarSync m_barSync;
   int64_t m_sampleTime = 0; // samples processed since setupProcessing()
   std::unique_ptr<LinkSync> m_link;

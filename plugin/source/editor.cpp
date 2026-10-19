@@ -762,7 +762,7 @@ void O11Editor::updateMyRow(const Snapshot &s, double now)
   {
     status = "paused: " + (s.hostChip.empty() ? std::string("DAW") : s.hostChip) + " stopped";
     color = Colors::amber();
-    tip = host + " is stopped, so you send and hear nothing: press play to join in";
+    tip = host + " is stopped, so you send nothing: press play to send";
   }
   else
   {
@@ -843,7 +843,7 @@ void O11Editor::updateFooter(const Snapshot &s)
   }
   else if (connected && s.sendPaused)
   {
-    text = host + " is stopped, so you send and hear nothing: press play to join in";
+    text = host + " is stopped, so you send nothing: press play to send";
     warn = true;
   }
   else if (!s.syncNote.empty())
