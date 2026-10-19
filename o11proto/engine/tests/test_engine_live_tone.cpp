@@ -902,10 +902,13 @@ void checkOneFallback(const RunResult& res) {
 
 // A jittery stream: from the start of the recording, alice's link holds
 // her datagrams for 10 to 20 ms (15 +- 5) every 0.5 to 1.5 s, then sends
-// them at once.
+// them at once. Frames of 240 samples, as in fixed_buffer_never_falls_back:
+// at the default of 480 these holds made few frames late in an 11 ms buffer
+// (a macOS runner: 2 of 16 spikes), and it fell back only after the 15 s.
 TEST(automatic_buffer_falls_back_on_jitter) {
     RunSetup setup;
     setup.seconds = 15;
+    setup.frame = 240;
     setup.buffer_ms[0] = setup.buffer_ms[1] = Engine::kLiveBufferAutomatic;
     setup.steps.push_back({0.0, [](ToneRoom& r) { r.startSpikes(0, 10, 20); }});
     setup.disturbed[1] = true;
