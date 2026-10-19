@@ -912,10 +912,12 @@ void O11Editor::updateRoom(const Snapshot &s, double)
   // the room's mode: Live (picking it switches everyone, from an interval's start), or intervals of
   // so many beats (picking one switches everyone to that length from the next interval)
   const bool liveHere = connected && s.liveServer;
+  // without the host's audio nothing plays, so the room's switch
+  const bool liveShown = liveHere && (s.audioRunning ? s.liveRoom : s.liveSwitchOn);
   m_mode->setEnabled(connected);
   m_mode->setEntryEnabled(0, liveHere);
   m_mode->setShown(!connected ? "\xe2\x80\x94"
-                   : liveHere && s.liveRoom ? uitext::liveModeText(true, s.liveHeardMs)
+                   : liveShown ? uitext::liveModeText(true, s.liveHeardMs)
                                             : uitext::intervalsModeText(bpi, false));
   {
     int index = -1;
