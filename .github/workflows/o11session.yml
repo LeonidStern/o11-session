@@ -7,6 +7,10 @@ name: o11session
 # Day to day (pushes to main, pull requests) only macOS builds and tests: that's where the
 # plug-in is tried by hand. Linux and Windows build too for a release candidate: a pushed tag
 # rc-<anything> (git tag rc-3 && git push origin rc-3), or a manual run with "all platforms".
+#
+# Pushes and pull requests skip the five long Live timing tests (LONG_TESTS, about 14 of the
+# 16 minutes on macOS). Those run every night on main, and on every release candidate or
+# all-platforms run.
 
 on:
   push:
@@ -15,6 +19,8 @@ on:
     paths: ['plugin/**', 'o11proto/**', '.github/workflows/o11session.yml']
   pull_request:
     paths: ['plugin/**', 'o11proto/**', '.github/workflows/o11session.yml']
+  schedule:
+    - cron: '0 2 * * *'   # nightly, main, every test
   workflow_dispatch:
     inputs:
       all_platforms:
@@ -26,6 +32,9 @@ permissions:
   contents: read
 
 env:
+  # the long Live timing tests, and whether this run includes them
+  LONG_TESTS: '^test_engine_live(_room|_tone|_paths|_stalls)?$'
+  FULL_TESTS: ${{ startsWith(github.ref, 'refs/tags/rc-') || inputs.all_platforms || github.event_name == 'schedule' }}
   # pluginval release and the SHA-256 of each of its zips
   PLUGINVAL_VERSION: v1.0.4
   PLUGINVAL_SHA256_LINUX: c01c49d8063965c4c2dea8324468336768f5c9139e0b1caebde14c2400b55352
@@ -192,7 +201,12 @@ jobs:
           test "$(plutil -extract CFBundlePackageType raw "$BUNDLE/Contents/Info.plist")" = BNDL
 
       - name: Tests
-        run: ctest --test-dir build --output-on-failure -V
+        run: |
+          if [ "$FULL_TESTS" = true ]; then
+            ctest --test-dir build --output-on-failure -V
+          else
+            ctest --test-dir build --output-on-failure -V -E "$LONG_TESTS"
+          fi
 
       - name: Split into Apple silicon and Intel bundles
         run: |
