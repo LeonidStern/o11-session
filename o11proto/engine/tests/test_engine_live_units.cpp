@@ -1311,6 +1311,46 @@ TEST(sink_host_stalls_of_one_host) {
                 CHECK(std::labs(r.after - r.before) <= frame);
             }
         }
+        // 3, the sender's measure of its gap off by up to a host block (its
+        // clock's reading of when its blocks began: a callback a little
+        // late before the stall makes it short, one late after it long),
+        // and a carry from its gaps before: its xrun blocks are whole
+        // frames of what it measured, rounded down (5.4), here one fewer or
+        // one more than the stall's own frames. The listener conceals just
+        // those, and the frame that came late after them if one did, and
+        // its delay moves by what they and the stall differ by: as before
+        // this host's gaps changed (the sender's alone is no host gap here).
+        // The hole concealed is never shorter than the stall by more than a
+        // frame and the host block the measure may be short by.
+        for (int blocks : {13, 17}) {           // 35 ms (1664 frames), 45 ms (2176)
+            const long missed = blocks * 128L;
+            for (int off : {-120, -40, -17, 17, 40, 120}) {
+                for (int path = 0; path < 2; ++path) {
+                    const int net = path == 0 ? 24 : 240, carry = path == 0 ? 0 : frame / 2;
+                    for (int phase = 0; phase < 3; ++phase) {
+                        const StallResult r = runStall(frame, 700 + phase, blocks, -1, 0, net, 0, off, 0, carry);
+                        char what[112];
+                        std::snprintf(what, sizeof(what), "the sender's host misses %.1f ms, its measure %+d, carry %d, path %d (phase %d)",
+                                      blocks * 128 / 48.0, off, carry, net, phase);
+                        printStall(what, frame, r);
+                        const long xrun = static_cast<long>(r.xruns_sent) * frame;
+                        CHECK(r.playing);
+                        CHECK(r.corr_before > 0.9 && r.corr_after > 0.9);
+                        CHECK_EQ(r.c.xruns, 1u);
+                        CHECK_EQ(r.c.host_gaps, 0u);
+                        CHECK_EQ(r.c.lost, 0u);
+                        CHECK_EQ(r.c.overruns, 0u);
+                        CHECK_EQ(r.c.skips, 0u);
+                        CHECK(r.c.late <= static_cast<std::uint32_t>(128 / frame + 1));
+                        CHECK_EQ(static_cast<long>(r.c.concealed), xrun + static_cast<long>(r.c.late) * frame);
+                        CHECK(std::labs((r.after - r.before) - (xrun - missed)) <= 8);
+                        CHECK(static_cast<long>(r.c.concealed) >= missed - frame - 128);
+                        CHECK(static_cast<long>(r.c.concealed) <= missed + 3 * frame);
+                        CHECK(std::labs(r.after - r.before) <= frame + 128);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1375,6 +1415,32 @@ TEST(sink_host_stalls_in_between) {
                 CHECK(r.corr_after > 0.9);
                 CHECK(r.c.host_gap48 <= std::max(0L, missed - sent) + frame);
                 CHECK(r.after - r.before > -frame);
+                CHECK(r.after - r.before <= frame + 2 * 128);
+                CHECK_EQ(r.c.overruns, 0u);
+                CHECK_EQ(r.c.lost, 0u);
+            }
+        }
+        // And the sender's measure off: its xrun blocks a frame fewer or
+        // more than its stall's. What is concealed and skipped stays
+        // within the bounds above; the delay may go lower by as much as the
+        // xrun blocks fall short of the stall (a frame and the host block
+        // its measure may be short by), as when the sender's host alone
+        // stalled.
+        for (int c : {0, 1, 2, 3, 11}) {
+            const Case& cs = cases[c];
+            for (int off : {-120, -40, 40, 120}) {
+                const long at = 700;
+                const StallResult r =
+                    runStall(frame, at + cs.send_from, cs.send_blocks, at + cs.recv_from, cs.recv_blocks, 24, 0, off, 0);
+                char what[112];
+                std::snprintf(what, sizeof(what), "%s, the sender's measure %+d", cs.what, off);
+                printStall(what, frame, r);
+                const long sent = cs.send_blocks * 128L, missed = cs.recv_blocks * 128L;
+                CHECK(r.playing);
+                CHECK(r.corr_after > 0.9);
+                CHECK(static_cast<long>(r.c.concealed) <= std::max(0L, sent - missed) + 2 * frame);
+                CHECK(r.c.host_gap48 <= std::max(0L, missed - sent) + frame);
+                CHECK(r.after - r.before > -(frame + 128));
                 CHECK(r.after - r.before <= frame + 2 * 128);
                 CHECK_EQ(r.c.overruns, 0u);
                 CHECK_EQ(r.c.lost, 0u);

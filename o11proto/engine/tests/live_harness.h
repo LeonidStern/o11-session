@@ -48,6 +48,13 @@ struct Side {
     // blocks: so that two sides' stalls begin at the blocks meant.
     std::atomic<long> stall_at{-1};
     std::atomic<int> stall_len{0};
+    // The host calls its process() `call_late_us` µs late at the room's
+    // block `call_late_at` (-1: never), as a host's callback comes a little
+    // late now and then: its clock's reading of when its blocks began is
+    // off by as much, and so is its measure of a gap just before or after
+    // that block (6.9).
+    std::atomic<long> call_late_at{-1};
+    std::atomic<int> call_late_us{0};
     std::mutex m;
     std::vector<std::string> notices;
     std::size_t noticeCount() {
@@ -276,6 +283,11 @@ struct Room {
                 for (int i = 0; i < B; ++i) in[static_cast<std::size_t>(i)] = sd.signal ? sd.signal(f + i, opt.rate) : 0.0f;
                 const float* inp[1] = {in.data()};
                 float* o[2] = {out[static_cast<std::size_t>(2 * s)].data(), out[static_cast<std::size_t>(2 * s + 1)].data()};
+                if (b == sd.call_late_at.load(std::memory_order_acquire)) {
+                    const auto until = Clock::now() + std::chrono::microseconds(sd.call_late_us.load());
+                    while (Clock::now() < until) {
+                    }
+                }
                 const auto t0 = Clock::now();
                 sd.e.process(inp, 1, o, 2, B, opt.rate);
                 const long took =
