@@ -1,6 +1,8 @@
 // ENGINE.md 13.10-13.13: two engines against o11server, simulated clock;
 // and the level meters and dropout counts of 8.6 and 8.7.
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <vector>
 
 #include "check.h"
@@ -59,8 +61,10 @@ struct Room {
     long frames = 0;
     bool listener_runs = true;
     long listener_start = 0;                     // the listener's clock starts this many frames after the sender's
+    bool paced = false;                          // advance() keeps to the wall clock (Live needs it)
+    TimePoint paced_from{};
 
-    Room(int rate_, int block_, int bpm = 120, int bpi = 8) : rate(rate_), block(block_) {
+    Room(int rate_, int block_, int bpm = 120, int bpi = 8, bool live = false) : rate(rate_), block(block_) {
         ServerConfig cfg;
         cfg.port = 0;
         cfg.allow_anonymous = true;
@@ -68,6 +72,7 @@ struct Room {
         cfg.opus_kbps = 128;
         cfg.bpm = static_cast<std::uint16_t>(bpm);
         cfg.bpi = static_cast<std::uint16_t>(bpi);
+        if (live) cfg.live.mode = LiveMode::On;
         CHECK(server.start(cfg));
         in.assign(static_cast<std::size_t>(block), 0.0f);
         sl = sr = ll = lr = in;
@@ -126,6 +131,10 @@ struct Room {
             }
             frames += block;
             control();
+            if (paced) {
+                if (paced_from == TimePoint{}) paced_from = Clock::now() - std::chrono::microseconds(frames * 1000000LL / rate);
+                std::this_thread::sleep_until(paced_from + std::chrono::microseconds(frames * 1000000LL / rate));
+            }
         }
     }
     int intervalLen() const { return listener.usualIntervalLength(); }
@@ -584,6 +593,34 @@ TEST(level_while_muted) {                        // 8.6
     CHECK(lv1 < 0.01f);
     CHECK(f.listener.channelPeak(0, 0, 0) < 0.01f);
     CHECK_EQ(f.dropouts(), 0);
+}
+
+// 8.6 in a Live room (16.8): channel 0's level follows what is heard live,
+// as its peak does, and goes on while the channel is muted. About 2 s.
+TEST(live_level) {
+    Room room(48000, 240, 120, 8, true);
+    room.paced = true;
+    REQUIRE(room.connectBoth());
+    for (int i = 0; i < 50 && !room.listener.userLive(0); ++i) room.advance(0.1);
+    REQUIRE(room.listener.userLive(0));
+    room.advance(0.5);
+    float pk = room.listener.channelPeak(0, 0, 0);
+    float lv0 = room.listener.channelLevel(0, 0, 0), lv1 = room.listener.channelLevel(0, 0, 1);
+    std::printf("  live, heard: peak %.3f, level %.3f %.3f\n", pk, lv0, lv1);
+    CHECK(pk > 0.3f && pk < 0.6f);
+    CHECK(lv0 > 0.3f && lv0 < 0.6f);
+    for (int side = 0; side < 2; ++side)           // the same measurement while heard
+        CHECK_EQ(room.listener.channelLevel(0, 0, side), room.listener.channelPeak(0, 0, side));
+    room.listener.setChannelMute(0, 0, true);
+    room.advance(1.2);
+    pk = room.listener.channelPeak(0, 0, 0);
+    lv0 = room.listener.channelLevel(0, 0, 0);
+    lv1 = room.listener.channelLevel(0, 0, 1);
+    std::printf("  live, muted: peak %.4f, level %.3f %.3f\n", pk, lv0, lv1);
+    CHECK(room.listener.userLive(0));
+    CHECK(pk < 0.01f);
+    CHECK(lv0 > 0.3f && lv0 < 0.6f);
+    CHECK(lv1 > 0.3f && lv1 < 0.6f);
 }
 
 TEST(dropouts_per_channel) {                     // 8.7, 13.16
