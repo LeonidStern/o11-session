@@ -157,6 +157,7 @@ if(O11PROTO_BUILD_ENGINE)
   target_link_libraries(test_engine_live_tone o11proto_asio)
   set_tests_properties(test_engine_live_room PROPERTIES TIMEOUT 900)
   set_tests_properties(test_engine_live_tone PROPERTIES TIMEOUT 480)   # 7 runs of 12-20 s
+  set_tests_properties(test_engine_live_stalls PROPERTIES TIMEOUT 480) # 22 rooms of 8-9 s
 endif()
 
 # --------------------------------------------------------------- portmap

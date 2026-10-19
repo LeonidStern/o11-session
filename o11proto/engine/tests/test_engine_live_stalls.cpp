@@ -14,8 +14,11 @@
 // as much of the stream as its host missed, so its delay stays; the
 // listener at the other host conceals the hole. Stalls in between (of
 // different lengths, or a block apart) conceal no more than the sender's
-// audio misses and skip no more than the delay needs. Each player plays
-// noise of its own, so that each listener's delay is found by correlation.
+// audio misses and skip no more than the delay needs. A callback a little
+// late next to a stall puts that host's measure of its gap off: the
+// sender's xrun blocks a frame fewer or more than the stall's. Each player
+// plays noise of its own, so that each listener's delay is found by
+// correlation.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -79,9 +82,16 @@ Delta minus(const LiveCounters& a, const LiveCounters& b) {
 struct Stall {
     int from = 0, blocks = 0;                    // from the stall's first block on (0 blocks: none)
 };
+// One host's call a little late, so that its measure of its gap is off
+// (live_harness.h, Side::call_late_at): `side`'s call of the block `block`
+// blocks from the stall's first (-1: the one before it), `us` µs late.
+struct Late {
+    int side = -1, block = 0, us = 0;
+};
 struct Case {
     const char* what;
     Stall s[2];                                  // alice's host, bob's
+    Late late = {};
 };
 
 // One listener's view of one stall: listener `l` hears sender `1 - l`.
@@ -94,6 +104,23 @@ struct View {
     // 150 ms after it ended): the machine's, and the counts aren't the
     // stall's alone.
     bool stray = false;
+    // The stall's own dropout runs from its first dropout event on to the
+    // rejoin after it, and the xrun blocks played then: `stall_late`, the
+    // frames that came late in it. A dropout that starts after that (a run
+    // dry, a block lost or late) is one of its own: a frame held up on its
+    // way (a thread woken late, under calm()'s 10 ms), which the stall's
+    // move of the delay (lower by what the xrun blocks fall short of it)
+    // may have made late. Its late frames are counted apart, `later_late`,
+    // when it is a plain one, closed by a rejoin; after an overflow, a
+    // rebuffer, a skip or an xrun in it, or with the counts and the log
+    // apart, all are the stall's. What it concealed is not: a late frame's
+    // turn was concealed, so concealed less the late frames, all of them,
+    // nets it out.
+    long stall_late = 0, later = 0, later_late = 0;
+    // The sender's blocks from the first after its stall to the one that
+    // reported its gap (6.9: the first that didn't come early), and the
+    // most frames they complete: the frames it sent before its xrun blocks.
+    long report_blocks = 0, report_frames = 0;
 };
 
 struct Players {
@@ -106,6 +133,22 @@ struct Players {
     long lag(int l, long from, long to, long lo, long hi, double* corr) {
         const std::uint32_t seed = kSeed[1 - l];
         return bestLag(r[l].heard.get(), [seed](long n) { return noise(n, seed); }, from, to, lo, hi, corr);
+    }
+    // The sender's (side `s`) blocks from `e`, its first after its stall,
+    // up to the first that came at least 90 % of a block after the one
+    // before it, so the one that reported its gap (6.9). A block that
+    // comes earlier (its host caught up on a late wake, or its callback
+    // jittered) puts the report off by a block, and the frames that block
+    // completes go before the xrun blocks. Read by this clock, a block
+    // within 0.1 ms of the line counts as early: the engine reads its own.
+    long reportBlocks(int s, long e) {
+        const std::int64_t dur = r.opt.block * 1000000000LL / r.opt.rate;
+        const std::int64_t* called = r[s].called.get();
+        long j = e + 1;
+        while (j < std::min(e + 64, r.max_blocks) && called[j] > 0 && called[j - 1] > 0 &&
+               called[j] - called[j - 1] < dur * 9 / 10 + 100000)
+            ++j;
+        return j - e;
     }
     // Runs one case; false when the machine had a hiccup around it.
     bool run(const Case& c, View v[2]) {
@@ -124,9 +167,16 @@ struct Players {
             r[i].stall_len.store(c.s[i].blocks);
             r[i].stall_at.store(at + c.s[i].from, std::memory_order_release);
         }
+        if (c.late.side >= 0) {
+            r[c.late.side].call_late_us.store(c.late.us);
+            r[c.late.side].call_late_at.store(at + c.late.block, std::memory_order_release);
+        }
         const long end = (at + longest + 330) * B;   // ~0.9 s after the stall
         r.until([&] { return r.frames.load() > end; }, 5);
-        for (int i = 0; i < 2; ++i) r[i].stall_at.store(-1);
+        for (int i = 0; i < 2; ++i) {
+            r[i].stall_at.store(-1);
+            r[i].call_late_at.store(-1);
+        }
         const long before_from = (at - 200) * B, before_to = (at - 20) * B;
         const long after_from = (at + longest + 130) * B, after_to = (at + longest + 310) * B;
         for (int l = 0; l < 2; ++l) {
@@ -136,9 +186,48 @@ struct Players {
             v[l].before = lag(l, before_from, before_to, 0, 9600, &v[l].corr_before);
             v[l].after = lag(l, after_from, after_to, std::max(0L, v[l].before - 960), v[l].before + 960, &v[l].corr_after);
             const double stall_ms = longest * 1000.0 * B / r.opt.rate;
+            const Stall theirs = c.s[1 - l];
+            if (theirs.blocks > 0) {
+                v[l].report_blocks = reportBlocks(1 - l, at + theirs.from + theirs.blocks);
+                v[l].report_frames = (frame - 1 + v[l].report_blocks * B) / frame;
+            }
+            int state = 0;                       // 0: before the stall's dropout, 1: in it, 2: after it, 3: in one of its own
+            bool plain = true;
             for (const LiveEvent& e : r[l].e.liveUserEvents(u[l])) {
                 if (e.steady_ns < at_ns - 1500000000LL) continue;
                 const double t = (e.steady_ns - at_ns) / 1e6;
+                if (t >= -5) {
+                    const bool own = state >= 2;
+                    if (own && state == 2 &&
+                        (e.kind == LiveEventKind::Dry || e.kind == LiveEventKind::Lost || e.kind == LiveEventKind::Late)) {
+                        state = 3;
+                        ++v[l].later;
+                    }
+                    switch (e.kind) {
+                    case LiveEventKind::Dry:
+                    case LiveEventKind::Lost:
+                        if (state == 0) state = 1;
+                        break;
+                    case LiveEventKind::Late:
+                        if (state == 0) state = 1;
+                        if (own) ++v[l].later_late;
+                        else ++v[l].stall_late;
+                        break;
+                    case LiveEventKind::Rejoin:
+                        if (state == 1 || state == 3) state = 2;
+                        break;
+                    case LiveEventKind::Xrun:
+                        if (state == 3) plain = false;
+                        break;
+                    case LiveEventKind::Overflow:
+                    case LiveEventKind::Rebuffer:
+                    case LiveEventKind::Skip:
+                        plain = false;
+                        break;
+                    default:
+                        break;
+                    }
+                }
                 switch (e.kind) {
                 case LiveEventKind::Dry:
                 case LiveEventKind::Lost:
@@ -158,6 +247,11 @@ struct Players {
                               static_cast<long long>(e.value), (e.steady_ns - at_ns) / 1e6);
                 v[l].log += b;
             }
+            if (state == 3 || v[l].stall_late + v[l].later_late != v[l].d.late) plain = false;
+            if (!plain) {
+                v[l].later = v[l].later_late = 0;
+                v[l].stall_late = v[l].d.late;
+            }
         }
         return r.calm(before_from - r.opt.rate / 2, r.frames.load());
     }
@@ -169,16 +263,27 @@ void print(const char* who, int frame, const View& v) {
                 who, v.before, v.after, v.corr_before, v.corr_after, v.d.concealed, v.d.underruns, v.d.xruns, v.d.late,
                 v.d.lost, v.d.skips, v.d.host_gaps, v.d.host_gap_frames, v.d.overflows);
     if (!v.log.empty()) std::printf("        the log: %s\n", v.log.c_str());
+    if (v.report_blocks > 0)
+        std::printf("        the sender reported its gap at its block %ld after the stall: up to %ld frames before its xrun "
+                    "blocks; %ld came late in the stall's dropout\n",
+                    v.report_blocks + 1, v.report_frames, v.stall_late);
+    if (v.later > 0)
+        std::printf("        then %ld dropout%s of its own (the machine's): %ld late, counted apart\n", v.later,
+                    v.later == 1 ? "" : "s", v.later_late);
     if (v.stray) std::printf("        a dropout away from the stall (the machine's): not checked\n");
     (void)frame;
 }
 
 // Each case in a room of its own. A stall that one host alone misses moves
 // a listener's delay: a listener whose sender's host stalled conceals the
-// hole and the frame that came late after it (as before this host's gaps
+// hole and the frames that came late before it (as before this host's gaps
 // changed), and one whose own host stalled skips the time missed to the
-// nearest block. The speed then takes the delay back to its level over tens
-// of seconds (6.9: 0.1 of the fill's error a second, past a 2 ms dead band).
+// nearest block. The delay a listener is left with may be lower by as much
+// as the xrun blocks fall short of the stall, which a frame held up on its
+// way a little later (a thread woken a few ms late) may then find: a
+// dropout of its own, counted apart (View). The speed then takes the
+// delay back to its level over tens of seconds (6.9: 0.1 of the fill's
+// error a second, past a 2 ms dead band).
 // A case after it in the same room found the delay some ms up and still
 // moving: a few hundred ppm slide it 5-10 frames over the half second its
 // lag is found from, which smears the noise's correlation (sharp to a few
@@ -228,6 +333,10 @@ void stallCase(int frame, const Case& c) {
         const long m0 = mine.from * 128L, m1 = m0 + missed, s0 = theirs.from * 128L, s1 = s0 + sent;
         const long both = mine.blocks && theirs.blocks ? std::max(0L, std::min(m1, s1) - std::max(m0, s0)) : 0;
         const View& w = v[l];
+        // What is concealed less the frames that came late, all of them: a
+        // dropout of its own after the stall nets out (View). And the frames
+        // that came late in the stall's own dropout.
+        const long net = w.d.concealed - w.d.late * frame, late = w.stall_late;
         CHECK(w.corr_before > 0.6 && w.corr_after > 0.6);
         CHECK_EQ(w.d.overflows, 0);
         CHECK_EQ(w.d.lost, 0);
@@ -249,16 +358,34 @@ void stallCase(int frame, const Case& c) {
             CHECK(std::labs(w.after - w.before) <= frame / 2 + 128);
         } else if (!mine.blocks && theirs.blocks) {
             // 3: the sender's alone: the hole concealed, as before this
-            // host's gaps changed. In real time, and so in the cases
-            // below, a little more: the frames its host's first block
-            // after the stall completes (one or two) come after their
-            // turn, late, and the xrun blocks after them.
+            // host's gaps changed: the sender's xrun blocks (5.4: whole
+            // frames of the gap it measured, rounded down, the rest carried
+            // over to its next gap) and, in real time, and so in the cases
+            // below, the frames the sender sent before them: those its
+            // host's blocks after the stall complete until one reports the
+            // gap (one or two, more when blocks came early). They come
+            // after their turn, late. The listener's delay moves by as much
+            // as the xrun blocks fall short of the stall or pass it: what
+            // is concealed less the late frames is the stall and the
+            // delay's move, to a ms (the speed may slide the delay
+            // meanwhile). The sender's measure is its clock's reading of
+            // when its blocks began (6.9), off by as much as a callback
+            // came late, up to a host block: its xrun blocks may be a frame
+            // fewer than the stall's, or (with a carry) one more, and the
+            // hole concealed and the delay's move up to a frame and a host
+            // block short of it or past it (a callback under 1 ms late made
+            // 8 of 240 frames, 1920, for the 2176 frames of 45 ms).
             CHECK_EQ(w.d.xruns, 1);
-            CHECK(w.d.concealed >= sent - frame && w.d.concealed <= sent + 3 * frame);
+            CHECK(late <= w.report_frames);
+            CHECK(std::labs(net - (sent + (w.after - w.before))) <= 48);
+            CHECK(net >= sent - frame - 128 && net <= sent + frame + 128);
             CHECK(std::labs(w.after - w.before) <= frame + 128);
         } else {
-            // 4: in between.
-            CHECK(w.d.concealed <= std::max(0L, sent - missed) + 3 * frame);
+            // 4: in between. What is concealed less the frames that came
+            // late (as in 3) is no more than the sender's audio misses, to
+            // the xrun blocks' whole frames and the hosts' measures.
+            CHECK(late <= w.report_frames);
+            CHECK(net <= std::max(0L, sent - missed) + 2 * frame);
             CHECK(w.d.host_gap_frames <= std::max(0L, missed - sent) + frame);
             CHECK(std::labs(w.after - w.before) <= frame + 2 * 128);
         }
@@ -281,6 +408,28 @@ void stalls(int frame) {
         {"bob's host misses 45 ms", {{0, 0}, {0, 17}}},
         {"alice's host misses 32 ms, bob's 45 ms", {{0, 12}, {0, 17}}},
         {"alice's host misses 53 ms, bob's 21 ms within it", {{0, 20}, {6, 8}}},
+        // Bob's callback 1 ms late at the block before the stall: its
+        // measure of the gap 1 ms short, its xrun blocks a frame fewer than
+        // the stall's (45 ms: 16 frames over whole frames of 120 and 240),
+        // as a callback a little late made them on a CI runner. At the
+        // second block after the stall: 1 ms long, a frame more (35 ms:
+        // 104 frames over whole frames of 120, 224 over those of 240).
+        {"bob's host misses 45 ms, its measure 1 ms short", {{0, 0}, {0, 17}}, {1, -1, 1000}},
+        {"bob's host misses 35 ms, its measure 1 ms long", {{0, 0}, {0, 13}}, {1, 13 + 1, 1000}},
+        {"both hosts miss 45 ms, bob's measure 1 ms short", {{0, 17}, {0, 17}}, {1, -1, 1000}},
+        // Bob's host back on its schedule only after its report of the gap:
+        // its call of the block that reports it (the second after the
+        // stall) 4 ms late, its blocks after that back to back until it
+        // has caught up. Its measure is 4 ms long, and so are its xrun
+        // blocks (a frame more at 120); as a listener it skips only the
+        // stall all the same (a wake some ms late there made a CI runner
+        // skip 50 ms for 45 at frames of 240). Its first block after the
+        // stall 4 ms late instead: it catches up before it reports, at its
+        // fourth block. And both hosts' reports 4 ms late alike (one thread
+        // calls both): not heard.
+        {"bob's host misses 45 ms, its report 4 ms late", {{0, 0}, {0, 17}}, {1, 17 + 1, 4000}},
+        {"bob's host misses 45 ms, back 4 ms late", {{0, 0}, {0, 17}}, {1, 17, 4000}},
+        {"both hosts miss 45 ms, both reports 4 ms late", {{0, 17}, {0, 17}}, {0, 17 + 1, 4000}},
     };
     for (const Case& c : cases) stallCase(frame, c);
 }

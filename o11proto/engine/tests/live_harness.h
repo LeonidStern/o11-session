@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -42,12 +43,20 @@ struct Side {
     std::unique_ptr<std::uint8_t[]> live;        // userLive(0) after each block
     std::unique_ptr<std::uint8_t[]> room;        // liveRoomLive() after each block
     std::unique_ptr<int[]> pos;                  // the interval position after each block
+    std::unique_ptr<std::int64_t[]> called;      // when the host called process() for each block (steady ns; 0: it didn't)
     std::atomic<long> clock_from{-1};            // the frame its interval clock started at, -1 before
     std::atomic<int> stall{0};                   // blocks the host doesn't call process() for
     // Or from the room's block `stall_at` on (-1: none), for `stall_len`
     // blocks: so that two sides' stalls begin at the blocks meant.
     std::atomic<long> stall_at{-1};
     std::atomic<int> stall_len{0};
+    // The host calls its process() `call_late_us` µs late at the room's
+    // block `call_late_at` (-1: never), as a host's callback comes a little
+    // late now and then: its clock's reading of when its blocks began is
+    // off by as much, and so is its measure of a gap just before or after
+    // that block (6.9).
+    std::atomic<long> call_late_at{-1};
+    std::atomic<int> call_late_us{0};
     std::mutex m;
     std::vector<std::string> notices;
     std::size_t noticeCount() {
@@ -150,6 +159,7 @@ struct Room {
             s.live.reset(new std::uint8_t[static_cast<std::size_t>(max_blocks)]());
             s.room.reset(new std::uint8_t[static_cast<std::size_t>(max_blocks)]());
             s.pos.reset(new int[static_cast<std::size_t>(max_blocks)]());
+            s.called.reset(new std::int64_t[static_cast<std::size_t>(max_blocks)]());
             s.e.setMetronome(0, 0, true, 0);
             LocalChannel lc;
             lc.name = "tone";
@@ -276,7 +286,13 @@ struct Room {
                 for (int i = 0; i < B; ++i) in[static_cast<std::size_t>(i)] = sd.signal ? sd.signal(f + i, opt.rate) : 0.0f;
                 const float* inp[1] = {in.data()};
                 float* o[2] = {out[static_cast<std::size_t>(2 * s)].data(), out[static_cast<std::size_t>(2 * s + 1)].data()};
+                if (b == sd.call_late_at.load(std::memory_order_acquire)) {
+                    const auto until = Clock::now() + std::chrono::microseconds(sd.call_late_us.load());
+                    while (Clock::now() < until) {
+                    }
+                }
                 const auto t0 = Clock::now();
+                sd.called[b] = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
                 sd.e.process(inp, 1, o, 2, B, opt.rate);
                 const long took =
                     static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());

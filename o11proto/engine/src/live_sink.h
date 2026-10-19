@@ -288,6 +288,16 @@ public:
     // finding its delay skips the time missed at once.
     void hostLate(int host_frames, int host_rate, std::int64_t now_ns);
     void hostGap(int host_frames, int host_rate, std::int64_t now_ns);
+    // After hostGap(): the host has caught up on this much of the gap since
+    // (the gap's block came late, the host not yet back on its schedule),
+    // so it missed that much less. While the window is open, that much
+    // less is skipped of the stream's own audio. The xrun blocks absorbed
+    // stay so while they are no more than the gap as reported: the
+    // sender's measure may be long alike (its host's block late as well),
+    // and its xrun blocks then are too. Once more came than that (the
+    // sender's gap was the longer), what is absorbed is what this host
+    // missed after all.
+    void hostGapBack(int host_frames, int host_rate);
     void hostCaughtUp();
     static constexpr int kGapWindow48 = 4800;   // 100 ms of the stream played
     // Before each block's apply(): how far (48 kHz samples) the host's
@@ -382,6 +392,9 @@ private:
     // and its measure may be the longer; once more xrun blocks came than
     // that (the sender's gap was the longer), to the nearest block.
     std::int64_t absorbAbove() const { return gap_longer_ ? block_ / 2 : -gapSlack48(); }
+    // What is owed against the xrun blocks absorbed: less what the host
+    // caught up on once the sender's gap proved the longer (hostGapBack()).
+    std::int64_t owedNow() const { return gap_owed48_ - (gap_longer_ ? gap_back48_ : 0); }
     void closeGap(std::int64_t now_ns);         // the window closes: skips what is still owed
     void forgetGap();                           // a new delay: nothing is owed
     void skipBlocks(std::int64_t n, std::int64_t now_ns);   // n blocks of the stream for this host's gap
@@ -489,8 +502,9 @@ private:
     // This host's gap (hostGap()): what it owes the delay (48 kHz samples,
     // less the xrun blocks absorbed), of that what hostLate() gave and
     // hostGap() hasn't yet confirmed, and the window in which xrun blocks
-    // are absorbed: open until played48_ reaches gap_until48_.
-    std::int64_t gap_owed48_ = 0, gap_late48_ = 0, gap_until48_ = 0;
+    // are absorbed: open until played48_ reaches gap_until48_. And what the
+    // host caught up on after it reported the gap (hostGapBack()).
+    std::int64_t gap_owed48_ = 0, gap_late48_ = 0, gap_until48_ = 0, gap_back48_ = 0;
     // Open; hostGap() came in it; more xrun blocks came than it owed.
     bool gap_open_ = false, gap_confirmed_ = false, gap_longer_ = false;
     int gap_absorbed_ = 0;                      // xrun blocks absorbed in this window

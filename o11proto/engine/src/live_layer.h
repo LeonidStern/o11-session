@@ -329,6 +329,12 @@ private:
     bool gate_open_ = false;
     std::int64_t expect_ns_ = 0, prev_start_ns_ = 0, prev_dur_ns_ = 0;
     bool late_pending_ = false;
+    // After a gap is reported: the schedule its block began, held through
+    // the blocks after it (when each is due on it), the gap, what of it the
+    // host has caught up since and so missed after all, and the host frames
+    // since, for kGapBackNs (audioBlock()).
+    std::int64_t back_sched_ns_ = 0, back_gap_ns_ = 0, back_ns_ = 0, back_frames_ = 0;
+    static constexpr std::int64_t kGapBackNs = 50000000LL;   // 50 ms
     // The host's schedule: when this block is due on it, held through a
     // late block and the blocks that catch up on it (audioBlock()).
     std::int64_t sched_ns_ = 0;
