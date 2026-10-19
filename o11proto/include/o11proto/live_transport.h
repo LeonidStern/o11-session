@@ -2,7 +2,7 @@
 // IPv4 socket for the relay and the direct paths, the hellos and their
 // cookie, the probes that open a direct path to each of the room's other
 // players (15.10), and opaque payloads in and out. What the payloads mean
-// is the caller's (the engine's Live layer, ENGINE.md section 15).
+// is the caller's (the engine's Live layer, ENGINE.md section 16).
 //
 // All-to-all: with the paths of 0x09 (setPaths()), a payload to one peer
 // goes to it directly once a probe of the pair was answered, and through
@@ -82,10 +82,10 @@ public:
     Transport(const Transport&) = delete;
     Transport& operator=(const Transport&) = delete;
 
-    // Opens and connects the socket, sends the first hello and starts the
-    // thread. On failure `error` is one of the reasons of live-mode 6.1:
-    // "no peer ID or server address", "can't open a UDP socket (error <n>)",
-    // "can't connect the UDP socket to the server (error <n>)".
+    // Opens the socket (on a port of its own, not connected), sends the
+    // first hello and starts the thread. On failure `error` is one of the
+    // reasons of live-mode 6.1: "no peer ID or server address", "can't open
+    // a UDP socket (error <n>)".
     bool start(const Options& o, std::string& error);
     void stop();                               // joins the thread; a no-op when stopped
     bool running() const;                      // any thread

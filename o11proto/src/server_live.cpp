@@ -216,7 +216,7 @@ struct Server::Live {
     };
     RouteCheck checkRoute() const {
         RouteCheck r;
-        std::vector<int> in;                   // the bound senders that send directly
+        std::vector<int> direct;               // the bound senders that send directly
         for (int id : senders) {
             auto it = players.find(id);
             if (it == players.end() || !it->second.bound) continue;
@@ -225,7 +225,7 @@ struct Server::Live {
                                      : p.relay_only ? live::RelayWhy::RelayOnly
                                                     : live::RelayWhy::None;
             if (w == live::RelayWhy::None) {
-                in.push_back(id);
+                direct.push_back(id);
                 continue;
             }
             r.all_up = false;
@@ -239,18 +239,18 @@ struct Server::Live {
             auto it = m.find(to);
             return it == m.end() ? live::PathState::Opening : it->second;
         };
-        for (std::size_t i = 0; i < in.size(); ++i)
-            for (std::size_t j = i + 1; j < in.size(); ++j) {
-                const live::PathState x = state(in[i], in[j]), y = state(in[j], in[i]);
+        for (std::size_t i = 0; i < direct.size(); ++i)
+            for (std::size_t j = i + 1; j < direct.size(); ++j) {
+                const live::PathState x = state(direct[i], direct[j]), y = state(direct[j], direct[i]);
                 if (x == live::PathState::Up && y == live::PathState::Up) continue;
                 r.all_up = false;
                 if (x != live::PathState::Down && y != live::PathState::Down) continue;
-                ++r.no_path[in[i]];
-                ++r.no_path[in[j]];
+                ++r.no_path[direct[i]];
+                ++r.no_path[direct[j]];
                 if (r.why == live::RelayWhy::None) {
                     r.why = live::RelayWhy::NoPath;
-                    r.a = in[i];
-                    r.b = in[j];
+                    r.a = direct[i];
+                    r.b = direct[j];
                 }
             }
         return r;
@@ -276,9 +276,9 @@ struct Server::Live {
             kv.second.path_states.clear();     // new keys: every path opens again
         }
         paths_ok = live::systemRandom(path_secret, sizeof(path_secret));   // new keys for every pair
-        cfg.fresh_seconds = envSeconds("NINJAM_LIVE_FRESH_SECONDS", cfg.fresh_seconds);
+        cfg.fresh_seconds = envSeconds("O11_LIVE_FRESH_SECONDS", cfg.fresh_seconds);
         cfg.relay_fallback = envFlag("O11_LIVE_RELAY_FALLBACK", cfg.relay_fallback);
-        cfg.stats_seconds = envSeconds("NINJAM_LIVE_STATS_SECONDS", cfg.stats_seconds);
+        cfg.stats_seconds = envSeconds("O11_LIVE_STATS_SECONDS", cfg.stats_seconds);
         stats_since = next_fresh_check = Clock::now();
         in = out = 0;
         dropped.fill(0);
@@ -386,9 +386,9 @@ void Server::setLiveConfig(const LiveConfig& config) {
             log(r == OpenResult::Busy ? busyWarning(p) : randomWarning(p));
         }
     } else {
-        L.cfg.fresh_seconds = envSeconds("NINJAM_LIVE_FRESH_SECONDS", L.cfg.fresh_seconds);
+        L.cfg.fresh_seconds = envSeconds("O11_LIVE_FRESH_SECONDS", L.cfg.fresh_seconds);
         L.cfg.relay_fallback = envFlag("O11_LIVE_RELAY_FALLBACK", L.cfg.relay_fallback);
-        L.cfg.stats_seconds = envSeconds("NINJAM_LIVE_STATS_SECONDS", L.cfg.stats_seconds);
+        L.cfg.stats_seconds = envSeconds("O11_LIVE_STATS_SECONDS", L.cfg.stats_seconds);
     }
     if (!L.room_chosen) L.room_on = L.cfg.mode == LiveMode::On;
     L.dirty = true;

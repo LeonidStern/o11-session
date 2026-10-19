@@ -3,11 +3,10 @@
 // One thread (section 4) maps the port (section 5), waits for the renewal
 // time or the retry time, and removes the mapping (section 6) when told to
 // stop. UPnP-IGD goes through miniupnpc, NAT-PMP through libnatpmp. With
-// Live (PROTOCOL.md 15.11) the UDP port of the same number is mapped too,
+// Live (PROTOCOL.md 15.8) the UDP port of the same number is mapped too,
 // after TCP and with TCP's lease; a UDP failure never fails the TCP mapping.
 #include "o11proto/portmap.h"
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>

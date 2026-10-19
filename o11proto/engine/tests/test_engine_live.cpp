@@ -856,13 +856,13 @@ TEST(host_stalls_keep_the_delay) {
         const int n = (ms * kRate / 1000 + kBlock - 1) / kBlock;
         r.side[0].hold.store(n);                  // alice's host: n blocks late, then back to back
         r.wait(3);
-        const long settled = r.frames.load();
+        const long settled_at = r.frames.load();
         double fill[2];
         for (int s = 0; s < 2; ++s) fill[s] = r.side[s].e.liveUserBufferMs(0);
         r.wait(1.5);
         const bool calm = r.calmSince(t0);
         for (int s = 0; s < 2; ++s) {
-            const std::vector<double> d = r.liveDelays(s, settled);
+            const std::vector<double> d = r.liveDelays(s, settled_at);
             double worst = 0;
             for (double x : d) worst = std::max(worst, std::fabs(x - before[s]));
             std::printf("    alice's host %d ms late: %s from 3 s on: %zu bursts, %.2f to %.2f ms "

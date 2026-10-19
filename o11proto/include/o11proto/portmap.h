@@ -5,7 +5,7 @@
 // before it expires, keeps trying when no router answers and removes the
 // mapping when stopped. Everything it has to say goes through `log`, one line
 // per event, each starting with "[portmap] ", except the Live warning that the
-// UDP port could not be forwarded (PROTOCOL.md 15.11), which starts with
+// UDP port could not be forwarded (PROTOCOL.md 15.8), which starts with
 // "warning: Live: ".
 #ifndef O11PROTO_PORTMAP_H
 #define O11PROTO_PORTMAP_H

@@ -65,8 +65,6 @@ static void drawBox(juce::Graphics &g, juce::Rectangle<float> r)
   fillRect(g, r, RADIUS, Colors::box());
 }
 
-static juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
-
 // ---------------------------------------------------------------------------
 
 void Strip::setColor(juce::Colour c)
