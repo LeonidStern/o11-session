@@ -942,31 +942,10 @@ void LiveLayer::audioBlock(const float* l, const float* r, bool transmit, int fr
     } else {
         expect_ns_ = now;
     }
-    // After a gap is reported. Its block may itself have come late, the
-    // host not yet caught up on the stall (a wake a few ms late), and the
-    // gap measured as long by that much; then the blocks after it come
-    // early until it has. A block that isn't early, so on the host's own
-    // schedule again, says how much: by as much as it comes before the
-    // schedule the gap's block began, the gap was shorter. That much the
-    // sinks owe the delay no more (LiveSink::hostGapBack()). Early blocks
-    // don't say: a host may call some of its blocks back to back on each
-    // of its device's periods. For 50 ms, or until a block is late again.
-    if (back_gap_ns_ > 0) {
-        back_sched_ns_ += prev_dur_ns_;
-        back_frames_ += frames;
-        if (pending > 0 || gap > 0 || back_frames_ * 1000000000LL > kGapBackNs * rate) {
-            back_gap_ns_ = 0;
-        } else if (!early && back_sched_ns_ - now > back_ns_) {
-            const std::int64_t to = std::min(back_sched_ns_ - now, back_gap_ns_);
-            back = static_cast<int>(to * rate / 1000000000LL - back_ns_ * rate / 1000000000LL);
-            back_ns_ = to;
-        }
-    }
-    if (gap > 0) {
-        back_sched_ns_ = now;
-        back_gap_ns_ = gap_ns;
-        back_ns_ = back_frames_ = 0;
-    }
+    // After a gap is reported: what of it the host caught up on, which the
+    // sinks owe the delay no more (GapBack, LiveSink::hostGapBack()).
+    back = static_cast<int>(gap_back_.block(now, prev_dur_ns_, early, pending > 0 || gap > 0) * rate / 1000000000LL);
+    if (gap > 0) gap_back_.start(now, gap_ns);
     // How far this block is behind the host's schedule. A host whose
     // blocks stall and then come back to back to catch up plays the stream
     // time it missed late: until it has caught up, each sink holds the
