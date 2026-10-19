@@ -8,9 +8,11 @@
 ![VST3](https://img.shields.io/badge/format-VST3-blue)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
-[**Download**](#download) · [Live mode](#live-mode) · [Intervals mode](#intervals-mode) · [Ableton Link](#auto-bpm-with-ableton-link) · [Rock-solid timing](#rock-solid-timing) · [FAQ](#faq)
+[**Download**](#download) · [Live mode](#live-mode) · [Intervals mode](#intervals-mode) · [Ableton Link](#auto-bpm-with-ableton-link) · [Per-player routing](#every-player-on-their-own-channel) · [Rock-solid timing](#rock-solid-timing) · [FAQ](#faq)
 
 </div>
+
+<p align="center"><img src="docs/images/o11-session.png" alt="O11 Session in a room of eight players, synced to Ableton through Link" width="900"></p>
 
 O11 Session is a plug-in that turns your DAW into a shared rehearsal room.
 Put it on a track, send the room address to your bandmates, and jam over the
@@ -25,8 +27,8 @@ and mix.
   Link.
 - ⏱️ **Built not to drift.** Continuous clock correction and smart stall
   recovery keep everyone locked together for the whole session.
-- 🎛️ **Every player on their own track.** Mix, record and add effects to each
-  bandmate like any other track.
+- 🎛️ **Every player on their own channel.** Route each bandmate to a separate
+  track in your DAW to mix, record and add effects.
 - 🚀 **Host with one click.** The room runs inside the plug-in. No server to
   rent, nothing to configure.
 
@@ -52,7 +54,8 @@ Reaper, Studio One, Cubase and any other VST3 host.
    room on your computer, asks your router to let people in, and shows the
    address to share.
 3. **Invite your band.** They paste the address into their own copy and join.
-4. **Play.** Each player arrives on their own output in your DAW.
+4. **Play.** Each player arrives on their own output in your DAW
+   ([see routing](#every-player-on-their-own-channel)).
 
 ## Live mode
 
@@ -69,6 +72,8 @@ distance allows.
 - **A room that tells you what's wrong.** If someone's connection isn't good
   enough for Live, the room names them and suggests Intervals mode. One click
   switches the whole room.
+
+<p align="center"><img src="docs/images/room-live.png" alt="A room in Live mode suggesting Intervals because one player drops out" width="800"></p>
 
 ## Intervals mode
 
@@ -111,9 +116,24 @@ is built to win it:
 - **Lost packets are asked for again**, and anything that still doesn't
   arrive is concealed and faded out, never clicked.
 
+## Every player on their own channel
+
+Besides the main mix of the whole room, O11 Session has eight extra stereo
+outputs, "Player 1" to "Player 8". Each player who joins gets one of their
+own, so you can route every bandmate to a separate channel in your DAW:
+
+- **Record each player on their own track**, ready to edit and mix after the
+  jam.
+- **Mix them like any other track:** level, pan, mute, solo, EQ, compression,
+  reverb, sends.
+- **Send a player anywhere:** to a headphone mix, a sidechain or an
+  external output of your audio interface.
+
+In Ableton, for example, create an audio track, set its Audio From to the
+O11 Session track and pick "Player 1".
+
 ## More features
 
-- **Up to eight other players**, each on a separate stereo output.
 - **Room chat and votes** for tempo, interval and sound quality.
 - **Built-in metronome**, saved with your project along with every setting.
 - **Small and light.** One compact window and a light footprint.
