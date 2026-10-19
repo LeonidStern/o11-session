@@ -952,16 +952,20 @@ void LiveSink::unabsorb(std::int64_t above) {
 }
 
 // The window closes. What the sender's xrun blocks didn't take back is
-// skipped of the stream's own audio, to the nearest block. When xrun blocks
-// came, up to a block of it is their rounding (the sender carries the rest
-// of its gap over to the next) and up to the slack the hosts' measures of
-// the gap differing: that stays.
+// skipped of the stream's own audio: to the nearest block when none came
+// (this host alone missed the time). When xrun blocks came, up to a block
+// of what is owed is their rounding (whole frames: the sender carries the
+// rest of its gap over to the next) and up to the slack the hosts' measures
+// of the gap differing. Skipping that would take the delay below where it
+// was, so it stays: what is left after the slack goes in whole blocks,
+// rounded down.
 void LiveSink::closeGap(std::int64_t now_ns) {
     const std::int64_t owed = gap_owed48_;
     const bool absorbed = gap_absorbed_ > 0;
     forgetGap();
-    if (owed <= 0 || (absorbed && owed < block_ + gapSlack48())) return;
-    const std::int64_t n = static_cast<std::int64_t>(std::floor(static_cast<double>(owed) / block_ + 0.5));
+    if (owed <= 0) return;
+    const std::int64_t n = absorbed ? (owed - gapSlack48()) / block_
+                                    : static_cast<std::int64_t>(std::floor(static_cast<double>(owed) / block_ + 0.5));
     if (n > 0) skipBlocks(n, now_ns);
 }
 

@@ -280,10 +280,12 @@ public:
     // turn and are neither concealed nor counted, so a stall that hits both
     // hosts alike is neither heard nor moves the delay. What the xrun
     // blocks don't take back is skipped of the stream's own audio once the
-    // window closes, to the nearest block, as the delay needs; when xrun
-    // blocks came, up to a block and gapSlack48() of it is their rounding
-    // and the hosts' measures differing, and stays. A stream still finding
-    // its delay skips the time missed at once.
+    // window closes, as the delay needs: to the nearest block when no xrun
+    // blocks came; when some did, up to a block and gapSlack48() of it is
+    // their rounding and the hosts' measures differing, so what is left
+    // after the slack goes in whole blocks, rounded down, and never takes
+    // the delay below where it was by a frame or more. A stream still
+    // finding its delay skips the time missed at once.
     void hostLate(int host_frames, int host_rate, std::int64_t now_ns);
     void hostGap(int host_frames, int host_rate, std::int64_t now_ns);
     void hostCaughtUp();

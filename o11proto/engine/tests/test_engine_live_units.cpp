@@ -1357,6 +1357,29 @@ TEST(sink_host_stalls_in_between) {
             CHECK_EQ(r.c.lost, 0u);
             CHECK(std::labs(r.after - r.before) <= frame + 128);
         }
+        // The hosts' measures of the gaps differ, by up to a host block:
+        // what is skipped still takes the delay no lower than it was by a
+        // frame (the sender's xrun blocks are whole frames, rounded down),
+        // nor leaves it higher than a frame and the slack each way.
+        for (int c : {0, 2, 11}) {
+            const Case& cs = cases[c];
+            for (int off : {-120, -40, 40, 120}) {
+                const long at = 700;
+                const StallResult r =
+                    runStall(frame, at + cs.send_from, cs.send_blocks, at + cs.recv_from, cs.recv_blocks, 24, 0, 0, off);
+                char what[112];
+                std::snprintf(what, sizeof(what), "%s, the receiver's measure %+d", cs.what, off);
+                printStall(what, frame, r);
+                const long sent = cs.send_blocks * 128L, missed = cs.recv_blocks * 128L;
+                CHECK(r.playing);
+                CHECK(r.corr_after > 0.9);
+                CHECK(r.c.host_gap48 <= std::max(0L, missed - sent) + frame);
+                CHECK(r.after - r.before > -frame);
+                CHECK(r.after - r.before <= frame + 2 * 128);
+                CHECK_EQ(r.c.overruns, 0u);
+                CHECK_EQ(r.c.lost, 0u);
+            }
+        }
     }
 }
 
