@@ -111,7 +111,6 @@ public:
   // nowUs (Link's clock): returns the offset to add to nominalUs
   double update(double nominalUs, double nowUs, double blockUs);
   void reset() { m_have = false; }
-  double offsetUs() const { return m_offset; }
 
 private:
   long long m_bucket[BUCKETS] = {}, m_last = 0;

@@ -2,10 +2,11 @@
 //
 // One thread (section 4) maps the port (section 5), waits for the renewal
 // time or the retry time, and removes the mapping (section 6) when told to
-// stop. UPnP-IGD goes through miniupnpc, NAT-PMP through libnatpmp.
+// stop. UPnP-IGD goes through miniupnpc, NAT-PMP through libnatpmp. With
+// Live (PROTOCOL.md 15.8) the UDP port of the same number is mapped too,
+// after TCP and with TCP's lease; a UDP failure never fails the TCP mapping.
 #include "o11proto/portmap.h"
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -14,6 +15,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include "socket_compat.h"   // Asio
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -30,7 +33,6 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #endif
@@ -58,6 +60,7 @@ constexpr int kNatpmpRemoveWaitMs = 2000;
 constexpr int kPollStepMs = 250;
 constexpr const char* kDescription = "O11 Session";
 constexpr const char* kProtocol = "TCP";
+constexpr const char* kUdpProtocol = "UDP";
 
 constexpr const char* kUpnpTypes[] = {
     "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
@@ -144,8 +147,10 @@ bool isPrivateIPv4(const std::string& dotted) {
 struct PortMapper::Impl {
     std::function<void(const std::string&)> log;
     int port = 0;
+    bool udp = false;                   // map the UDP port too (Live)
 
     std::thread thread;
+    asio::io_context io{1};             // the mapping thread's waits for NAT-PMP's answers
     std::mutex mutex;
     std::condition_variable cv;
     bool stopping = false;
@@ -159,9 +164,33 @@ struct PortMapper::Impl {
     in_addr_t natpmpGateway = 0;
     bool natpmpForceGateway = false;
     unsigned natpmpPublicPort = 0;
+    // UDP (Live). udpWorks: the router forwards UDP on the TCP port's number.
+    bool udpWorks = false;
+    bool udpWarned = false;             // the warning is logged once, until UDP works again
+    unsigned natpmpUdpPublicPort = 0;   // a NAT-PMP UDP mapping held, even at another port
 
     void emit(const std::string& line) {
         if (log) log("[portmap] " + line);
+    }
+
+    // "TCP port" or, while UDP works too, "TCP and UDP port".
+    const char* ports() const { return udpWorks ? "TCP and UDP port " : "TCP port "; }
+
+    void udpWorking() {
+        udpWorks = true;
+        udpWarned = false;
+    }
+
+    // Deliberately not a [portmap] line: a hosting plug-in keeps showing the
+    // address people connect to.
+    void udpFailed(const std::string& why) {
+        udpWorks = false;
+        if (udpWarned) return;
+        udpWarned = true;
+        if (log)
+            log("warning: Live: the router did not forward UDP port " + std::to_string(port) + " (" + why +
+                "), so players outside your network can't play Live with you: while the room is Live they hear no "
+                "one, and no one hears them (!live off puts everyone on intervals)");
     }
 
     bool stopRequested() {
@@ -225,6 +254,16 @@ struct PortMapper::Impl {
                 emit("UPnP: router refused to forward TCP port " + portStr + " (error " + std::to_string(r) + ")");
             return -1;
         }
+        if (udp) {                              // same ports, address, description and lease
+            const std::string lease = upnpPermanentOnly ? "0" : std::to_string(kLeaseSeconds);
+            int u = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, portStr.c_str(), portStr.c_str(),
+                                        lanaddr, kDescription, kUdpProtocol, nullptr, lease.c_str());
+            if (u == UPNPCOMMAND_SUCCESS)
+                udpWorking();
+            else
+                udpFailed(u == 718 ? std::string("UPnP: the router forwards it to another machine")
+                                   : "UPnP error " + std::to_string(u));
+        }
         char external[64] = {0};
         std::string addr;
         if (UPNP_GetExternalIPAddress(urls.controlURL, data.first.servicetype, external) == UPNPCOMMAND_SUCCESS)
@@ -235,9 +274,15 @@ struct PortMapper::Impl {
 
     void upnpRemove() {
         const std::string portStr = std::to_string(port);
+        bool udpRemoved = false;
+        if (udpWorks)                           // UDP first, quietly
+            udpRemoved = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, portStr.c_str(),
+                                                kUdpProtocol, nullptr) == UPNPCOMMAND_SUCCESS;
+        udpWorks = false;
         int r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, portStr.c_str(), kProtocol, nullptr);
         if (r == UPNPCOMMAND_SUCCESS)
-            emit("UPnP: removed the forward for TCP port " + portStr);
+            emit(std::string("UPnP: removed the forward for ") + (udpRemoved ? "TCP and UDP port " : "TCP port ") +
+                 portStr);
         else
             emit("UPnP: could not remove the forward for TCP port " + portStr + " (error " + std::to_string(r) + ")");
         FreeUPNPUrls(&urls);
@@ -260,30 +305,44 @@ struct PortMapper::Impl {
 
     // Waits for the answer to the pending request for up to waitMs, calling
     // readnatpmpresponseorretry every 250 ms (it retransmits on its own
-    // schedule). With checkStop, gives up when stop() was called. Returns the
-    // library result, or NATPMP_TRYAGAIN when the time ran out.
+    // schedule) or as soon as libnatpmp's socket is readable. The waits are
+    // Asio's, on the mapper's io_context, with the socket lent to it for the
+    // time of the call (released, not closed: closenatpmp closes it). With
+    // checkStop, gives up when stop() was called. Returns the library result,
+    // or NATPMP_TRYAGAIN when the time ran out.
     int natpmpWait(natpmp_t& np, natpmpresp_t& resp, int waitMs, bool checkStop) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs);
+        asio::ip::udp::socket sock(io);
+        asio::error_code lent;
+        sock.assign(asio::ip::udp::v4(), static_cast<asio::ip::udp::socket::native_handle_type>(np.s), lent);
+        asio::steady_timer step_timer(io);
+        int r = NATPMP_TRYAGAIN;
         for (;;) {
-            if (checkStop && stopRequested()) return NATPMP_TRYAGAIN;
+            if (checkStop && stopRequested()) break;
             auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) return NATPMP_TRYAGAIN;
+            if (now >= deadline) break;
             auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
             int step = static_cast<int>(left < kPollStepMs ? left : kPollStepMs);
-            fd_set fds;
-            FD_ZERO(&fds);
-#ifdef _WIN32
-            FD_SET(static_cast<SOCKET>(np.s), &fds);
-#else
-            FD_SET(np.s, &fds);
-#endif
-            timeval tv{};
-            tv.tv_sec = step / 1000;
-            tv.tv_usec = (step % 1000) * 1000;
-            select(np.s + 1, &fds, nullptr, nullptr, &tv);
-            int r = readnatpmpresponseorretry(&np, &resp);
-            if (r != NATPMP_TRYAGAIN) return r;
+            if (!lent) sock.async_wait(asio::socket_base::wait_read, [](const asio::error_code&) {});
+            step_timer.expires_after(std::chrono::milliseconds(step));
+            step_timer.async_wait([](const asio::error_code&) {});
+            io.restart();
+            io.run_one();                       // the answer, or the step's time
+            asio::error_code ignored;
+            if (!lent) sock.cancel(ignored);
+            step_timer.cancel();
+            io.run();                           // the other one ends too
+            r = readnatpmpresponseorretry(&np, &resp);
+            if (r != NATPMP_TRYAGAIN) break;
         }
+        if (!lent) {
+            asio::error_code kept;
+            sock.release(kept);
+            // Should Asio ever keep it, it closes it: then libnatpmp mustn't
+            // (its next requests fail, as when the router doesn't answer).
+            if (kept) np.s = static_cast<decltype(np.s)>(-1);
+        }
+        return r;
     }
 
     // Sends a TCP mapping request and waits for the answer. Returns the
@@ -311,6 +370,7 @@ struct PortMapper::Impl {
         }
         natpmpPublicPort = resp.pnu.newportmapping.mappedpublicport;
         const int lifetime = static_cast<int>(resp.pnu.newportmapping.lifetime);
+        if (udp) natpmpAddUdp(np);
 
         std::string addr;
         natpmpresp_t addrResp{};
@@ -325,19 +385,51 @@ struct PortMapper::Impl {
         return lifetime;
     }
 
+    // The UDP request after the TCP mapping: the public port TCP was granted,
+    // since clients send UDP to the TCP port number they reached.
+    void natpmpAddUdp(natpmp_t& np) {
+        int r = sendnewportmappingrequest(&np, NATPMP_PROTOCOL_UDP, static_cast<uint16_t>(port),
+                                          static_cast<uint16_t>(natpmpPublicPort), kLeaseSeconds);
+        natpmpresp_t resp{};
+        if (r >= 0) r = natpmpWait(np, resp, kNatpmpWaitMs, true);
+        if (stopRequested()) return;
+        if (r >= 0 && resp.type == NATPMP_RESPTYPE_UDPPORTMAPPING) {
+            natpmpUdpPublicPort = resp.pnu.newportmapping.mappedpublicport;   // kept even when it differs
+            if (natpmpUdpPublicPort == natpmpPublicPort)
+                udpWorking();
+            else
+                udpFailed("NAT-PMP: it gave public port " + std::to_string(natpmpUdpPublicPort) + ", not " +
+                          std::to_string(natpmpPublicPort));
+        } else if (r < 0 && natpmpIsRefusal(r)) {
+            udpFailed("NAT-PMP error " + std::to_string(natpmpErrorCode(r)));
+        } else {
+            udpFailed("NAT-PMP: the router did not answer");
+        }
+    }
+
     void natpmpRemove() {
         const std::string portStr = std::to_string(natpmpPublicPort);
         natpmp_t np;
         int r = NATPMP_ERR_SOCKETERROR;
+        bool udpRemoved = false;
         if (natpmpGatewayFromEnv() && initnatpmp(&np, natpmpForceGateway ? 1 : 0, natpmpGateway) == 0) {
+            natpmpresp_t resp{};
+            if (natpmpUdpPublicPort != 0) {     // UDP first, quietly
+                int u = sendnewportmappingrequest(&np, NATPMP_PROTOCOL_UDP, static_cast<uint16_t>(port),
+                                                  static_cast<uint16_t>(natpmpUdpPublicPort), 0);
+                if (u >= 0) u = natpmpWait(np, resp, kNatpmpRemoveWaitMs, false);
+                udpRemoved = u >= 0 && udpWorks;
+            }
             r = sendnewportmappingrequest(&np, NATPMP_PROTOCOL_TCP, static_cast<uint16_t>(port),
                                           static_cast<uint16_t>(natpmpPublicPort), 0);
-            natpmpresp_t resp{};
             if (r >= 0) r = natpmpWait(np, resp, kNatpmpRemoveWaitMs, false);
             closenatpmp(&np);
         }
+        natpmpUdpPublicPort = 0;
+        udpWorks = false;
         if (r >= 0)
-            emit("NAT-PMP: removed the forward for TCP port " + portStr);
+            emit(std::string("NAT-PMP: removed the forward for ") + (udpRemoved ? "TCP and UDP port " : "TCP port ") +
+                 portStr);
         else
             emit("NAT-PMP: could not remove the forward for TCP port " + portStr + " (error " +
                  std::to_string(natpmpErrorCode(r)) + ")");
@@ -348,9 +440,9 @@ struct PortMapper::Impl {
     void report(const std::string& how, const std::string& addr, int externalPort) {
         const std::string p = std::to_string(externalPort);
         if (addr.empty() || addr == "0.0.0.0")
-            emit(how + ": router forwards TCP port " + p + " to this machine, but did not say its public address");
+            emit(how + ": router forwards " + ports() + p + " to this machine, but did not say its public address");
         else if (isPrivateIPv4(addr))
-            emit(how + ": router forwards TCP port " + p + " to this machine, but the router's own internet address is " +
+            emit(how + ": router forwards " + ports() + p + " to this machine, but the router's own internet address is " +
                  addr + ", which is not public. Your internet provider probably uses carrier-grade NAT, or another "
                  "router sits in front of this one, so people outside your network still can't connect. Ask your "
                  "provider for a public IPv4 address, or run the server on a hosted machine.");
@@ -405,7 +497,8 @@ struct PortMapper::Impl {
         pthread_sigmask(SIG_BLOCK, &blocked, nullptr);
 #endif
         const std::string portStr = std::to_string(port);
-        emit("asking the router to forward TCP port " + portStr + " to this machine");
+        emit(std::string("asking the router to forward ") + (udp ? "TCP and UDP port " : "TCP port ") + portStr +
+             " to this machine");
         bool warned = false;
         while (!stopRequested()) {
             const int lease = map();
@@ -418,8 +511,9 @@ struct PortMapper::Impl {
                 }
                 if (!warned) {
                     emit("could not find a router that supports UPnP or NAT-PMP. Forward TCP port " + portStr +
-                         " on your router to this machine by hand, or turn on UPnP in the router's settings. "
-                         "Will keep trying every 5 minutes.");
+                         " on your router to this machine by hand, " +
+                         (udp ? "and UDP port " + portStr + " for Live, " : std::string()) +
+                         "or turn on UPnP in the router's settings. Will keep trying every 5 minutes.");
                     warned = true;
                 }
                 waitFor(kRetrySeconds);
@@ -446,11 +540,14 @@ PortMapper::PortMapper() : impl_(new Impl) {}
 
 PortMapper::~PortMapper() { stop(); }
 
-void PortMapper::start(int port) {
+void PortMapper::start(int port, bool udp) {
     stop();
     socketsStartup();
     impl_->log = log;
     impl_->port = port;
+    impl_->udp = udp;
+    impl_->udpWorks = impl_->udpWarned = false;
+    impl_->natpmpUdpPublicPort = 0;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->stopping = false;

@@ -24,8 +24,8 @@ namespace o11 {
 namespace uitext {
 
 constexpr int BPM_MIN = 40, BPM_MAX = 240;           // what the BPM box votes for
-constexpr int BPI_CHOICES[] = { 2, 4, 8, 12, 16, 24, 32, 48, 64 }; // 2 to 64, as the server allows
-constexpr int NUM_BPI_CHOICES = 9;
+constexpr int BPI_CHOICES[] = { 2, 4, 8, 12, 16 }; // Leo's list; a typed /bpi can still set up to 64
+constexpr int NUM_BPI_CHOICES = 5;
 constexpr double PIXELS_PER_BPM = 2.0;               // dragging the BPM box up or down (4 times as far with Shift)
 // the level meters show -60 dB to 0 dB: green, amber from -12 dB, red from -3 dB
 constexpr float METER_FLOOR_DB = -60.0f, METER_AMBER = 0.8f, METER_RED = 0.95f;
@@ -55,6 +55,18 @@ std::string playersText(int players);
 std::string joinedText(double seconds);
 // a player's gaps in their audio: "1 dropout", "3 dropouts"
 std::string dropoutsText(long n);
+// a delay in the Mode box, its tooltip and the room's events: "28 ms"
+std::string msText(int ms);
+// the Mode box: "Live 28 ms" while the room plays Live ("Live" until the delay is known), else
+// "Intervals"
+std::string liveModeText(bool live, int heardMs);
+// the Mode menu's choice "Intervals · 4 beats", and the box's shorter "Intervals · 4" (just "Intervals" for 0)
+std::string intervalsModeText(int beats, bool unit);
+// the advice while the room is Live (the Snapshot's liveReason: 1 a connection's dropouts, 2 a
+// client that can't play Live), whose ("You" for yours) and how many more, suggesting
+// Intervals: "Anna drops out: try Intervals", "Your connection drops out: try Intervals",
+// "Carol and 1 more can't play Live: try Intervals"; "" for no reason
+std::string liveAdviceText(int reason, const std::string &who, int others);
 // how long ago something happened, in the room panel: "now", "12 s", "2 min", "1 h"
 std::string ageText(double seconds);
 // a server's line with the players' addresses taken out: "anna@203.0.113.9 set ..." is "anna set ..."
@@ -64,9 +76,9 @@ std::string withoutAddresses(const std::string &text);
 // chat, with the plug-in's own notes and the server's messages): who came and went, what
 // changed (tempo, interval, codec, bitrate), and what the server says. The kinds are the
 // engine's (ChatLine): the plug-in's notes, the server's messages, the built-in server's log,
-// joins, leaves, what players say (only their votes are shown), anything else (errors the
-// editor shows elsewhere).
-enum class LineKind { Note, Server, HostLog, Join, Leave, Chat, Other };
+// joins, leaves, what players say (only their votes are shown), the engine's Live lines (the
+// room went Live, or back on intervals), anything else (errors the editor shows elsewhere).
+enum class LineKind { Note, Server, HostLog, Join, Leave, Chat, Live, Other };
 struct RoomEvent
 {
   enum Tone { Plain, Change, Warn }; // grey, purple, amber

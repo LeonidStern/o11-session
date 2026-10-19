@@ -1054,7 +1054,10 @@ TEST(send_to_reset_peer_is_an_error) {
     REQUIRE(afd != kInvalidSocket);
     Connection conn(afd);
     resetClose(peer);
-    bool failed = false, saw_epipe = false;
+    bool failed = false;
+#ifndef _WIN32
+    bool saw_epipe = false;
+#endif
     std::vector<std::uint8_t> chunk(1000, 0x55);
     for (int i = 0; i < 200; ++i) {
         // Through the Connection, then a bare compat::send with no flags:

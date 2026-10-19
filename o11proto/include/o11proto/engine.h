@@ -1,7 +1,8 @@
 // o11proto engine - the NINJAM client engine (ENGINE.md revision 1).
 //
 // Two contexts: the audio context calls process(); the control context calls
-// run() and everything else. See ENGINE.md section 2.
+// run() and everything else. See ENGINE.md section 2. Live mode (section 16)
+// adds a network thread of its own, which the application never sees.
 #ifndef O11PROTO_ENGINE_H
 #define O11PROTO_ENGINE_H
 
@@ -31,6 +32,7 @@ constexpr int kPrebufferBytes = 8192;
 constexpr int kFirstWriteThreshold = 8192;
 constexpr int kLaterWriteThreshold = 2048;
 constexpr int kCrossfadeFrames = 128;
+constexpr double kLiveResumeFadeSeconds = 0.02;   // the first interval uploaded after the room left Live fades in
 constexpr int kDropoutSlackFrames = 64;          // late data this close to the interval's end is no dropout (8.7)
 
 // Settings of a local channel (ENGINE.md 5.1).
@@ -52,6 +54,89 @@ inline void panGains(float pan, float* left, float* right) {
     *left = pan > 0 ? 1.0f - pan : 1.0f;
     *right = pan < 0 ? 1.0f + pan : 1.0f;
 }
+
+// How Live's audio goes (all-to-all, Engine::liveRoomRoute(), and a
+// stream's LiveCounters::route): directly between the players, or through
+// the server's relay; None without Live, or with a server without the
+// direct paths.
+enum class LiveRoute : std::uint8_t { None = 0, Direct = 1, Relay = 2 };
+const char* liveRouteName(LiveRoute route);       // "none", "direct", "relay"
+// Why the room's Live goes through the relay (o11proto/live_room.h).
+enum class LiveRelayReason : std::uint8_t {
+    None = 0,
+    NoPath,                                      // the pair user_a, user_b had no direct path
+    NoDirectClient,                              // user_a's client doesn't send directly
+    RelayOnly,                                   // user_a's client sends through the relay only (its test setting)
+};
+struct LiveRoomRoute {
+    LiveRoute route = LiveRoute::None;
+    LiveRelayReason reason = LiveRelayReason::None;   // while Relay
+    std::string user_a, user_b;                  // the users the reason names ("" for none)
+    // While Relay: every pair of the room's Live players has a direct path
+    // again, so `!live direct` (Engine::setLiveRoomDirect()) would take the
+    // room back to all-to-all. Advice, as the trouble advice is.
+    bool direct_possible = false;
+};
+
+// Live, per user, for a UI or a log (Engine::liveUserCounters(),
+// Engine::liveUserEvents()): what the user's stream did here since the
+// user's Live slot got its stream. Blocks are the stream's frames (5 ms at
+// the default); frames are at 48 kHz.
+struct LiveCounters {
+    std::uint32_t late = 0;                      // blocks that came after their turn to play, unplayed
+    std::uint32_t lost = 0;                      // blocks missing at their turn that never came (so far)
+    std::uint64_t concealed_frames = 0;          // concealment played once the stream had played
+    std::uint32_t underruns = 0;                 // times it ran dry
+    std::uint32_t overflows = 0;                 // times it had no room, or was late for good: buffered afresh
+    std::uint32_t xrun_gaps = 0;                 // the sender's host missed time (6.4)
+    std::uint32_t resent = 0;                    // blocks that came when asked for again
+    // Corrections that moved the playback position: jumps when it buffered
+    // afresh (blocks skipped), this host's own gaps (the stream skipped by
+    // as much), and the speed leaving the clock's own to bring the fill back
+    // (how often, how far it moved the stream in all, + ahead, and the
+    // speed now, + faster).
+    std::uint32_t skips = 0;
+    std::int64_t skipped_frames = 0;
+    std::uint32_t host_gaps = 0;
+    std::int64_t host_gap_frames = 0;
+    std::uint32_t speed_changes = 0;
+    double speed_moved_ms = 0;
+    double speed_ppm = 0;
+    double fill_ms = -1;                         // as liveUserBufferMs()
+    // The jitter buffer the stream plays with now, in ms, and whether it
+    // fell back to the larger automatic one (Engine::setLiveBufferMs()).
+    int buffer_ms = -1;
+    bool fell_back = false;
+    LiveRoute route = LiveRoute::None;           // the path the stream's blocks come by now (None before one)
+};
+enum class LiveEventKind : std::uint8_t {
+    None = 0,
+    Stream,                                      // a new stream (value: its first block's sequence)
+    Play,                                        // playback began after buffering (value: µs buffered)
+    Late,                                        // a block came after its turn, unplayed (value: µs after it)
+    Lost,                                        // a block missing at its turn: concealed (value: its sequence)
+    Dry,                                         // nothing at a block's turn: concealed (value: its sequence)
+    Rejoin,                                      // after running dry, back on its delay (value: the block played)
+    Overflow,                                    // a block with no room: buffers afresh (value: its sequence)
+    Rebuffer,                                    // late for good after running dry: buffers afresh
+    Skip,                                        // the position jumped ahead (value: frames)
+    HostGap,                                     // this host missed time: the stream skipped (value: frames)
+    Xrun,                                        // the sender's host missed time: concealed (value: its sequence)
+    SpeedOn,                                     // the speed left the clock's own (value: the fill's error, µs)
+    SpeedOff,                                    // and has been back for 1 s (value: the furthest it went, ppm)
+    End,                                         // the stream ended or went
+    Fallback,                                    // the automatic buffer fell back (value: the buffer now, ms)
+    Route,                                       // the blocks come by this path now (value: a LiveRoute; first with the stream)
+};
+const char* liveEventName(LiveEventKind kind);   // "late", "lost", ...
+struct LiveEvent {
+    std::int64_t steady_ns = 0;                  // std::chrono::steady_clock, ns since its epoch
+    LiveEventKind kind = LiveEventKind::None;
+    std::int64_t value = 0;
+};
+
+struct LiveLayer;                                 // Live mode's state (engine/src/live_layer.h)
+struct LiveMix;                                   // a user's channel 0 in the Live mixer (same header)
 
 // Interval length of ENGINE.md 4.3, computed exactly as the reference does.
 inline int intervalLengthFor(int bpm, int bpi, int sampleRate) {
@@ -171,19 +256,140 @@ public:
     void admin(const std::string& command);
     void sendChat(const std::array<std::string, 5>& fields);
 
+    // ---- Live mode (section 16): real-time audio over UDP on servers that
+    // have it, in place of each Live player's channel 0 intervals.
+    // Notices come from run(); `error` marks lines shown in the error style.
+    std::function<void(const std::string& text, bool error)> onLiveNotice;
+    void setLiveEnabled(bool v) { live_enabled_.store(v); }   // announce Live at the next connect() (default on)
+    bool liveEnabled() const { return live_enabled_.load(); }
+    // The jitter buffer (6.8), per sender. Automatic, the default: each
+    // stream starts at 10 ms and falls back to 20 ms at its second late
+    // dropout within 10 s (it ran dry and its audio came late, or a block
+    // came too late to play; a block lost doesn't count), for as long as
+    // that stream lasts. setLiveBufferMs(ms) fixes every stream at `ms`
+    // (5..200), without a fallback; setLiveBufferAutomatic() (or
+    // setLiveBufferMs(kLiveBufferAutomatic)) goes back. Either is raised for
+    // long host blocks. liveBufferMs() is the fixed setting, or
+    // kLiveBufferAutomatic; liveBufferInUseMs() is B: the fixed setting, or
+    // what an automatic stream starts at, each raised for long host blocks.
+    static constexpr int kLiveBufferAutomatic = 0;
+    void setLiveBufferMs(int ms);
+    void setLiveBufferAutomatic() { setLiveBufferMs(kLiveBufferAutomatic); }
+    bool liveBufferAutomatic() const { return live_setting_ms_.load() == kLiveBufferAutomatic; }
+    int liveBufferMs() const { return live_setting_ms_.load(); }
+    int liveBufferInUseMs() const;
+    // The saved `live_buffer_ms=` value: "auto" or 0 for automatic, else a
+    // whole number clamped to 5..200; false for anything else.
+    static bool parseLiveBufferSetting(const std::string& value, int* ms);
+    bool liveCommand(const std::string& text);  // "/live ...": answered here (true), never sent
+    void setLiveHostState(bool playing, bool offline);   // the host's transport and offline rendering
+    bool liveRunning() const;                   // the Live client (its UDP socket) runs
+    bool userLive(int user) const;              // this user's channel 0 is heard live now
+    // The room has one mode for everyone, set by its `!live` switch alone
+    // (o11proto/live_room.h): Live, with no interval audio at all (none is
+    // uploaded or relayed), or intervals. liveRoomLive() says this engine
+    // plays the room Live now (taken at an interval boundary, and false at
+    // once when the switch goes off or Live can't play here). A player who
+    // can't play Live neither hears nor is heard while the room is Live.
+    // Then the server's advice says who has trouble: liveAdviceReason() why
+    // (dropouts, or can't play Live), liveAdviceUser() whose (the worst, or
+    // the first; "" with no advice) and liveAdviceCount() how many players
+    // have trouble, the one named among them (0 with no advice). A UI may
+    // suggest switching the room to intervals then; notices say when the
+    // advice appears and clears.
+    enum class LiveAdvice { None, Dropouts, CantLive };
+    bool liveRoomLive() const;
+    LiveAdvice liveAdviceReason() const;
+    std::string liveAdviceUser() const;
+    int liveAdviceCount() const;
+    // For a UI, from the control context: the latest SERVER_LIVE says the
+    // server has Live with its UDP port open (liveServerHas()) and the
+    // room's `!live` switch is on (liveRoomSwitchOn()); liveHeardMs() is
+    // about how late this listener hears the Live players (the median of
+    // the 6.10 estimates of the slots playing live, rounded; the N of "The
+    // room is Live now, about N ms late."), -1 while the room isn't Live or
+    // there is no estimate yet.
+    bool liveServerHas() const;
+    bool liveRoomSwitchOn() const;
+    int liveHeardMs() const;
+    // For a UI or a log, per user: how full the jitter buffer of this
+    // user's Live stream is now (its fill smoothed over 0.5 s, which its
+    // speed keeps at the level buffering gave), and how late this listener
+    // hears the user now (the one-way estimate of 6.10 with that fill in
+    // place of what the buffer held when playback started), in ms; -1
+    // while the user's stream isn't playing here (or, for the second,
+    // without a round trip yet).
+    double liveUserBufferMs(int user) const;
+    double liveUserHeardMs(int user) const;
+    // The counts of LiveCounters for this user's stream, false (and `out`
+    // untouched) without one; and its latest events (at most 64, the
+    // oldest first, at most `max`). Any context, lock-free with the audio.
+    bool liveUserCounters(int user, LiveCounters* out) const;
+    std::vector<LiveEvent> liveUserEvents(int user, std::size_t max = 64) const;
+    // The jitter buffer this user's stream plays with now (ms; -1 without
+    // a stream), and whether it fell back (automatic only; it stays fallen
+    // back until the user's stream starts again). Any context.
+    int liveUserBufferInUseMs(int user) const;
+    bool liveUserBufferFellBack(int user) const;
+    // All-to-all (16.x), the room's route, from the latest room message
+    // (control context). Direct: every player sends to each other player
+    // directly, and only directly; a pair whose path doesn't hold (the
+    // probe rule: no answer for 10 s) can't hear each other, and the
+    // server's advice names one of them as can't play Live. A player who
+    // can't send directly (an older client, or setLiveTestForceRelay()) is
+    // heard and hears through the relay. None with a server without the
+    // paths.
+    // With the server's backend option LiveConfig::relay_fallback, the room
+    // goes Relay instead, everyone through the relay, once a pair has no
+    // direct path or a player can't send directly, and stays so until
+    // setLiveRoomDirect() (it sends `!live direct`, shown nowhere), which
+    // the server takes while no pair is known to have no path;
+    // direct_possible advises it. A room with no Live player starts Direct.
+    LiveRoomRoute liveRoomRoute() const;
+    std::string liveRoomRouteText() const;      // one line for a log: "direct", "relay: alice and bob ..."
+    void setLiveRoomDirect();
+    // Per user (any context): whether the direct path to this user holds
+    // now (a probe answered within 10 s), and the latest answered probe's
+    // round trip on it, ms (-1 for none).
+    bool liveUserHasDirectPath(int user) const;
+    double liveUserProbeRttMs(int user) const;
+    // Test hooks, any context. setLiveTestForceRelay() (for benchmarks):
+    // this engine sends and takes Live through the relay only and tells the
+    // server so (its CLIENT_LIVE_PATHS): the others then reach it through
+    // the relay too (with relay_fallback, the room goes to the relay).
+    // Nothing else on the wire says so. setLiveTestBlockPeer(): nothing goes directly
+    // between this engine and the user of this name, as on a network that
+    // stops letting it through: the probe rule finds it.
+    void setLiveTestForceRelay(bool on);
+    void setLiveTestBlockPeer(const std::string& name, bool blocked);
+    void setLiveTestLoss(double fraction);      // test hook: drop this share of the datagrams received
+    void setLiveTestSendGap(int ms);            // test hook: the Live data sent in the next `ms` is lost
+    void setLiveTestSendHold(int ms);           // test hook: ... is held back, then sent all at once
+    // Test hook: the frame (counted from this engine's first process()
+    // block) where this user's live audio last went into concealment, -1
+    // for never.
+    long liveTestConcealedFrom(int user) const;
+    // For diagnostics: the Live network thread's scheduling, its longest
+    // wake-up delay and its timed waits (live::Transport::timing()), one line.
+    std::string liveTestTiming() const;
+
 private:
     struct UploadBlock {
         enum Kind { Audio, End, Silence } kind = Audio;
         int channels = 1;
         int rate = 48000;
+        bool fresh = false;                     // after a pause (the room was Live): a new encoder, nothing carried over
         std::vector<float> data;                // interleaved
     };
     struct LocalState {
         LocalChannel s;
         bool transmitting = false;              // audio context
+        bool live_paused = false;               // audio context: not transmitting while the room is Live
+        int fade_in = 0, fade_len = 0;          // audio context: the interval fades in (frames to go, of)
         std::atomic<float> peak[2]{{0.0f}, {0.0f}};
         std::mutex qm;                          // upload queue
         std::vector<UploadBlock> queue;
+        std::vector<UploadBlock> drained;       // uploadLoop's turn (control context only)
         std::vector<std::vector<float>> spare;  // recycled block buffers
         // control-context encoder state
         std::unique_ptr<Encoder> enc;
@@ -227,6 +433,9 @@ private:
         int fade_channels = 0;
         bool ignoresIntervals() const { return (flags & (kChanVoice | kChanSession)) != 0; }
     };
+    struct LiveMixDeleter {
+        void operator()(LiveMix* p) const;
+    };
     struct RemoteUser {
         std::string name;
         float volume = 1.0f;
@@ -234,6 +443,16 @@ private:
         bool mute = false;
         std::uint32_t submask = 0;
         std::array<RemoteChannel, kMaxChannels> ch;
+        // Live mode: the user's slot as the control context sees it (and
+        // its generation; -1 when it has none here or its player can't do
+        // Live), the one the mixer plays, taken at a boundary, and channel
+        // 0's two paths in the mixer (null until the server has Live).
+        int live_want = -1;
+        std::uint32_t live_want_gen = 0;
+        int live_slot = -1;
+        std::uint32_t live_gen = 0;
+        std::atomic<bool> live_now{false};
+        std::unique_ptr<LiveMix, LiveMixDeleter> live_mix;
     };
     struct Download {
         std::string user;
@@ -288,6 +507,7 @@ private:
     std::map<int, std::unique_ptr<LocalState>> locals_;
     std::vector<std::unique_ptr<RemoteUser>> users_;
     std::vector<std::unique_ptr<Decoder>> garbage_;
+    std::vector<std::unique_ptr<Decoder>> garbage_spare_;   // collectGarbage's turn (control context only)
     std::map<Guid, Download> downloads_;
 
     std::atomic<Status> status_{Status::Preconnect};
@@ -320,6 +540,28 @@ private:
     std::atomic<int> metro_out_{0};
 
     std::vector<float> mix_tmp_;
+
+    // Live mode (engine_live.cpp, live_layer.cpp).
+    struct LiveDeleter {
+        void operator()(LiveLayer* p) const;
+    };
+    void liveInit();
+    void liveMessage(const live::ServerLive& m);
+    void liveRawMessage(const RawMessage& m);   // the room message (0x08)
+    void liveRoomNotices();
+    void liveControl();                         // run()
+    void liveReset();
+    void liveStatus();
+    void liveNotice(const std::string& text, bool error);
+    double liveOneWayMs(int slot, double* buffer_ms, double* network_ms, double* codec_ms) const;
+    void liveAudioBlock(const float* const* in, int numIn, int frames, int sampleRate);   // process()
+    void liveBoundary();                        // boundary(), before uploadBoundary() and newIntervalStep()
+    bool liveHoldsIntervals() const;            // audio context: the room is Live, so nothing is uploaded
+    void mixLive(float* const* out, int numOut, int len, int at, int sampleRate);   // channel 0 of Live users
+    void liveIntervalAudio(RemoteUser& u, int len, int sampleRate, float* dst);
+    std::atomic<bool> live_enabled_{true};
+    std::atomic<int> live_setting_ms_{kLiveBufferAutomatic};
+    std::unique_ptr<LiveLayer, LiveDeleter> live_;   // last: its network thread stops first
 };
 
 }  // namespace engine

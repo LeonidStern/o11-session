@@ -24,6 +24,8 @@
 #ifndef _O11_CLICK_H_
 #define _O11_CLICK_H_
 
+#include <vector>
+
 namespace o11 {
 
 class Click
@@ -35,7 +37,7 @@ public:
   static constexpr double ACCENT_HZ = 1500, BEAT_HZ = 1000;
   static constexpr double BEAT_LEVEL = 0.6;    // the other beats, against beat 1
 
-  void setSampleRate(double sampleRate);
+  void setSampleRate(double sampleRate); // not while render() runs: it makes the clicks' samples
   void reset(); // stop the click playing
 
   // Adds the clicks to `frames` samples of left (and right, if not null), which play
@@ -53,6 +55,7 @@ private:
   int m_length = 1920;
   int m_n = -1; // the sample of the click playing, -1 when none
   bool m_accent = false;
+  std::vector<double> m_samples[2]; // sample() at m_sampleRate, made by setSampleRate(): [0] the other beats, [1] the accent
 };
 
 } // namespace o11

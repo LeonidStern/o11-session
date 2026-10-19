@@ -45,6 +45,9 @@
 namespace o11 {
 namespace ui {
 
+// a UTF-8 std::string as a juce::String
+inline juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
+
 struct Colors
 {
   static juce::Colour window() { return juce::Colour(0xff242424); }
@@ -183,10 +186,10 @@ class MenuBox : public juce::Component, public juce::SettableTooltipClient
 {
 public:
   explicit MenuBox(const juce::Font &font);
-  void addEntry(const std::string &text) { m_entries.push_back(text); }
+  void addEntry(const std::string &text) { m_entries.push_back(text); m_entryEnabled.push_back(true); }
+  void setEntryEnabled(int index, bool enabled); // a greyed entry can't be picked
   void setShown(const std::string &text); // what the box says (the room's value may not be one of the choices)
   void setCurrentIndex(int index) { m_current = index; } // the checked entry, -1 for none
-  int currentIndex() const { return m_current; }
   std::function<void(int)> onSelect; // an entry was picked
   void paint(juce::Graphics &g) override;
   void mouseDown(const juce::MouseEvent &e) override;
@@ -196,6 +199,7 @@ private:
   std::string m_shown;
   juce::Font m_font;
   std::vector<std::string> m_entries;
+  std::vector<bool> m_entryEnabled;
   int m_current = -1;
 };
 
@@ -257,7 +261,6 @@ class LevelMeter : public juce::Component, public juce::SettableTooltipClient
 public:
   LevelMeter() = default;
   void setLevel(float peak, double now); // the latest peak (linear), at now (seconds)
-  bool clipped() const { return m_clip; }
   void paint(juce::Graphics &g) override;
   void mouseDown(const juce::MouseEvent &e) override; // puts the clip light out
 
@@ -293,6 +296,10 @@ public:
   explicit Chip(const juce::Font &font);
   void set(const std::string &text, const std::string &who);
   void paint(juce::Graphics &g) override;
+  void mouseUp(const juce::MouseEvent &e) override;
+
+  std::function<void()> onClick; // when set, the chip is a button (a hand over it)
+  void setClick(std::function<void()> click);
 
 private:
   juce::Font m_font;
@@ -310,7 +317,7 @@ public:
     juce::Colour color;
     double time = 0; // when (seconds, the clock of now in setNow)
   };
-  enum { LINE_H = 16 };
+  static constexpr int LINE_H = 16;
   explicit EventList(const juce::Font &font);
   void setEvents(const std::vector<Event> &events); // newest first
   void setPlaceholder(const std::string &text);       // shown when there are none

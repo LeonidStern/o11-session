@@ -5,12 +5,11 @@
 #include <cctype>
 #include <cerrno>
 #include <cmath>
-#include <cstring>
 #include <random>
-#include <sstream>
 
+#include "o11proto/live.h"
 #include "o11proto/sha1.h"
-#include "socket_compat.h"
+#include "server_net.h"
 
 namespace o11proto {
 
@@ -140,38 +139,59 @@ bool Server::start(const ServerConfig& config) {
     }
     effective_codec_ = computeEffectiveCodec();
 
-    if (!compat::startup()) return false;
-    socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == kInvalidSocket) return false;
-    compat::setListenReuse(fd);
-    sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(cfg_.port);
-    sa.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (!cfg_.bind_address.empty() && inet_pton(AF_INET, cfg_.bind_address.c_str(), &sa.sin_addr) != 1) {
-        compat::closeSocket(fd);
+    Net& n = net();
+    asio::error_code ec;
+    asio::ip::address_v4 addr = asio::ip::address_v4::any();
+    if (!cfg_.bind_address.empty()) {
+        addr = asio::ip::make_address_v4(cfg_.bind_address, ec);
+        if (ec) return false;
+    }
+    n.acceptor.open(asio::ip::tcp::v4(), ec);
+    if (ec) return false;
+    compat::setListenReuse(n.acceptor.native_handle());
+    n.acceptor.bind(asio::ip::tcp::endpoint(addr, cfg_.port), ec);
+    if (!ec) n.acceptor.listen(64, ec);
+    if (!ec) n.acceptor.non_blocking(true, ec);
+    if (ec) {
+        asio::error_code ignored;
+        n.acceptor.close(ignored);
         return false;
     }
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0 || ::listen(fd, 64) != 0) {
-        compat::closeSocket(fd);
-        return false;
-    }
-    setNonBlocking(fd);
-    socklen_t len = sizeof(sa);
-    if (getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &len) == 0) port_ = ntohs(sa.sin_port);
-    listen_fd_ = fd;
+    port_ = n.acceptor.local_endpoint(ec).port();
+    ++n.epoch;
+    n.accepting = n.accept_ready = n.relay_reading = n.timing = n.pass_due = false;
     log("listening on port " + std::to_string(port_));
+    if (!liveStart()) {                         // Live require without its UDP port
+        stop();
+        return false;
+    }
+    armAccept();
+    armTimer();
     return true;
 }
 
 void Server::stop() {
-    if (listen_fd_ != kInvalidSocket) {
-        compat::closeSocket(listen_fd_);
-        listen_fd_ = kInvalidSocket;
+    liveShutdown();                             // the UDP port closes before the users go
+    if (net_) {
+        asio::error_code ec;
+        net_->acceptor.close(ec);
+        net_->timer.cancel();
+        ++net_->epoch;                          // what still waits ends and does nothing
+        net_->accepting = net_->accept_ready = net_->timing = net_->pass_due = false;
+        net_->accepted.clear();
     }
     conns_.clear();
     transfers_.clear();
     votes_.clear();
+}
+
+bool Server::running() const { return net_ && net_->acceptor.is_open(); }
+
+void Server::NetDeleter::operator()(Net* p) const { delete p; }
+
+Server::Net& Server::net() {
+    if (!net_) net_.reset(new Net);
+    return *net_;
 }
 
 std::size_t Server::userCount() const {
@@ -202,46 +222,129 @@ Server::Conn* Server::connById(int id) {
 }
 
 // ----------------------------------------------------------------- event loop
+//
+// Each socket event runs its handler (a connection's messages, Live's
+// datagrams); then one pass for everything that was ready: the timers, Live's
+// tick, every queue flushed, the closed connections reaped and, last, the new
+// ones accepted (so a peer that already closed doesn't count against the
+// pending limits). A relay read that only forwarded Live data needs none.
+// The timer makes a pass of its own when nothing happens.
+
+// The housekeeping: Live's freshness, its advice and the room's messages
+// every 20 ms while its UDP port is open; else the keepalives, the login,
+// transfer and vote timeouts (whole seconds) every 100 ms.
+constexpr auto kServerTick = std::chrono::milliseconds(100);
+constexpr auto kServerLiveTick = std::chrono::milliseconds(20);
 
 void Server::runFor(int ms) {
-    TimePoint deadline = Clock::now() + std::chrono::milliseconds(ms);
-    while (Clock::now() < deadline) poll(20);
+    Net& n = net();
+    asio::steady_timer until(n.io, std::chrono::milliseconds(ms));
+    bool done = false;
+    until.async_wait([&done](const asio::error_code&) { done = true; });
+    while (!done) {
+        if (n.io.stopped()) n.io.restart();
+        n.io.run_one();
+    }
 }
 
 void Server::poll(int timeout_ms) {
-    if (listen_fd_ == kInvalidSocket) return;
-    std::vector<pollfd> pfds;
-    pfds.reserve(conns_.size() + 1);
-    pollfd lp{};
-    lp.fd = listen_fd_;
-    lp.events = POLLIN;
-    pfds.push_back(lp);
-    for (auto& c : conns_) {
-        pollfd p{};
-        p.fd = c->c.fd();
-        p.events = POLLIN;
-        if (c->c.wantWrite()) p.events |= POLLOUT;
-        pfds.push_back(p);
+    if (!running()) return;
+    net_->run(timeout_ms);
+}
+
+void Server::armAccept() {
+    Net& n = *net_;
+    if (n.accepting || !n.acceptor.is_open()) return;
+    n.accepting = true;
+    const unsigned e = n.epoch;
+    // An accept rather than a wait for the listening socket: Asio's accept
+    // tries at once, so a connection that came before it is never missed.
+    n.acceptor.async_accept([this, e](const asio::error_code& ec, asio::ip::tcp::socket s) {
+        Net& m = *net_;
+        if (m.epoch != e) return;
+        m.accepting = false;
+        if (ec == asio::error::operation_aborted) return;
+        if (!ec) m.accepted.push_back(std::move(s));
+        m.accept_ready = true;                  // taken in by the pass, after the reaping
+        schedulePass();
+    });
+}
+
+void Server::readConn(Conn& c) {
+    if (!c.c.readAvailable()) {
+        dropConnection(c, "connection closed");
+        schedulePass();
+        return;
     }
-    int rc = compat::poll(pfds.data(), pfds.size(), timeout_ms);
-    if (rc < 0 && !compat::isInterrupted(compat::lastError())) return;
-    if (rc > 0) {
-        for (std::size_t i = 1; i < pfds.size(); ++i) {
-            Conn& c = *conns_[i - 1];
-            if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                if (!c.c.readAvailable()) {
-                    dropConnection(c, "connection closed");
-                    continue;
-                }
-                RawMessage m;
-                bool error = false;
-                while (c.c.isOpen() && !c.close_after_flush && c.c.nextMessage(m, error))
-                    handleMessage(c, m);
-                if (error) dropConnection(c, "protocol error");
-            }
-        }
-    }
+    RawMessage m;
+    bool error = false;
+    while (c.c.isOpen() && !c.close_after_flush && c.c.nextMessage(m, error)) handleMessage(c, m);
+    if (error) dropConnection(c, "protocol error");
+    armRead(c);
+    schedulePass();
+}
+
+void Server::armRead(Conn& c) {
+    if (c.reading || !c.c.isOpen()) return;
+    c.reading = true;
+    const int id = c.id;
+    const unsigned e = net_->epoch;
+    c.c.net()->socket.async_wait(asio::socket_base::wait_read, [this, id, e](const asio::error_code& ec) {
+        if (net_->epoch != e) return;
+        Conn* cp = connById(id);                // gone: reaped, its socket closed
+        if (!cp) return;
+        cp->reading = false;
+        if (ec == asio::error::operation_aborted || !cp->c.isOpen()) return;
+        readConn(*cp);
+    });
+}
+
+void Server::armWrite(Conn& c) {
+    if (c.writing || !c.c.isOpen()) return;
+    c.writing = true;
+    const int id = c.id;
+    const unsigned e = net_->epoch;
+    c.c.net()->socket.async_wait(asio::socket_base::wait_write, [this, id, e](const asio::error_code& ec) {
+        if (net_->epoch != e) return;
+        Conn* cp = connById(id);
+        if (!cp) return;
+        cp->writing = false;
+        if (ec != asio::error::operation_aborted) schedulePass();   // an error shows in the flush
+    });
+}
+
+void Server::armTimer() {
+    Net& n = *net_;
+    if (n.timing || !n.acceptor.is_open()) return;
+    n.timing = true;
+    const unsigned e = n.epoch;
+    n.timer.expires_after(liveUdpOpen() ? kServerLiveTick : kServerTick);
+    n.timer.async_wait([this, e](const asio::error_code& ec) {
+        Net& m = *net_;
+        if (m.epoch != e) return;
+        m.timing = false;
+        if (ec == asio::error::operation_aborted) return;
+        armTimer();
+        schedulePass();
+    });
+}
+
+void Server::schedulePass() {
+    Net& n = net();
+    if (n.pass_due) return;
+    n.pass_due = true;
+    const unsigned e = n.epoch;
+    asio::post(n.io, [this, e] {
+        Net& m = *net_;
+        if (m.epoch != e) return;
+        m.pass_due = false;
+        if (running()) pass();
+    });
+}
+
+void Server::pass() {
     handleTimers(Clock::now());
+    liveTick(Clock::now());
 
     // Flush everything, then reap closed connections.
     for (auto& c : conns_) {
@@ -250,8 +353,11 @@ void Server::poll(int timeout_ms) {
             dropConnection(*c, "send failed");
             continue;
         }
-        if (c->close_after_flush && (!c->c.wantWrite() || Clock::now() > c->close_deadline))
+        if (c->close_after_flush && (!c->c.wantWrite() || Clock::now() > c->close_deadline)) {
             c->c.close();
+            continue;
+        }
+        if (c->c.wantWrite()) armWrite(*c);
     }
     conns_.erase(std::remove_if(conns_.begin(), conns_.end(),
                                 [](const std::unique_ptr<Conn>& c) { return !c->c.isOpen(); }),
@@ -259,17 +365,32 @@ void Server::poll(int timeout_ms) {
 
     // Accept only after existing connections were serviced and reaped, so a
     // peer that already closed does not count against the pending limits.
-    if (rc > 0 && (pfds[0].revents & POLLIN)) acceptPending();
+    Net& n = *net_;
+    if (n.accept_ready) {
+        n.accept_ready = false;
+        acceptPending();
+    }
+    armAccept();
 }
 
+// The connection the accept got, then every other one waiting.
 void Server::acceptPending() {
+    Net& n = *net_;
+    std::vector<asio::ip::tcp::socket> got = std::move(n.accepted);
+    n.accepted.clear();
+    std::size_t taken = 0;
     for (;;) {
-        sockaddr_storage ss;
-        socklen_t len = sizeof(ss);
-        socket_t fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&ss), &len);
-        if (fd == kInvalidSocket) return;
+        asio::ip::tcp::socket s(n.io);
+        if (taken < got.size()) {
+            s = std::move(got[taken++]);
+        } else {
+            asio::error_code ec;
+            n.acceptor.accept(s, ec);           // non-blocking: would_block once none is waiting
+            if (ec == asio::error::interrupted || ec == asio::error::connection_aborted) continue;
+            if (ec) return;
+        }
         auto c = std::make_unique<Conn>();
-        c->c.adopt(fd);
+        c->c.adopt(std::unique_ptr<Connection::Net, Connection::NetDeleter>(new Connection::Net(std::move(s))));
         c->id = next_id_++;
         c->addr = c->c.peerAddress();
         c->connected_at = Clock::now();
@@ -282,7 +403,9 @@ void Server::acceptPending() {
         for (const auto& o : conns_) {
             if (o->logged_in || !o->c.isOpen()) continue;
             std::uint8_t peek;
-            if (compat::recv(o->c.fd(), &peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0) continue;
+            asio::error_code pe;
+            o->c.net()->socket.receive(asio::buffer(&peek, 1), asio::socket_base::message_peek, pe);
+            if (pe == asio::error::eof) continue;
             ++pending;
             if (o->addr == c->addr) ++pending_here;
         }
@@ -308,6 +431,7 @@ void Server::acceptPending() {
         c->c.send(kMsgAuthChallenge, encode(ch));
         log("connection " + std::to_string(c->id) + " from " + c->addr);
         conns_.push_back(std::move(c));
+        readConn(*conns_.back());                   // what it sent already, then its wait
     }
 }
 
@@ -399,6 +523,7 @@ void Server::dropConnection(Conn& c, const std::string& why) {
 void Server::removeUser(Conn& c) {
     if (!c.logged_in) return;
     c.logged_in = false;
+    liveLeft(c);
     UserInfoChange change;
     bool had_zero = false;
     for (int i = 0; i < kMaxChannels; ++i) {
@@ -452,7 +577,7 @@ void Server::handleMessage(Conn& c, const RawMessage& m) {
     case kMsgClientUploadWrite: handleUploadWrite(c, m.payload); break;
     case kMsgChat: handleChat(c, m.payload); break;
     case kMsgKeepalive: break;
-    default: break;                             // unknown types are ignored
+    default: liveClientMessage(c, m); break;    // Live's reports; other unknown types are ignored
     }
 }
 
@@ -660,6 +785,7 @@ void Server::finishLogin(Conn& c, const std::string& name, std::uint32_t privs, 
         roomCodecChanged(&c, !was_empty);
         effective_codec_ = now;
     }
+    liveJoined(c);
 }
 
 // A status account polls the server: it gets the room state and is closed
@@ -766,6 +892,12 @@ void Server::handleUploadBegin(Conn& c, const std::vector<std::uint8_t>& p) {
     std::vector<std::uint8_t> silent = encode(silence);
 
     bool is_silence = guidIsZero(ub.guid);
+    // A Live room has no interval audio (a silent interval still goes: it
+    // tells the others none is due).
+    if (!is_silence && ub.fourcc != 0 && liveRefusesUpload(Clock::now())) {
+        iv_refused_.fetch_add(1);
+        return;
+    }
     std::uint32_t need = codecCapForFourcc(ub.fourcc);
     bool relayed = need == 0 || (cfg_.allow_codecs & need) != 0;
     std::string key = lower(c.name);
@@ -807,13 +939,17 @@ void Server::handleUploadBegin(Conn& c, const std::vector<std::uint8_t>& p) {
 void Server::handleUploadWrite(Conn& c, const std::vector<std::uint8_t>& p) {
     IntervalWrite w;
     if (!decode(p, w)) return;
+    ((c.caps & live::kCapLive) ? iv_from_live_ : iv_from_others_).fetch_add(p.size());
     auto it = transfers_.find(w.guid);
     if (it == transfers_.end()) return;
     if (it->second.uploader != c.id) return;    // only the uploader may write
     it->second.last = Clock::now();
     for (int id : it->second.receivers) {
         Conn* o = connById(id);
-        if (o && o->logged_in) send(*o, kMsgDownloadWrite, p);   // payload forwarded untouched
+        if (o && o->logged_in) {
+            send(*o, kMsgDownloadWrite, p);     // payload forwarded untouched
+            iv_relayed_.fetch_add(p.size());
+        }
     }
     if (w.last()) transfers_.erase(it);
 }
@@ -825,6 +961,7 @@ void Server::handleChat(Conn& c, const std::vector<std::uint8_t>& p) {
     if (!decode(p, m)) return;                  // includes the trailing-NUL rule
     const std::string& cmd = m.fields[0];
     if (cmd == "MSG") {
+        if (liveCommand(c, m.fields[1])) return;   // works without the chat privilege
         if (!(c.privs & kPrivChat)) {
             sendServerMsg(c, "No MSG permission");
             return;
@@ -930,7 +1067,7 @@ void Server::handleBangCommand(Conn& c, const std::string& text) {
         sendCodecMaskToAll();
     } else {
         sendChat(c, ChatMessage("PRIVMSG", "*",
-                                "Unknown !command. Commands available: !vote, !topic, !codec, !bitrate"));
+                                "Unknown !command. Commands available: !vote, !topic, !codec, !bitrate, !live"));
     }
 }
 

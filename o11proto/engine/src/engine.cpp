@@ -16,6 +16,10 @@ namespace engine {
 
 namespace {
 constexpr int kDownloadTimeoutSeconds = 8;
+// What the vectors the audio context pushes to hold from the start (decoders
+// to free, blocks to upload): they keep their capacity after that.
+constexpr std::size_t kGarbageReserve = 64;
+constexpr std::size_t kUploadReserve = 64;
 
 float clip1(float v) { return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v); }
 }  // namespace
@@ -40,7 +44,12 @@ void PlaybackResampler::advance(int srcRate, int dstRate, int len, int consumed)
 
 // ------------------------------------------------------------- lifecycle
 
-Engine::Engine() { wireClient(); }
+Engine::Engine() {
+    garbage_.reserve(kGarbageReserve);
+    garbage_spare_.reserve(kGarbageReserve);
+    wireClient();
+    liveInit();
+}
 
 Engine::~Engine() {
     suppress_ = true;
@@ -59,7 +68,10 @@ void Engine::raisePeak(std::atomic<float>& p, float v) {
 // ------------------------------------------------------------ connection
 
 void Engine::wireClient() {
-    client_.on_message = [this](const RawMessage&) { ++messages_; };
+    client_.on_message = [this](const RawMessage& m) {
+        ++messages_;
+        liveRawMessage(m);
+    };
     client_.on_challenge = [this](const AuthChallenge&) { got_challenge_ = true; };
     client_.on_licence_decision = [this](const std::string& text) {
         return onLicence ? onLicence(text) : LicenceAnswer::Agree;
@@ -90,6 +102,7 @@ void Engine::wireClient() {
         has_mask_.store(true);
     };
     client_.on_userinfo = [this](const UserInfoRecord& rec) { handleUserInfo(rec); };
+    client_.on_live = [this](const live::ServerLive& m) { liveMessage(m); };
     client_.on_download_begin = [this](const DownloadBegin& d) { handleDownloadBegin(d); };
     client_.on_download_data = [this](const Guid& g, const std::vector<std::uint8_t>& b) {
         handleDownloadData(g, b, false);
@@ -139,6 +152,8 @@ void Engine::connect(const std::string& host, std::uint16_t port, const std::str
     o.max_server_version = 0x00030000;
     o.login_when_licence_refused = true;
     o.auto_subscribe = false;
+    o.live = live_enabled_.load();
+    o.live_direct = true;                       // Live is all-to-all where the server has the paths (0x09)
     client_.setChannels(channelList());
     if (!client_.connect(host, port, o)) {
         std::lock_guard<std::mutex> lock(text_mutex_);
@@ -148,6 +163,7 @@ void Engine::connect(const std::string& host, std::uint16_t port, const std::str
 }
 
 void Engine::resetConnectionState() {
+    liveReset();
     got_challenge_ = logged_in_ = got_config_ = false;
     maxchan_.store(0);
     codec_mask_.store(0);
@@ -216,6 +232,7 @@ bool Engine::run() {
     messages_ = 0;
     if (client_.state() != Client::State::Disconnected && client_.state() != Client::State::Failed)
         client_.poll(0);
+    liveControl();
     checkDownloadTimeouts();
     bool uploaded = uploadLoop();
     collectGarbage();
@@ -223,12 +240,15 @@ bool Engine::run() {
 }
 
 void Engine::collectGarbage() {
-    std::vector<std::unique_ptr<Decoder>> g;
+    // garbage_ and garbage_spare_ take turns. The one handed back to the
+    // audio context is empty but keeps its capacity, so its push_back there
+    // does not allocate; the decoders are freed here, outside the lock.
     {
         std::lock_guard<std::mutex> lock(remote_mutex_);
-        g.swap(garbage_);
+        if (garbage_.empty()) return;
+        garbage_.swap(garbage_spare_);
     }
-    g.clear();
+    garbage_spare_.clear();
 }
 
 // ------------------------------------------------------- local channels
@@ -241,6 +261,8 @@ void Engine::setLocalChannel(int index, const LocalChannel& settings) {
         auto it = locals_.find(index);
         if (it == locals_.end()) {
             it = locals_.emplace(index, std::make_unique<LocalState>()).first;
+            it->second->queue.reserve(kUploadReserve);
+            it->second->drained.reserve(kUploadReserve);
             announce = true;
         } else if (it->second->s.name != settings.name) {
             announce = true;
@@ -323,7 +345,6 @@ int Engine::uploadKbps(int index) const {
 
 bool Engine::uploadLoop() {
     bool any = false;
-    std::vector<UploadBlock> items;
     std::vector<std::pair<int, LocalState*>> chans;
     {
         std::lock_guard<std::mutex> lock(local_mutex_);
@@ -332,7 +353,10 @@ bool Engine::uploadLoop() {
     // Encoding happens without local_mutex_ held; a channel removed meanwhile
     // is only destroyed by removeLocalChannel in this same (control) context.
     for (auto& [index, ls] : chans) {
-        items.clear();
+        // queue and drained take turns: the queue gets back an empty vector
+        // that keeps its capacity, so the audio context's push_back does
+        // not allocate.
+        std::vector<UploadBlock>& items = ls->drained;
         {
             std::lock_guard<std::mutex> ql(ls->qm);
             items.swap(ls->queue);
@@ -340,9 +364,12 @@ bool Engine::uploadLoop() {
         if (items.empty()) continue;
         any = true;
         for (auto& b : items) processUploadItem(*ls, index, b);
-        std::lock_guard<std::mutex> ql(ls->qm);
-        for (auto& b : items)
-            if (!b.data.empty() && ls->spare.size() < kUploadQueueLimit) ls->spare.push_back(std::move(b.data));
+        {
+            std::lock_guard<std::mutex> ql(ls->qm);
+            for (auto& b : items)
+                if (!b.data.empty() && ls->spare.size() < kUploadQueueLimit) ls->spare.push_back(std::move(b.data));
+        }
+        items.clear();
     }
     return any;
 }
@@ -361,7 +388,7 @@ void Engine::processUploadItem(LocalState& ls, int index, UploadBlock& b) {
             }
             ls.skipped = false;
             int kbps = room_kbps_.load() ? room_kbps_.load() : ls.s.bitrate;
-            if (!ls.enc || ls.enc->fourcc() != fourcc || ls.enc->rate() != b.rate ||
+            if (!ls.enc || b.fresh || ls.enc->fourcc() != fourcc || ls.enc->rate() != b.rate ||
                 ls.enc->channels() != b.channels || ls.enc->kbps() != kbps)
                 ls.enc = makeEncoder(fourcc, b.rate, b.channels, kbps);
             if (!ls.enc) {
@@ -819,6 +846,7 @@ void Engine::process(const float* const* in, int numIn, float* const* out, int n
         clock_grace_ = 0;
         clock_moved_.store(false);
     }
+    liveAudioBlock(in, numIn, frames, sampleRate);
 
     if (!running_.load()) {
         mixLocal(in, numIn, out, numOut, frames, sampleRate);
@@ -837,6 +865,7 @@ void Engine::process(const float* const* in, int numIn, float* const* out, int n
         for (int c = 0; c < numIn; ++c) inp[c] = in[c] + pos;
         for (int c = 0; c < numOut; ++c) outp[c] = out[c] + pos;
         mixRemote(outp, numOut, piece, sampleRate);
+        mixLive(outp, numOut, piece, pos, sampleRate);
         mixLocal(inp, numIn, outp, numOut, piece, sampleRate);
         mixMetronome(outp, numOut, piece, sampleRate);
         interval_pos_.store(interval_pos_.load() + piece);
@@ -872,18 +901,27 @@ void Engine::boundary(int sampleRate) {
     beat_len_ = std::max(1, len / std::max(1, active_bpi_.load()));
     next_beat_ = 0;
     beat_index_ = 0;
+    liveBoundary();
     uploadBoundary();
     newIntervalStep();
 }
 
-// 6.3, local_mutex_ held.
+// 6.3, local_mutex_ held. While the room is Live nothing is uploaded: a
+// channel stops at the boundary where the room goes Live, with a silent
+// interval so that no one waits for its audio, and starts again at the
+// first boundary after the room left Live, with an interval that fades in
+// (engine_live.cpp).
 void Engine::uploadBoundary() {
     int maxchan = maxchan_.load();
+    const bool held = liveHoldsIntervals();
     for (auto& kv : locals_) {
         if (kv.first >= maxchan) continue;
         LocalState& ls = *kv.second;
         bool was = ls.transmitting;
-        ls.transmitting = ls.s.broadcast;
+        ls.transmitting = ls.s.broadcast && !held;
+        const int fade = std::max(1, static_cast<int>(kLiveResumeFadeSeconds * sample_rate_.load()));
+        ls.fade_in = ls.fade_len = ls.transmitting && ls.live_paused ? fade : 0;
+        ls.live_paused = ls.s.broadcast && held;
         std::lock_guard<std::mutex> ql(ls.qm);
         if (was && ls.queue.size() < static_cast<std::size_t>(kUploadQueueLimit)) {
             UploadBlock b;
@@ -965,7 +1003,11 @@ void Engine::newIntervalStep() {
                 std::size_t have = std::min(n, rc.current->available());
                 float* d = const_cast<float*>(rc.current->data());
                 for (std::size_t i = 0; i < have; ++i) {
-                    float s = static_cast<float>(i + 1) / static_cast<float>(n);
+                    // A raised cosine, flat at both ends: a linear ramp bends the
+                    // sound where it starts and ends, a tick when the lapping
+                    // frames (an extrapolation) and the new interval differ.
+                    const double u = (static_cast<double>(i) + 0.5) / static_cast<double>(n);
+                    float s = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * u));
                     for (int c = 0; c < ch; ++c) {
                         std::size_t k = i * static_cast<std::size_t>(ch) + static_cast<std::size_t>(c);
                         d[k] = d[k] * s + rc.fade[k] * (1.0f - s);
@@ -993,6 +1035,7 @@ void Engine::mixRemote(float* const* out, int numOut, int len, int sampleRate) {
             float vol = std::min(4.0f, std::max(0.0f, u->volume * rc.volume));
             float pan = std::min(1.0f, std::max(-1.0f, u->pan + rc.pan));
             bool muted = any_solo ? !rc.solo : (rc.mute || u->mute);
+            if (&rc == &u->ch[0] && u->live_mix) continue;   // mixed with its live audio by mixLive (engine_live.cpp)
             Decoder& dec = *rc.current;
             int srcRate = dec.rate();
             int needed = rc.rs.needed(srcRate, sampleRate, len);
@@ -1134,6 +1177,14 @@ void Engine::mixLocal(const float* const* in, int numIn, float* const* out, int 
                     }
                 } else {
                     std::copy(src1, src1 + len, b.data.begin());
+                }
+                // The first interval after the room left Live fades in: a
+                // raised cosine, flat at both ends.
+                b.fresh = ls.fade_in == ls.fade_len && ls.fade_in > 0;
+                for (int i = 0; i < len && ls.fade_in > 0; ++i, --ls.fade_in) {
+                    const double u = (static_cast<double>(ls.fade_len - ls.fade_in) + 0.5) / ls.fade_len;
+                    const float g = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * u));
+                    for (int c = 0; c < b.channels; ++c) b.data[static_cast<std::size_t>(i * b.channels + c)] *= g;
                 }
                 ls.queue.push_back(std::move(b));
             }

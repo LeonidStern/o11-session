@@ -54,7 +54,7 @@ public:
   void resized() override;
 
   // the size it is laid out for, the smallest, the largest
-  enum { DEFAULT_WIDTH = 720, DEFAULT_HEIGHT = 330, MIN_WIDTH = 640, MIN_HEIGHT = 300, MAX_WIDTH = 3000, MAX_HEIGHT = 2000 };
+  static constexpr int DEFAULT_WIDTH = 720, DEFAULT_HEIGHT = 330, MIN_WIDTH = 640, MIN_HEIGHT = 300, MAX_WIDTH = 3000, MAX_HEIGHT = 2000;
   // how much a window of this size scales the layout: 1 up to the default size, then as much as fits
   static double zoomFor(double width, double height);
 
@@ -128,10 +128,9 @@ private:
 
   // transport
   ui::Strip *m_transport = nullptr;
-  juce::Label *m_syncText = nullptr, *m_beatBox = nullptr;
-  ui::Strip *m_sep[2] = { nullptr, nullptr };
-  ui::FlatButton *m_sync = nullptr, *m_click = nullptr;
-  ui::Led *m_syncLed = nullptr;
+  juce::Label *m_beatBox = nullptr;
+  ui::Strip *m_sep = nullptr;
+  ui::FlatButton *m_click = nullptr;
   ui::ArcKnob *m_clickVolume = nullptr;
   ui::BeatCells *m_beats = nullptr;
 
@@ -158,10 +157,16 @@ private:
   // room panel
   ui::Strip *m_room = nullptr;
   juce::Label *m_roomTitle = nullptr, *m_roomCount = nullptr;
-  juce::Label *m_bpmLabel = nullptr, *m_intervalLabel = nullptr, *m_codecLabel = nullptr, *m_kbpsLabel = nullptr, *m_recentLabel = nullptr;
+  juce::Label *m_bpmLabel = nullptr, *m_codecLabel = nullptr, *m_kbpsLabel = nullptr, *m_recentLabel = nullptr;
+  juce::Label *m_modeLabel = nullptr;
   ui::DragNumberBox *m_bpm = nullptr;
-  ui::MenuBox *m_interval = nullptr, *m_codec = nullptr, *m_kbps = nullptr;
-  ui::Chip *m_chips[2] = { nullptr, nullptr }; // a tempo and an interval the room waits to change to
+  ui::FlatButton *m_sync = nullptr; // follow the DAW's tempo
+  ui::Led *m_syncLed = nullptr;
+  juce::Label *m_syncText = nullptr; // the DAW's tempo
+  ui::MenuBox *m_codec = nullptr, *m_kbps = nullptr;
+  ui::MenuBox *m_mode = nullptr; // the room's: Live, or intervals of one of uitext::BPI_CHOICES beats
+  // a tempo and an interval the room waits to change to, and Live: what it waits for
+  ui::Chip *m_chips[3] = { nullptr, nullptr, nullptr };
   ui::EventList *m_events = nullptr;
 
   // host bar
@@ -184,6 +189,8 @@ private:
   unsigned long long m_chatRevision = ~0ull;
   double m_eventsSince = -1;    // the room the events list was made for (Snapshot::roomSince)
   int m_chipsShown = -1;        // how many chips the room panel was laid out for
+  std::string m_syncChip = "DAW"; // the DAW's name the room panel was laid out for ("Ableton", "Link")
+  float m_syncTextW = 0;          // the width it gave the DAW's tempo
   struct Vote
   {
     std::string who; // "You" for you

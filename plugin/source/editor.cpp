@@ -10,7 +10,6 @@
 #include <math.h>
 #include <string.h>
 #include <algorithm>
-#include <chrono>
 #include <vector>
 
 #include "processor.h"
@@ -37,28 +36,24 @@ static const float ROOM_X = 6, ROOM_Y = 5;      // the room panel's margins
 static const float LABEL_H = 11, CHIP_H = 17;   // the room panel's labels, its notes of changes to come
 static const double SILENT_SECONDS = 10;        // a row says "silent" after this long without sound (or two intervals)
 
-static double now_seconds()
+// a view's text is already this: its UTF-8 bytes compared where they are (the editor asks 30
+// times a second, mostly of texts that haven't changed), without making a juce::String of it
+static bool sameText(const juce::String &shown, const std::string &text)
 {
-  using namespace std::chrono;
-  return duration<double>(steady_clock::now().time_since_epoch()).count();
+  return shown.getNumBytesAsUTF8() == text.size() && memcmp(shown.toRawUTF8(), text.data(), text.size()) == 0;
 }
-
-static juce::String str(const std::string &s) { return juce::String::fromUTF8(s.c_str()); }
 
 static void setLabel(juce::Label *label, const std::string &text, bool tooltip = false)
 {
-  if (!label) return;
+  if (!label || sameText(label->getText(), text)) return;
   const juce::String t = str(text);
-  if (label->getText() == t) return;
   label->setText(t, juce::dontSendNotification);
   if (tooltip) label->setTooltip(t); // the whole text, when the label cuts it off
 }
 
 static void setTooltip(juce::SettableTooltipClient *v, const std::string &text)
 {
-  if (!v) return;
-  const juce::String t = str(text);
-  if (v->getTooltip() != t) v->setTooltip(t);
+  if (v && !sameText(v->getTooltip(), text)) v->setTooltip(str(text));
 }
 
 static void setLabelColor(juce::Label *label, juce::Colour c)
@@ -207,14 +202,9 @@ void O11Editor::buildViews()
   m_connText = add(m_header, makeLabel("", f.value, Colors::value(), juce::Justification::centredRight));
   m_connText->setInterceptsMouseClicks(true, false); // for its tooltip
 
-  // transport: Sync (o) Live 120.00 | Click (dial) | beats  [6 / 16]
+  // transport: Click (dial) | beats  [6 / 16]
   m_transport = add(m_root.get(), new Pane(Colors::strip(), 2));
-  m_sync = add(m_transport, new FlatButton("Sync", FlatButton::Toggle, f.button));
-  m_sync->onChange = [this]() { engine().setFollowHostTempo(m_sync->value()); };
-  m_syncLed = add(m_transport, new Led);
-  m_syncText = add(m_transport, makeLabel("", f.value, Colors::value()));
-  m_syncText->setInterceptsMouseClicks(true, false);
-  for (auto &sep : m_sep) sep = add(m_transport, new Strip(Colors::separator()));
+  m_sep = add(m_transport, new Strip(Colors::separator()));
   m_click = add(m_transport, new FlatButton("Click", FlatButton::Toggle, f.button));
   m_click->setTooltip("The metronome: the first beat of each interval higher");
   m_click->onChange = [this]() { engine().setMetronome(sliderToGain(m_clickVolume->value()), !m_click->value()); };
@@ -254,12 +244,18 @@ void O11Editor::buildViews()
   m_footer = add(m_mixer, makeLabel("", f.small, Colors::label()));
   m_footer->setInterceptsMouseClicks(true, false);
 
-  // room panel: Room  4 players / BPM, Interval / Codec, Kbps / changes to come / Recent
+  // room panel: Room  4 players / BPM (o) Live 120.00, Mode / [Sync] 120.00, Live 28 ms / Codec, Kbps /
+  // changes to come / Recent
   m_room = add(m_root.get(), new Pane(Colors::pane(), 2));
   m_roomTitle = add(m_room, makeLabel("Room", f.labelBold, Colors::value()));
   m_roomCount = add(m_room, makeLabel("", f.label, Colors::label(), juce::Justification::centredRight));
   m_bpmLabel = add(m_room, makeLabel("BPM", f.label, Colors::label()));
-  m_intervalLabel = add(m_room, makeLabel("Interval", f.label, Colors::label()));
+  m_modeLabel = add(m_room, makeLabel("Mode", f.label, Colors::label()));
+  m_syncLed = add(m_room, new Led);
+  m_syncText = add(m_room, makeLabel("", f.label, Colors::value(), juce::Justification::centredRight));
+  m_syncText->setInterceptsMouseClicks(true, false);
+  m_sync = add(m_room, new FlatButton("Sync", FlatButton::Toggle, f.button));
+  m_sync->onChange = [this]() { engine().setFollowHostTempo(m_sync->value()); };
   m_codecLabel = add(m_room, makeLabel("Codec", f.label, Colors::label()));
   m_kbpsLabel = add(m_room, makeLabel("Kbps", f.label, Colors::label()));
   m_bpm = add(m_room, new DragNumberBox(f.valueBold));
@@ -280,15 +276,23 @@ void O11Editor::buildViews()
   };
   m_bpm->setTooltip("The room's tempo: drag up or down (Shift for fine steps), or double-click and type, to change it "
                     "for everyone from the next interval");
-  m_interval = add(m_room, new MenuBox(f.value));
-  for (int b : uitext::BPI_CHOICES) m_interval->addEntry(uitext::beatsText(b));
-  m_interval->onSelect = [this](int i) {
+  // Live, or intervals of so many beats: picking one switches everyone from the next interval
+  m_mode = add(m_room, new MenuBox(f.value));
+  m_mode->addEntry("Live"); // the order of the choices
+  for (int b : uitext::BPI_CHOICES) m_mode->addEntry(uitext::intervalsModeText(b, true));
+  m_mode->onSelect = [this](int i) {
     Snapshot s;
     engine().getSnapshot(s);
-    if (i >= 0 && i < uitext::NUM_BPI_CHOICES && s.state == ConnState::Connected && uitext::BPI_CHOICES[i] != s.bpi)
-      engine().vote("bpi", uitext::BPI_CHOICES[i]);
+    if (i < 0 || s.state != ConnState::Connected) return;
+    if (i == 0)
+    {
+      if (s.liveServer && !s.liveSwitchOn) engine().setRoomLive(true);
+      return;
+    }
+    if (i > uitext::NUM_BPI_CHOICES) return;
+    if (s.liveServer && s.liveSwitchOn) engine().setRoomLive(false);
+    if (uitext::BPI_CHOICES[i - 1] != s.bpi) engine().vote("bpi", uitext::BPI_CHOICES[i - 1]);
   };
-  m_interval->setTooltip("How many beats each interval lasts: pick one to change it for everyone from the next interval");
   m_codec = add(m_room, new MenuBox(f.value));
   m_codec->addEntry("Opus"); // the order of the choices
   m_codec->addEntry("FLAC");
@@ -317,7 +321,7 @@ void O11Editor::buildViews()
   m_host->setTooltip("Host a room in this plug-in, and join it");
   m_host->onChange = [this]() {
     m_hostPending = true;
-    m_hostPendingSince = now_seconds();
+    m_hostPendingSince = nowSeconds();
     engine().setHosting(m_host->value());
   };
   m_hostCount = add(m_hostBar, makeLabel("", f.value, Colors::value()));
@@ -417,22 +421,12 @@ void O11Editor::layoutTransport(float w)
     place(s, x, (BAR_H - 14) / 2, x + 1, (BAR_H - 14) / 2 + 14);
     x += 1 + ITEM_GAP;
   };
-  const float syncW = m_sync->preferredWidth();
-  place(m_sync, x, y0, x + syncW, y1);
-  x += syncW + ITEM_GAP;
-  place(m_syncLed, x, 0, x + 6, BAR_H);
-  x += 6 + ITEM_GAP;
-  // room for the host's name and a tempo, so the row doesn't move when they change
-  const float syncTextW = std::max(60.0f, textWidth(m_fonts.value, "Host 888.88") + 2);
-  place(m_syncText, x, 0, x + syncTextW, BAR_H);
-  x += syncTextW + ITEM_GAP;
-  sep(m_sep[0]);
   const float clickW = m_click->preferredWidth();
   place(m_click, x, y0, x + clickW, y1);
   x += clickW + ITEM_GAP;
   place(m_clickVolume, x, (BAR_H - 15) / 2, x + 15, (BAR_H - 15) / 2 + 15);
   x += 15 + ITEM_GAP;
-  sep(m_sep[1]);
+  sep(m_sep);
   const float beatBoxW = std::max(38.0f, textWidth(m_fonts.value, "88 / 88") + 10);
   place(m_beatBox, w - BAR_X - beatBoxW, y0, w - BAR_X, y1);
   place(m_beats, x, 0, std::max(x + 16, w - BAR_X - beatBoxW - ITEM_GAP), BAR_H);
@@ -518,11 +512,19 @@ void O11Editor::layoutRoom(juce::Rectangle<float> pane)
   place(m_roomTitle, x0, y, x0 + 60, y + LABEL_H);
   place(m_roomCount, x0 + 60, y, x1, y + LABEL_H);
   y += LABEL_H + 5;
-  place(m_bpmLabel, x0, y, x0 + colW, y + LABEL_H);
-  place(m_intervalLabel, xb, y, x1, y + LABEL_H);
+  // BPM, and the DAW's tempo at the right of its label: (o) Ableton 120.00
+  const float syncTextW = std::min(colW - textWidth(m_fonts.label, "BPM") - 14,
+                                   textWidth(m_fonts.label, m_syncChip + " 888.88") + 2);
+  m_syncTextW = syncTextW;
+  place(m_bpmLabel, x0, y, x0 + colW - syncTextW - 10, y + LABEL_H);
+  place(m_syncLed, x0 + colW - syncTextW - 10, y, x0 + colW - syncTextW - 4, y + LABEL_H);
+  place(m_syncText, x0 + colW - syncTextW, y, x0 + colW, y + LABEL_H);
+  place(m_modeLabel, xb, y, x1, y + LABEL_H);
   y += LABEL_H + 2;
-  place(m_bpm, x0, y, x0 + colW, y + ITEM_H);
-  place(m_interval, xb, y, x1, y + ITEM_H);
+  const float syncW = m_sync->preferredWidth();
+  place(m_sync, x0, y, x0 + syncW, y + ITEM_H);
+  place(m_bpm, x0 + syncW + 4, y, x0 + colW, y + ITEM_H);
+  place(m_mode, xb, y, x1, y + ITEM_H);
   y += ITEM_H + 5;
   place(m_codecLabel, x0, y, x0 + colW, y + LABEL_H);
   place(m_kbpsLabel, xb, y, x1, y + LABEL_H);
@@ -593,7 +595,7 @@ void O11Editor::update()
   if (!m_root) return;
   Snapshot s;
   engine().getSnapshot(s);
-  const double now = now_seconds();
+  const double now = nowSeconds();
 
   if (s.settingsRevision != m_settingsRevision) syncSettings();
   m_settingsRevision = s.settingsRevision;
@@ -665,7 +667,7 @@ void O11Editor::updateHeader(const Snapshot &s)
       break;
     default: text = "Not connected"; break;
   }
-  if (m_connText->getText() != str(text))
+  if (!sameText(m_connText->getText(), text))
   {
     setLabel(m_connText, text);
     layoutHeader((float)m_header->getWidth());
@@ -695,7 +697,15 @@ void O11Editor::updateTransport(const Snapshot &s)
   // Sync: the host's tempo, green when it is the room's, amber when not, grey while Sync is
   // off; "Link" while the host follows the room through Link
   const std::string chip = s.linkLeads ? "Link" : s.hostChip.empty() ? "DAW" : s.hostChip;
-  setLabel(m_syncText, chip + " " + uitext::bpmBoxText(s.hostTempo));
+  if (chip != m_syncChip)
+  {
+    m_syncChip = chip;
+    layoutRoom(m_room->getBounds().toFloat());
+  }
+  // "Ableton 120.00", or "Ableton 120" where the panel is too narrow for it
+  std::string syncText = chip + " " + uitext::bpmBoxText(s.hostTempo);
+  if (s.hostTempo > 0 && textWidth(m_fonts.label, syncText) + 2 > m_syncTextW) syncText = chip + " " + bpmText(s.hostTempo);
+  setLabel(m_syncText, syncText);
   const bool known = s.hostTempo > 0 && connected && s.bpm > 0 && m_sync->value();
   const bool differ = known && fabs(s.hostTempo - s.bpm) > BarSync::SAME_TEMPO;
   m_syncLed->setColor(differ ? Colors::amber() : Colors::green(), known);
@@ -787,7 +797,7 @@ void O11Editor::updateEmpty(const Snapshot &s, const uitext::HostBar &bar)
   else if (channels == 0) text = "Nobody else is here yet.";
 
   bool relayout = false;
-  if (m_emptyText->getText() != str(text))
+  if (!sameText(m_emptyText->getText(), text))
   {
     setLabel(m_emptyText, text);
     relayout = true;
@@ -871,15 +881,7 @@ void O11Editor::updateRoom(const Snapshot &s, double)
   const double bpm = playing ? s.intervalBpm : s.bpm;
   const int bpi = playing ? s.intervalBeats : s.bpi;
   m_bpm->setEnabled(connected);
-  m_interval->setEnabled(connected);
   m_bpm->setShown(connected && bpm > 0 ? (int)lround(bpm) : 120, uitext::bpmBoxText(connected ? bpm : 0));
-  m_interval->setShown(connected && bpi > 0 ? uitext::beatsText(bpi) : "\xe2\x80\x94");
-  {
-    int index = -1;
-    for (int i = 0; i < uitext::NUM_BPI_CHOICES; i ++)
-      if (uitext::BPI_CHOICES[i] == s.bpi) index = i;
-    m_interval->setCurrentIndex(connected ? index : -1);
-  }
 
   // the room's codec: picking one switches everyone (!codec), so only in a room
   m_codec->setEnabled(connected);
@@ -907,13 +909,44 @@ void O11Editor::updateRoom(const Snapshot &s, double)
     m_kbps->setCurrentIndex(index);
   }
 
+  // the room's mode: Live (picking it switches everyone, from an interval's start), or intervals of
+  // so many beats (picking one switches everyone to that length from the next interval)
+  const bool liveHere = connected && s.liveServer;
+  m_mode->setEnabled(connected);
+  m_mode->setEntryEnabled(0, liveHere);
+  m_mode->setShown(!connected ? "\xe2\x80\x94"
+                   : liveHere && s.liveRoom ? uitext::liveModeText(true, s.liveHeardMs)
+                                            : uitext::intervalsModeText(bpi, false));
+  {
+    int index = -1;
+    for (int i = 0; i < uitext::NUM_BPI_CHOICES; i ++)
+      if (uitext::BPI_CHOICES[i] == s.bpi) index = i + 1;
+    m_mode->setCurrentIndex(!connected ? -1 : liveHere && s.liveSwitchOn ? 0 : index);
+  }
+  const std::string lengths = "pick a length to switch everyone to intervals of that many beats from the next interval";
+  if (!connected)
+    setTooltip(m_mode, "Live plays everyone in real time, about 30 ms late, on servers that have it; Intervals plays each "
+                       "player one interval late, in time with the beat");
+  else if (!s.liveServer)
+    setTooltip(m_mode, "This server doesn't have Live, so everyone plays through intervals: pick a length to change it for "
+                       "everyone from the next interval");
+  else if (s.liveRoom)
+    setTooltip(m_mode, std::string("The room plays Live") +
+                       (s.liveHeardMs > 0 ? ": you hear the others about " + uitext::msText(s.liveHeardMs) + " late" : "") +
+                       ". Or " + lengths);
+  else if (s.liveSwitchOn)
+    setTooltip(m_mode, "Live is on: everyone goes Live together when the next interval starts. Or " + lengths);
+  else setTooltip(m_mode, "The room plays intervals: pick Live to play everyone in real time, from an interval's start, or " + lengths);
+
   // what the room changes to at the next interval, and who voted for it (when the server says)
   int shown = 0;
-  auto chip = [&](bool on, const std::string &text, const std::string &tip, const Vote &vote, int value) {
+  auto chip = [&](bool on, const std::string &text, const std::string &tip, const Vote &vote, int value,
+                  std::function<void()> click = nullptr) {
     if (!on) return;
     Chip *c = m_chips[shown++];
     const std::string who = vote.value == value ? vote.who : std::string();
     c->set(text, who);
+    c->setClick(std::move(click));
     setTooltip(c, tip + (who.empty() ? "" : who == "You" ? ": you voted for it" : ": " + who + " voted for it"));
   };
   const int roomBpm = (int)lround(s.bpm);
@@ -921,7 +954,22 @@ void O11Editor::updateRoom(const Snapshot &s, double)
        "The room's tempo changes to " + std::to_string(roomBpm) + " BPM when the next interval starts", m_lastVote[0], roomBpm);
   chip(playing && s.bpi > 0 && s.bpi != s.intervalBeats, uitext::beatsText(s.bpi) + " from next interval",
        "The intervals last " + uitext::beatsText(s.bpi) + " from the next one on", m_lastVote[1], s.bpi);
-  for (int i = 0; i < 2; i ++) showView(m_chips[i], i < shown);
+  // Live: a player in trouble (the room stays Live; a click switches everyone to intervals), or
+  // the switch to come at the next interval
+  const Vote nobody;
+  const std::string advice = liveHere && s.liveSwitchOn && s.liveRoom
+                               ? uitext::liveAdviceText((int)s.liveReason, s.liveReasonWho, s.liveReasonOthers) : "";
+  if (!advice.empty())
+    chip(true, advice, std::string(s.liveReason == Snapshot::LiveCantLive
+                                     ? "A player can't reach the others directly, so they don't hear each other in Live"
+                                     : "Live audio has dropouts that intervals wouldn't have")
+                         + ". Click to switch the room to intervals for everyone", nobody, -1,
+         [this]() { engine().setRoomLive(false); });
+  else if (liveHere && s.liveSwitchOn && !s.liveRoom)
+    chip(true, "Live from next interval", "Everyone goes Live together when the next interval starts", nobody, -1);
+  else if (liveHere && !s.liveSwitchOn && s.liveRoom)
+    chip(true, "Intervals from next interval", "Everyone goes back to intervals when the next interval starts", nobody, -1);
+  for (int i = 0; i < 3; i ++) showView(m_chips[i], i < shown);
   if (shown != m_chipsShown)
   {
     m_chipsShown = shown;
@@ -940,6 +988,7 @@ static uitext::LineKind lineKind(const ChatLine &l)
     case ChatLine::Join: return uitext::LineKind::Join;
     case ChatLine::Leave: return uitext::LineKind::Leave;
     case ChatLine::Message: return uitext::LineKind::Chat;
+    case ChatLine::Live: return uitext::LineKind::Live;
     case ChatLine::Private: return l.who == "*" ? uitext::LineKind::Server : uitext::LineKind::Other; // the server's message of the day
     default: return uitext::LineKind::Other;
   }
@@ -1160,7 +1209,7 @@ void O11Editor::updateHostBar(const Snapshot &s, const uitext::HostBar &bar)
 {
   if (m_hostPending)
   {
-    const bool done = !s.hostBusy && (s.hosting == m_host->value() || now_seconds() - m_hostPendingSince > 3.0);
+    const bool done = !s.hostBusy && (s.hosting == m_host->value() || nowSeconds() - m_hostPendingSince > 3.0);
     if (done) m_hostPending = false;
   }
   if (!m_hostPending) m_host->setValue(s.hosting);
@@ -1178,7 +1227,7 @@ void O11Editor::updateHostBar(const Snapshot &s, const uitext::HostBar &bar)
   {
     const bool full = s.hostMaxUsers > 0 && s.hostUsers >= s.hostMaxUsers;
     const std::string count = std::to_string(s.hostUsers) + " in room" + (full ? " \xc2\xb7 full" : "");
-    if (m_hostCount->getText() != str(count))
+    if (!sameText(m_hostCount->getText(), count))
     {
       setLabel(m_hostCount, count);
       relayout = true;
@@ -1221,7 +1270,7 @@ void O11Editor::updateHostBar(const Snapshot &s, const uitext::HostBar &bar)
                              : "Host a room in this plug-in: anyone can join at your address without an account, and one "
                                "vote changes the tempo or the interval");
   }
-  if (m_portText->getText() != str(port))
+  if (!sameText(m_portText->getText(), port))
   {
     setLabel(m_portText, port);
     relayout = true;
@@ -1305,7 +1354,7 @@ void O11Editor::copyAddress(AddressBox *box)
   setTooltip(box, "Copied " + box->address());
   if (m_copied && m_copied != box) m_copied->setCopyTitle("Copy");
   m_copied = box;
-  m_copiedUntil = now_seconds() + 1.5;
+  m_copiedUntil = nowSeconds() + 1.5;
 }
 
 } // namespace o11

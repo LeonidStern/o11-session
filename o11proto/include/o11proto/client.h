@@ -1,7 +1,9 @@
 // o11proto - non-blocking NINJAM client state machine.
 //
-// The caller drives it from a loop with poll(); every incoming message is
-// delivered through a callback. Audio encoding is out of scope: the caller
+// The caller drives it from a loop with poll(), which runs the client's own
+// Asio io_context on the caller's thread for up to the time it is given:
+// the socket's waits and a housekeeping timer (keepalives, idle downloads)
+// all complete there. Every incoming message is delivered through a callback. Audio encoding is out of scope: the caller
 // hands in opaque encoded bytes per interval and receives the bytes of
 // other users' intervals as they arrive.
 #ifndef O11PROTO_CLIENT_H
@@ -11,10 +13,12 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "o11proto/connection.h"
+#include "o11proto/live.h"
 #include "o11proto/message.h"
 
 namespace o11proto {
@@ -43,6 +47,8 @@ public:
         bool login_when_licence_refused = false;       // true: send AUTH_USER without bit 0 and let the server refuse
         bool send_keepalives = true;                   // false only for tests
         bool auto_subscribe = false;                   // subscribe to every user seen (mask ~0)
+        bool live = false;                             // set client_caps bit 16: Live mode (PROTOCOL.md 15)
+        bool live_direct = false;                      // with `live`, bit 17 too: Live's direct paths (0x09)
     };
 
     struct RemoteChannel {
@@ -72,6 +78,9 @@ public:
     std::function<void(const Guid&, bool complete)> on_download_end;  // false = timed out
     std::function<void(const ChatMessage&)> on_chat;
     std::function<void(const CodecMask&)> on_codec_mask;
+    // Live mode (Options::live): each accepted Live message (0x07), a full
+    // state that replaces the previous one.
+    std::function<void(const live::ServerLive&)> on_live;
     std::function<void(const RawMessage&)> on_message;           // every message, before decoding
     std::function<void(const std::string& reason)> on_disconnect;
 
@@ -88,7 +97,7 @@ public:
     void answerLicence(bool agree);
 
     // One iteration of the event loop: waits up to timeout_ms for socket
-    // activity, then processes it and the timers.
+    // activity or the housekeeping timer, then processes what is ready.
     void poll(int timeout_ms);
     // Blocking helpers for tools and tests: poll until pred() is true (returns
     // true) or the timeout passes (returns false); or for a fixed time.
@@ -106,6 +115,13 @@ public:
     const CodecMask& codecMask() const { return codec_mask_; }
     const std::map<std::string, RemoteUser>& users() const { return users_; }
     const std::string& failReason() const { return fail_reason_; }
+    // Live mode: the latest Live message of this connection, and where Live
+    // UDP goes (the IPv4 address of the server end of the TCP connection, ""
+    // when it isn't IPv4, and the TCP port connected to).
+    bool hasLiveMessage() const { return has_live_; }
+    const live::ServerLive& liveMessage() const { return live_; }
+    const std::string& serverAddress() const { return server_addr_; }
+    std::uint16_t serverPort() const { return server_port_; }
     int keepaliveSeconds() const { return keepalive_seconds_; }
 
     // Sends (or, before login, remembers) the full channel list (section 6.1).
@@ -137,6 +153,22 @@ public:
     static Guid randomGuid();
 
 private:
+    // The io_context, the connection's waits and the timer (client.cpp).
+    // Declared before conn_: the socket goes before its io_context.
+    struct Net;
+    struct NetDeleter {
+        void operator()(Net* p) const;
+    };
+    std::unique_ptr<Net, NetDeleter> net_;
+    Net& net();
+    void readNow();
+    void armRead();
+    void armWrite();
+    void armTimer();
+    void schedulePass();
+    void pass();
+    void connected();
+
     void fail(const std::string& reason);
     void handleMessage(const RawMessage& m);
     void handleChallenge(const std::vector<std::uint8_t>& p);
@@ -161,6 +193,10 @@ private:
     std::vector<ChannelInfoRecord> channels_;
     std::map<std::string, RemoteUser> users_;
     std::map<Guid, TimePoint> downloads_;   // open downloads, last activity
+    bool has_live_ = false;
+    live::ServerLive live_;
+    std::string server_addr_;
+    std::uint16_t server_port_ = 0;
 };
 
 }  // namespace o11proto

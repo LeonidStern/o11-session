@@ -131,12 +131,22 @@ static float clamp_volume(float v) { return v != v ? 1.0f : std::min(std::max(v,
 static float clamp_pan(float v) { return v != v ? 0.0f : std::min(std::max(v, -1.0f), 1.0f); }
 
 constexpr int Settings::OPUS_KBPS[];
+constexpr int Settings::LIVE_BUFFER_MS[];
 
 int Settings::nearestOpusKbps(int kbps)
 {
   int best = DEFAULT_OPUS_KBPS;
   for (int k : OPUS_KBPS)
     if (abs(k - kbps) < abs(best - kbps)) best = k;
+  return best;
+}
+
+int Settings::nearestLiveBufferMs(int ms)
+{
+  if (ms <= 0) return LIVE_BUFFER_AUTO;
+  int best = LIVE_BUFFER_MS[0];
+  for (int b : LIVE_BUFFER_MS)
+    if (abs(b - ms) < abs(best - ms)) best = b;
   return best;
 }
 
@@ -181,6 +191,7 @@ bool Settings::deserialize(const std::string &data)
     else if (key == "monitor") s.monitor = value == "1";
     else if (key == "transmit") s.transmit = value == "1";
     else if (key == "follow_host_tempo") s.followHostTempo = value == "1";
+    else if (key == "live_buffer_ms") {} // older states: Live picks its buffer itself now
     else if (key == "opus_kbps")
     {
       char *end = nullptr;
@@ -320,6 +331,10 @@ Engine::Engine()
     return o11proto::engine::LicenceAnswer::Defer;
   };
   m_client->onChat = [this](const std::array<std::string, 5> &fields) { onChat(fields); };
+  // Live's own lines (the room went Live, or back on intervals), from run() on the network thread
+  m_client->onLiveNotice = [this](const std::string &text, bool error) {
+    addChat(error ? ChatLine::Error : ChatLine::Live, "", text);
+  };
 
   // our input, in stereo (source channels 0 and 1); the plug-in monitors it itself, so the
   // engine's monitoring of it is muted
@@ -351,7 +366,24 @@ void Engine::start()
   if (m_running) return;
   m_quit = false;
   m_running = true;
+  if (const char *log = getenv("O11_LIVE_LOG")) m_liveLog = atoi(log) != 0; // before the thread reads it
   m_thread = std::thread([this]() { threadProc(); });
+
+  // benchmarks, with no window: join a room once loaded (O11_CONNECT="host:port name") or host one
+  // (O11_HOST=1, on O11_HOST_PORT), pick the Opus bitrate (O11_BITRATE) and Live's buffer
+  // (O11_LIVE_BUFFER_MS: ms, or auto), and print the `live` line when it changes (O11_LIVE_LOG=1)
+  // benchmarks: this player is heard and hears through the room's server instead of directly
+  // (O11_LIVE_FORCE_RELAY=1 on every player: the whole room relayed, as before all to all)
+  if (const char *r = getenv("O11_LIVE_FORCE_RELAY")) m_client->setLiveTestForceRelay(atoi(r) != 0);
+  if (const char *ms = getenv("O11_LIVE_BUFFER_MS")) setLiveBuffer(Settings::nearestLiveBufferMs(strcmp(ms, "auto") == 0 ? 0 : atoi(ms)));
+  if (const char *k = getenv("O11_BITRATE")) setOpusKbps(atoi(k)); // before hosting: the host's bitrate is the room's
+  if (const char *h = getenv("O11_HOST")) setHosting(atoi(h) != 0);
+  if (const char *c = getenv("O11_CONNECT"))
+  {
+    const std::string s = c;
+    const size_t space = s.find(' ');
+    connect(s.substr(0, space), space == std::string::npos ? "bench" : s.substr(space + 1));
+  }
 }
 
 void Engine::stop()
@@ -434,6 +466,8 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
   // a stopped host: we send silence (and the network thread stops sending at the next interval)
   const bool stopped = timing && timing->transport && !timing->offline && !timing->position.playing;
   m_hostStopped.store(stopped, std::memory_order_relaxed);
+  // Live sends only while the host plays, and nothing while it renders offline
+  m_client->setLiveHostState(!stopped, timing && timing->offline);
   const bool monitor = m_monitor.load(std::memory_order_relaxed) && !m_client->anySolo();
 
   // the host's bars: the interval playing now may end a little early or late, so the next
@@ -484,45 +518,48 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
     int pos = 0, length = 0;
     m_client->position(&pos, &length);
     if (m_client->isIntervalRunning() && pos < length) n = std::min(n, length - pos);
-    for (int i = 0; i < n; i ++)
+    for (int c = 0; c < 2; c ++)
     {
-      m_monL[(size_t)i] = inL ? inL[done + i] * gain : 0.0f;
-      m_monR[(size_t)i] = inR ? inR[done + i] * gain : 0.0f;
-      m_bufL[(size_t)i] = stopped ? 0.0f : m_monL[(size_t)i];
-      m_bufR[(size_t)i] = stopped ? 0.0f : m_monR[(size_t)i];
+      const float *src = c == 0 ? inL : inR;
+      float *mon = c == 0 ? m_monL.data() : m_monR.data();
+      if (src)
+        for (int i = 0; i < n; i ++) mon[i] = src[done + i] * gain;
+      else memset(mon, 0, sizeof(float) * (size_t)n);
     }
-    const float *ins[2] = { m_bufL.data(), m_bufR.data() };
+    // the engine only reads its input: your input as you hear it, or silence (m_bufL and m_bufR
+    // are never written after setupProcessing) while the host is stopped
+    const float *ins[2] = { stopped ? m_bufL.data() : m_monL.data(), stopped ? m_bufR.data() : m_monR.data() };
+    // each player output: that player alone, written there by the engine itself (each of the
+    // host's channels is a buffer of its own: JUCE gives each one); the player pairs it doesn't
+    // use go to ours
     float *mix[MIX_OUTS];
     for (int c = 0; c < MIX_OUTS; c ++) mix[c] = m_mix[(size_t)c].data();
+    if (playerOuts)
+      for (int p = 0; p < NUM_PLAYER_OUTS; p ++)
+        if (float **bus = playerOuts->bus[p])
+          for (int c = 0; c < std::min(playerOuts->channels[p], 2); c ++)
+            if (bus[c]) mix[2 + 2 * p + c] = bus[c] + done;
     m_client->process(ins, 2, mix, MIX_OUTS, n, srate);
 
     // the main output: everyone, and your monitoring (the engine's own is muted, so it goes on
-    // while nothing is sent); each player output: that player alone
+    // while nothing is sent)
     float *outs[2] = { out[0] + done, numOut > 1 && out[1] ? out[1] + done : m_spare.data() };
-    for (int i = 0; i < n; i ++)
+    // a channel at a time (loops the compiler vectorizes: the main output's channel is none of
+    // those it sums), in the same order for each sample: the main pair, the player pairs, your
+    // monitoring
+    static_assert(NUM_PLAYER_OUTS == 8, "the sum below names each player pair");
+    for (int c = 0; c < 2; c ++)
     {
-      float l = mix[0][i], r = mix[1][i];
-      for (int p = 0; p < NUM_PLAYER_OUTS; p ++)
-      {
-        l += mix[2 + 2 * p][i];
-        r += mix[3 + 2 * p][i];
-      }
+      float *__restrict o = outs[c];
+      const float *m = mix[c], *p0 = mix[2 + c], *p1 = mix[4 + c], *p2 = mix[6 + c], *p3 = mix[8 + c], *p4 = mix[10 + c],
+                  *p5 = mix[12 + c], *p6 = mix[14 + c], *p7 = mix[16 + c];
+      for (int i = 0; i < n; i ++) o[i] = m[i] + p0[i] + p1[i] + p2[i] + p3[i] + p4[i] + p5[i] + p6[i] + p7[i];
       if (monitor)
       {
-        l += m_monL[(size_t)i];
-        r += m_monR[(size_t)i];
+        const float *mon = c == 0 ? m_monL.data() : m_monR.data();
+        for (int i = 0; i < n; i ++) o[i] += mon[i];
       }
-      outs[0][i] = l;
-      outs[1][i] = r;
     }
-    if (playerOuts)
-      for (int p = 0; p < NUM_PLAYER_OUTS; p ++)
-      {
-        float **bus = playerOuts->bus[p];
-        if (!bus) continue;
-        for (int c = 0; c < playerOuts->channels[p]; c ++)
-          if (bus[c]) memcpy(bus[c] + done, mix[2 + 2 * p + (c & 1)], sizeof(float) * (size_t)n);
-      }
 
     // the metronome, on the beats of the interval these samples played in
     if (m_client->isIntervalRunning())
@@ -751,7 +788,7 @@ void Engine::setRoomCodec(const std::string &codec)
 int Engine::sendKbps()
 {
   const int room = m_state == ConnState::Connected ? m_client->roomOpusKbps() : 0;
-  return room > 0 ? room : getSettings().opusKbps;
+  return room > 0 ? room : setting(&Settings::opusKbps);
 }
 
 void Engine::applySendKbps()
@@ -794,6 +831,24 @@ void Engine::setHostName(const std::string &name)
 {
   std::lock_guard<std::mutex> lock(m_settingsMutex);
   m_hostName = name;
+}
+
+void Engine::setRoomLive(bool on)
+{
+  post([this, on]() {
+    if (m_state == ConnState::Connected) m_client->say(on ? "!live on" : "!live off");
+  });
+}
+
+void Engine::setLiveBuffer(int ms)
+{
+  const int b = Settings::nearestLiveBufferMs(ms);
+  {
+    std::lock_guard<std::mutex> lock(m_settingsMutex);
+    if (m_settings.liveBufferMs == b) return;
+    m_settings.liveBufferMs = b;
+  }
+  post([this]() { applyLocalSettings(); });
 }
 
 void Engine::setRemote(const std::string &user, int channel, RemoteField field, float value)
@@ -875,6 +930,34 @@ void Engine::threadProc()
       m_lastPublish = t;
       publish();
     }
+    if (m_liveLog && t - m_liveLogAt >= 0.1)
+    {
+      m_liveLogAt = t;
+      const std::string line = command("live");
+      if (line != m_liveLogLine)
+      {
+        m_liveLogLine = line;
+        printf("live: %s", line.c_str());
+        fflush(stdout);
+      }
+    }
+    if (m_liveLog && t - m_liveCountersAt >= 1.0)
+    {
+      // and each player's counters, at most once a second when they change
+      m_liveCountersAt = t;
+      const std::string counters = command("live counters");
+      if (counters != m_liveCountersLine)
+      {
+        m_liveCountersLine = counters;
+        for (size_t a = 0, b; a < counters.size(); a = b + 1)
+        {
+          b = counters.find('\n', a);
+          if (b == std::string::npos) b = counters.size();
+          printf("live counters: %s\n", counters.substr(a, b - a).c_str());
+        }
+        fflush(stdout);
+      }
+    }
 
     std::unique_lock<std::mutex> lock(m_cmdMutex);
     if (m_commands.empty() && !m_quit) m_cmdCv.wait_for(lock, std::chrono::milliseconds(10));
@@ -888,6 +971,7 @@ void Engine::applyLocalSettings()
   m_clickVolume = s.metronomeMute ? 0.0f : s.metronomeVolume;
   // the engine monitors the input itself (process()), so it goes on while the host is stopped
   m_monitor = s.monitor;
+  if (m_client->liveBufferMs() != s.liveBufferMs) m_client->setLiveBufferMs(s.liveBufferMs);
 
   applySendKbps();
   applyBroadcast();
@@ -895,7 +979,7 @@ void Engine::applyLocalSettings()
 
 void Engine::applyBroadcast()
 {
-  const bool want = getSettings().transmit && !m_hostStopped.load(std::memory_order_relaxed);
+  const bool want = setting(&Settings::transmit) && !m_hostStopped.load(std::memory_order_relaxed);
   LocalChannel lc;
   // from the next interval (the channel stays, so the others keep their settings for it)
   if (m_client->localChannel(0, &lc) && lc.broadcast != want)
@@ -1025,7 +1109,7 @@ void Engine::checkCanSend(bool canSend)
 // votes the room to the host's tempo when it changes (see TempoFollower)
 void Engine::followHostTempo()
 {
-  if (!getSettings().followHostTempo) return;
+  if (!setting(&Settings::followHostTempo)) return;
   const double t = now_seconds();
   // the host's tempo, while it runs the audio
   const double tempo = t - m_lastAudio < 1.0 ? m_hostTempo.load(std::memory_order_relaxed) : 0.0;
@@ -1061,7 +1145,7 @@ void Engine::updateLink()
   if (t - m_lastLinkPoll < LINK_POLL) return;
   m_lastLinkPoll = t;
 
-  const bool sync = getSettings().followHostTempo;
+  const bool sync = setting(&Settings::followHostTempo);
   const bool inRoom = m_state == ConnState::Connected;
   if (!sync || !inRoom) releaseLink();
   m_link->use(sync && inRoom);
@@ -1210,6 +1294,25 @@ void Engine::updateUsers(Snapshot &snap)
       }
       uv.joinedAt = it->second;
     }
+    uv.liveHeardMs = (int)lround(m_client->liveUserHeardMs(u));
+    uv.liveFillMs = (int)lround(m_client->liveUserBufferMs(u));
+    uv.liveBufferMs = m_client->liveUserBufferInUseMs(u);
+    uv.liveFellBack = m_client->liveUserBufferFellBack(u);
+    uv.liveDirect = m_client->liveUserHasDirectPath(u);
+    uv.liveRttMs = (int)lround(m_client->liveUserProbeRttMs(u));
+    {
+      o11proto::engine::LiveCounters k;
+      if (m_client->liveUserCounters(u, &k))
+      {
+        char b[320];
+        snprintf(b, sizeof(b), "late=%u lost=%u concealed=%llu dry=%u overflows=%u xruns=%u resent=%u skips=%u host_gaps=%u speed_changes=%u speed_ppm=%.0f fill=%.1f buffer=%d fell_back=%d route=%s rtt=%d",
+                 k.late, k.lost, (unsigned long long)k.concealed_frames, k.underruns, k.overflows, k.xrun_gaps, k.resent,
+                 k.skips, k.host_gaps, k.speed_changes, k.speed_ppm, k.fill_ms, k.buffer_ms, k.fell_back ? 1 : 0,
+                 o11proto::engine::liveRouteName(k.route), uv.liveRttMs);
+        uv.liveCounters = b;
+      }
+      else uv.liveCounters.clear();
+    }
     signature += uv.name + "\n";
     for (int i = 0; ; i ++)
     {
@@ -1314,7 +1417,10 @@ void Engine::publish()
   snap.state = m_state;
   snap.status = m_statusText.empty() ? "Not connected" : m_statusText;
   snap.server = m_server;
-  snap.opusKbps = getSettings().opusKbps;
+  snap.opusKbps = setting(&Settings::opusKbps);
+  snap.liveBufferMs = setting(&Settings::liveBufferMs);
+  snap.liveBufferInUseMs = m_client->liveBufferInUseMs();
+  snap.liveRoute = o11proto::engine::liveRouteName(m_client->liveRoomRoute().route);
   snap.sendKbps = sendKbps();
   if (m_state == ConnState::Connected || m_state == ConnState::Connecting)
   {
@@ -1334,6 +1440,22 @@ void Engine::publish()
       if (upload) snap.uploadCodec = fourcc_text(upload);
       snap.canSend = upload != 0;
       checkCanSend(upload != 0);
+
+      // Live, as the engine plays it now (it switches the whole room at an interval's start)
+      snap.liveServer = m_client->liveServerHas();
+      snap.liveSwitchOn = snap.liveServer && m_client->liveRoomSwitchOn();
+      snap.liveRoom = m_client->liveRoomLive();
+      // the server's advice while Live: the worst trouble now, and how many have trouble
+      switch (m_client->liveAdviceReason())
+      {
+        case o11proto::engine::Engine::LiveAdvice::Dropouts: snap.liveReason = Snapshot::LiveDropouts; break;
+        case o11proto::engine::Engine::LiveAdvice::CantLive: snap.liveReason = Snapshot::LiveCantLive; break;
+        default: snap.liveReason = Snapshot::LiveNoReason; break;
+      }
+      const std::string who = m_client->liveAdviceUser();
+      snap.liveReasonWho = who.empty() ? std::string() : who == m_client->username() ? std::string("You") : displayName(who);
+      snap.liveReasonOthers = snap.liveReason == Snapshot::LiveNoReason ? 0 : std::max(0, m_client->liveAdviceCount() - 1);
+      snap.liveHeardMs = snap.liveRoom ? m_client->liveHeardMs() : -1;
     }
     updateUsers(snap);
   }
@@ -1354,7 +1476,7 @@ void Engine::publish()
   snap.audioRunning = t - m_lastAudio < 1.0;
   snap.localPeak[0] = m_client->localPeak(0, 0);
   snap.localPeak[1] = m_client->localPeak(0, 1);
-  snap.sendPaused = snap.audioRunning && m_hostStopped.load(std::memory_order_relaxed) && getSettings().transmit;
+  snap.sendPaused = snap.audioRunning && m_hostStopped.load(std::memory_order_relaxed) && setting(&Settings::transmit);
 
   // following the host, and its tempo against the room's
   std::string hostName;
@@ -1527,6 +1649,54 @@ std::string Engine::command(const std::string &lineIn)
     return "ok";
   }
   if (verb == "follow") { setFollowHostTempo(arg == "on" || arg == "1"); return "ok"; }
+  if (verb == "/live")
+  {
+    // the engine's own /live: its answer comes as Live lines, in the chat log
+    post([this, line]() { m_client->liveCommand(line); });
+    return "ok";
+  }
+  if (verb == "live")
+  {
+    if (arg == "on" || arg == "off")
+    {
+      setRoomLive(arg == "on");
+      return "ok";
+    }
+    if (arg.compare(0, 7, "buffer ") == 0)
+    {
+      const int ms = arg.compare(7, std::string::npos, "auto") == 0 ? Settings::LIVE_BUFFER_AUTO : atoi(arg.c_str() + 7);
+      if (Settings::nearestLiveBufferMs(ms) != ms || (ms == Settings::LIVE_BUFFER_AUTO && arg.compare(7, std::string::npos, "auto") != 0))
+        return "error: the buffer is auto or one of 10 15 20 30 40 60 80 100 (ms)";
+      setLiveBuffer(ms);
+      return "ok";
+    }
+    if (arg == "counters")
+    {
+      // each player's stream since it started here: what went wrong and what the buffer did (benchmarks)
+      Snapshot s;
+      getSnapshot(s);
+      std::string out;
+      for (const auto &uv : s.users)
+        if (!uv.liveCounters.empty()) out += uv.displayName + " " + uv.liveCounters + "\n";
+      return out;
+    }
+    if (!arg.empty()) return "error: live on|off, live buffer auto|N, live counters, or live";
+    Snapshot s;
+    getSnapshot(s);
+    static const char *reasons[] = { "none", "dropouts", "cantlive" };
+    char buf[256];
+    const std::string bufferText = s.liveBufferMs == Settings::LIVE_BUFFER_AUTO ? "auto" : std::to_string(s.liveBufferMs);
+    snprintf(buf, sizeof(buf), "server=%d switch=%d room=%s reason=%s who=%s others=%d heard=%d buffer=%s inuse=%d route=%s\n",
+             s.liveServer ? 1 : 0, s.liveSwitchOn ? 1 : 0, s.liveRoom ? "live" : "intervals", reasons[(int)s.liveReason],
+             s.liveReasonWho.c_str(), s.liveReasonOthers, s.liveHeardMs, bufferText.c_str(), s.liveBufferInUseMs, s.liveRoute.c_str());
+    // each player's stream: how late you hear them, how full its buffer is and the buffer it plays with (benchmarks)
+    std::string line = buf;
+    line.pop_back();
+    for (const auto &uv : s.users)
+      if (uv.liveHeardMs >= 0 || uv.liveFillMs >= 0)
+        line += " " + uv.displayName + "=" + std::to_string(uv.liveHeardMs) + "/" + std::to_string(uv.liveFillMs) + "/" + std::to_string(uv.liveBufferMs);
+    return line + "\n";
+  }
   if (verb == "vote")
   {
     // what the editor's BPM and BPI boxes do

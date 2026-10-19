@@ -48,11 +48,17 @@ Type `0xFE` is reserved ("extended") and never sent.
 | `0x04` | SERVER_DOWNLOAD_INTERVAL_BEGIN | server → client | 7.4 |
 | `0x05` | SERVER_DOWNLOAD_INTERVAL_WRITE | server → client | 7.4 |
 | `0x06` | SERVER_CODEC_MASK (Jamsa extension) | server → client | 8 |
+| `0x07` | SERVER_LIVE (Live mode, O11 Session extension) | server → client | 15 |
+| `0x08` | SERVER_LIVE_ROOM (Live mode) | server → client | 15.11 |
+| `0x09` | SERVER_LIVE_PATHS (Live mode) | server → client | 15.10 |
 | `0x80` | CLIENT_AUTH_USER | client → server | 4.2 |
 | `0x81` | CLIENT_SET_USERMASK | client → server | 6.3 |
 | `0x82` | CLIENT_SET_CHANNEL_INFO | client → server | 6.1 |
 | `0x83` | CLIENT_UPLOAD_INTERVAL_BEGIN | client → server | 7.2 |
 | `0x84` | CLIENT_UPLOAD_INTERVAL_WRITE | client → server | 7.2 |
+| `0x85` | CLIENT_LIVE_REPORT (Live mode) | client → server | 15.11 |
+| `0x86` | CLIENT_LIVE_LAN (Live mode) | client → server | 15.10 |
+| `0x87` | CLIENT_LIVE_PATHS (Live mode) | client → server | 15.10 |
 | `0xC0` | CHAT_MESSAGE | both | 9 |
 | `0xFD` | KEEPALIVE | both | 2 |
 
@@ -100,7 +106,7 @@ A client accepts `protocol_version` from `0x00020000` up to but excluding `0x000
 
 `passhash = SHA1( SHA1( username + ":" + password ) + challenge )`, where `+` is byte concatenation, `username` and `password` are the raw bytes the user typed (no terminator), and `challenge` is the 8 bytes from the server. For anonymous logins the password is the empty string (the hash is still sent; the server ignores it).
 
-`client_caps`: bit 0 = the user agreed to the licence (required when the server sent one; the server refuses otherwise). Bits 8-15 are codec capabilities (Jamsa extension, section 8): `0x100` = can decode Opus, `0x200` = can decode FLAC. All other bits must be 0 (JamWide uses bit 2 for a purpose of its own).
+`client_caps`: bit 0 = the user agreed to the licence (required when the server sent one; the server refuses otherwise). Bits 8-15 are codec capabilities (Jamsa extension, section 8): `0x100` = can decode Opus, `0x200` = can decode FLAC. Bit 16 (`0x10000`) = can play Live mode (section 15). All other bits must be 0 (JamWide uses bit 2 for a purpose of its own).
 
 The server accepts `client_version` from `0x00020000` to `0x0002ffff` inclusive.
 
@@ -413,7 +419,8 @@ From the client: `SESSION`, GUID as 32 hex digits, channel index as decimal, the
 | `!topic` | the server sends the current TOPIC to the sender |
 | `!vote bpm N`, `!vote bpi N` | cast a vote (needs the vote privilege; N within 40-400 or 2-64). A vote that counts is first shown to everyone, the voter included, as the voter's own chat line: `MSG`, the voter's name, the command as typed with leading and trailing white space removed (`MSG\0Anna\0!vote bpm 100\0\0\0`); the `[voting system]` line it produces follows it. Each user's latest vote per setting counts for `VotingTimeout` seconds (default 120). When the leading value has at least `threshold % × visible users` votes (rounded), the server applies it, broadcasts `[voting system] setting BPM to N` (or `BPI`) and a CONFIG_CHANGE, and clears the votes; otherwise it broadcasts `[voting system] leading candidate: a/b votes for N BPM [each vote expires in Ts]` to everyone. Voting is off when the threshold is over 100: `[voting system] Voting not enabled`; without the privilege: `[voting system] No vote permission`; bad arguments: `[voting system] !vote requires <bpm|bpi> <value> parameters`. These three go to the sender only, and a refused vote is not shown to the room. All `[voting system]` lines are `MSG` with an empty user. (Showing the vote is new in revision 2c: the reference server only sends the `[voting system]` lines; to any client the voter's line is ordinary chat.) |
 | `!codec [opus|flac|vorbis]`, `!bitrate [N]` | section 8.4 |
-| other `!word` | `PRIVMSG * Unknown !command. Commands available: !vote, !topic, !codec, !bitrate` to the sender |
+| `!live [on|off]` | section 15.3 |
+| other `!word` | `PRIVMSG * Unknown !command. Commands available: !vote, !topic, !codec, !bitrate, !live` to the sender (also on a server without Live) |
 
 ### 9.5 `/` commands (in an `ADMIN`)
 
@@ -482,8 +489,251 @@ A new client or server should pass these against the existing ones (the Jamsa re
 
 ## 14. Revision history
 
+- **Revision 2d (2026-10-18):** Live mode (section 15) as o11proto plays it now: the room has one mode for everyone, its `!live` switch alone, with no interval audio while it is Live, and the server's advice says who has trouble (15.11: `0x85`, `0x08`, the upload refusal, the `[live room]` lines, the new `!live` texts in 15.3); the players send to each other directly, all to all (15.10: caps bit 17, `0x09`, `0x86`, `0x87`, the probes, the pair key; the relay only for players without paths, make before break while a new path opens, and the off-by-default relay fallback with `!live direct`); the peer flag `0x02` sending (15.1); the client's socket isn't `connect()`ed, and its thread's wake and wait (15.6); the rate limit scaled for direct senders and the traffic line's order (15.7); the port mapper warning's new ending (15.8).
 - **Revision 2c (2026-10-17):** a `!vote` that counts is shown to the whole room as the voter's own `MSG`, before the `[voting system]` line (9.1, 9.2, 9.4, test 8); refused votes stay private to the sender. Other `!` commands are unchanged.
 - **Revision 2b (2026-10-17):** fourcc `OPUr`, raw Opus packets with length prefixes (7.8); servers map it to the `0x100` capability like `OPUS`.
 - **Revision 2a (2026-10-16):** two more findings from the same comparison: chat messages always carry five strings (9), and CODEC_MASK is only resent when it changes (8.1).
 - **Revision 2 (2026-10-16):** a clean-room implementation written from revision 1 was run against the reference server and client. Audio, login, channels, subscriptions and forwarding matched at once; the differences were all in things revision 1 left open, now fixed in the text: the exact `[server]` and `[voting system]` chat texts and the fact that they are `MSG` lines with an empty user (8.5, 9.4, 9.5); the default Opus bitrate of 128 kbps; anonymous users don't get multiple logins unless configured; the same-name replacement runs before the capacity check; `!codec` may switch between allowed codecs under RequireCodec.
 - **Revision 1 (2026-10-16):** first version, written from the Jamsa repository at `e040ae1`.
+
+## 15. Live mode (O11 Session extension)
+
+Live mode lets the players of a room hear each other in real time: each Live player sends small Opus packets over UDP, directly to each of the room's other Live players where the pair has a direct path (15.10), and through the server it is connected to, which copies them on, for a player without paths. The room has one mode for everyone, set by its `!live` switch alone: while the room is Live every Live player is heard live and there is no interval audio at all (none is uploaded or relayed); otherwise everyone plays intervals (15.11). This section is the wire reference for o11proto; it follows the Live mode specification revision 2 (2026-10-17, written from Jamsa's Live at `44a4904`), where every rule here is explained, except the room's one mode with its advice (15.11, in place of that specification's per-player switching) and the direct paths (15.10), which are O11 Session's own. The payload is in 15.9, the client's behaviour (audio, jitter buffer, the room's mode, `/live`) in `ENGINE.md` section 16, and what o11proto chose where that specification leaves room is in `NOTES.md` and `engine/NOTES.md`.
+
+### 15.1 The caps bit and SERVER_LIVE (`0x07`)
+
+A client that can play Live sets bit 16 (`0x10000`) of `client_caps`; one that also sends directly to the other players where it can (15.10) sets bit 17 (`0x20000`) too, which is read only together with bit 16. The server reads them at login only and never refuses a login because of them. There is no `server_caps` bit: a client learns that the server has Live only by receiving `0x07`, which is sent only to clients that set the bit, never to hidden users, and only to players with a key (below).
+
+| Offset | Size | Field | Meaning |
+|---|---|---|---|
+| 0 | u8 | version | 1 |
+| 1 | u8 | fixed length | 32: where the peer list starts |
+| 2 | u8 | flags | `0x01` room on, `0x02` UDP open, `0x04` may send; other bits 0 |
+| 3 | u8 | reserved | 0 |
+| 4 | u16 | UDP port | 0 = the TCP port number the client connected to |
+| 6 | u16 | bitrate | the room's Live Opus bitrate, kbps (32-510) |
+| 8 | u32 | peer id | this connection's id, never 0 |
+| 12 | u64 | key | this connection's secret |
+| 20 | u16 | frame size | Opus frame at 48 kHz: 120, 240 or 480 |
+| 22 | u16 | sender limit | how many players of a room play Live |
+| 24 | 8 | reserved | 0 |
+| 32 | … | peers | records to the end: u32 peer id, u8 flags (`0x01` bound, `0x02` sending: its own latest report says its source sends, 15.11), string name |
+
+The peers are the room's senders other than the receiver, in the room's order. **Parsing**: a payload under 32 bytes, version 0, or a fixed length below 32 or beyond the payload is ignored; a later version is read as version 1; a record needs 6 bytes left and a NUL inside the payload, otherwise the list ends; at most 256 records are read; records with id 0 or the receiver's own id are skipped. Each message is a full state that replaces the previous one; a client forgets it when it connects again.
+
+### 15.2 What the server says, and when
+
+- A **Live player** is logged in, set bit 16, and is not hidden. The **room's order** is the order in which the TCP connections were accepted (peer ids count up in that order).
+- Each Live player gets a 64-bit **key** from the system's cryptographic random source, never 0, the first time the server works out the Live state with Live allowed; it lasts for the connection. Without randomness the player keeps key 0, gets no `0x07`, and the server logs once `warning: Live: could not read the system's random source, so nobody can play Live` and tries again at later computations.
+- The **senders** are the first sender-limit Live players in the room's order that have a key and a channel limit (maxchan) above 0. Others with channels are **over the limit**; Live players with maxchan 0 are **listeners only**. Both get `0x07` without may send, are known to the relay and can bind, but receive no audio and are listed by nobody.
+- **Live allowed** means the configuration's Live mode isn't `no`. The room is **on** when Live is allowed, the UDP port is open and the room's switch is on.
+- Contents for player *P*: the UDP port is the announced port when set, else 0 (the relay always listens on the TCP port's number); flags as above (with the UDP port closed a sender gets may send alone); peers with bound set when the UDP port is open and that peer is bound (15.6).
+- The server works the messages out again whenever an input changes (a player joins or leaves, the switch, the options, the UDP port opening or closing, any player's bound state, the sending bit of a player's report, and for `0x09` a player's LAN address or relay-only flag) and sends each player its message when it differs, byte for byte, from the last one sent to it, within 100 ms. The first one follows the login sequence. Each `0x09` (15.10) goes after the `0x07` of the same pass, so that its ids are known.
+- **Live taken away**: when the options change to `no`, each player who was told about Live gets one message with flags 0 and no peers.
+
+### 15.3 The `!live` command
+
+A MSG whose text, after leading spaces and tabs, starts with `!live` in any letter case followed by a space, a tab or the end (`!livestream` isn't it). The argument is the rest, trimmed of spaces and tabs; `on` and `off` (any case) change the switch, `direct` takes the room's route back to direct (15.10) on a server with the relay fallback and is an unknown argument elsewhere, anything else asks for the state. It is never broadcast as chat and works without the chat privilege. All answers are MSG lines with an empty user, in this order of checks:
+
+1. `on`/`off`/`direct` without the vote privilege: `[server] you don't have permission to change the room's audio`
+2. Live not allowed: `[server] this server doesn't have Live`
+3. UDP port not open: `[server] Live is off: the server could not open its UDP port`
+4. `direct`: the answers of 15.10, to the sender.
+5. no or an unknown argument, or `on`/`off` equal to the state (which still counts as the room's choice): the status text, to the sender: `[server] Live is on. ` or `[server] Live is off. `, then `Players who can play Live: <senders>. ` or `Nobody here can play Live yet. `, then (only with an *over* list) `Live has room for <limit>, so <over> isn't heard while it is on. ` (`aren't` with several), then (only while the room's route is Relay, 15.10) `It goes through the server's relay since <why>. ` (without ` since <why>` when there is none), with `Everyone can connect directly again. ` after it while every pair has a direct path again, then `Turn it off with !live off` or `Turn it on with !live on`.
+6. otherwise the switch changes and every logged-in user gets `[server] <who> turned Live on: O11 Session players now hear each other in real time.` followed by ` <name>'s client can't play Live, so <name> isn't heard until Live is off.` for one user without bit 16 (or ` The clients of <names> can't play Live, so they aren't heard until Live is off.` for several) and the *over* sentence ` Live has room for <limit>, so <names> isn't heard while it is on.` (`aren't` with several); or `[server] <who> turned Live off: everyone hears each other through intervals again.` `<who>` is `someone` for a hidden user.
+
+Names are joined as `a`, `a and b`, `a, b and c`. Once switched with `!live`, the room's choice survives option changes (also to `no` and back); otherwise the room takes the default again (on for `on`, off otherwise).
+
+### 15.4 Options
+
+| `LiveConfig` field | `o11server` flag | Values | Default |
+|---|---|---|---|
+| `mode` | `--live` | `no`, `yes` (starts off), `on` (starts on), `require` (like `yes`, but `start()` fails without the UDP port) | `no` |
+| `kbps` | `--live-kbps` | 32-510 | 128 |
+| `frame` | `--live-frame` | 120, 240, 480 | 240 |
+| `max_peers` | `--live-max-peers` | 1-64 | 8 |
+| `announce_port` | `--live-port` | 0-65535; the UDP port to announce instead of the real one | 0 |
+| `strict_address` | `--live-strict-address` | `yes`, `no`: UDP must come from the player's TCP address | `yes` |
+| `relay_fallback` | none; the environment variable `O11_LIVE_RELAY_FALLBACK` (`1` or `0`, anything else leaves the field) overrides it when the UDP port opens and at each `setLiveConfig()` while it is open | off: Live goes only directly between the players (15.10); on: the room goes through the relay for everyone once a pair has no direct path | off |
+
+Out-of-range values are logged (`warning: LiveKbps 1000 is outside 32-510, using 128`) and replaced by the default. `Server::setLiveConfig()` applies new options while running, as a configuration reload would.
+
+**The UDP port.** With Live allowed, the server binds UDP on the TCP port's number (on the TCP listener's address when it has one), IPv4 only, without address reuse, with 1 MiB buffers, non-blocking, reporting each datagram's local address. Success logs `Live: listening on UDP port <p>`. A busy port logs `warning: Live is off, could not open UDP port <p>. Another program may already be using it (2049 is also the NFS port). Set a different Port in the config, or Live no.` and the server runs without UDP; with `require`, `start()` logs `Error listening on UDP port <p> for Live! Another program may already be using it (2049 is also the NFS port), or you may need permission to use it. Set a different Port in the config or use -port.` and fails. Opening draws a new cookie secret (and fails, with its own line, when no randomness can be had), forgets every binding, and draws a new path secret, so that every pair gets a new key and every path opens again (15.10); options changed to `no` close the port (`Live is off, closed UDP port <p>`). At shutdown the UDP port closes before the users are dropped.
+
+### 15.5 Datagrams
+
+All header fields are little-endian. A client sends to the IPv4 address of the server end of its TCP connection, at the UDP port of `0x07`, or at the TCP port number it connected to when that is 0.
+
+| Client → server, 20 bytes | | Server → client, 8 bytes | |
+|---|---|---|---|
+| 0, 2 | magic `N` `L` | 0, 2 | magic `N` `L` |
+| 2, u8 | version 1 | 2, u8 | version 1 |
+| 3, u8 | type: 1 hello, 2 data (3 probe, 4 probe reply: between players, 15.10) | 3, u8 | type: 1 hello reply, 2 data |
+| 4, u32 | sender: the peer id | 4, u32 | origin: the sender's peer id (0 in a hello reply) |
+| 8, u64 | key | | |
+| 16, u32 | destination: 0 = every other sender, else one peer id (0 in a hello) | | |
+
+- **Hello**, exactly 40 bytes: the header, u64 timestamp at 20 (echoed; o11proto sends monotonic microseconds with bit 63 set), u64 cookie at 28 (the latest accepted, 0 if none), 4 zero bytes.
+- **Hello reply**, exactly 24 bytes: the server header with origin 0, the hello's 8 timestamp bytes, the u64 cookie for the hello's source address and port.
+- **Data**: the header, then 1-1452 bytes of payload (15.9), forwarded untouched; 21-1472 bytes from a client, 9-1460 from the server.
+- The server drops anything over 1472 bytes. A client takes a datagram from the relay's address and port as the relay's; any other is a player's (15.10). It drops a datagram over 1500 bytes, and from the relay one with the wrong magic or version, a hello reply that isn't 24 bytes or has a nonzero origin, data with origin 0 or a payload of 0 or over 1452 bytes, and any other type.
+
+### 15.6 Hellos, the cookie and binding
+
+- The client sends a hello when its Live client starts, then every 2 s, and at once whenever an accepted reply brings a cookie other than the one it holds. It remembers its last 8 timestamps and accepts a reply only with a nonzero timestamp among them and a round trip of 0 to 10 s; that sets the server round trip and the cookie. Hellos go on while the room is off. In o11proto this is `live::Transport` (`live_transport.h`): one IPv4 socket per connection for the relay and the direct paths, bound to a port of its own and not `connect()`ed (what comes from the relay's address and port is the relay's, anything else must be a player's, 15.10), with 256 KiB buffers, no SIGPIPE and (on Windows) no "port unreachable" reset. Its start fails with `no peer ID or server address` or `can't open a UDP socket (error <n>)`. Its own thread is a network thread (`o11proto/realtime.h`, `thread::makeNetworkThread()`: on macOS the time-constraint policy, as an audio thread, else latency-critical). It waits on the socket and on `wake()` (one write to a non-blocking pipe, safe from the audio thread; none on Windows), and at least every `Options::wait_ms` (1-100 ms, default 1; always 1 on Windows) runs a pass of its own: an owner that sets more than 1 must call `wake()` for its own work, as the engine does with 10. `timing()` reports for diagnostics the scheduling it got (real-time or latency-critical), the timed waits that ran out and the longest of them and how many ended over 5 ms past their time, and the wakes, the longest wake-up delay and how many were over 5 ms.
+- **The cookie** = SipHash-2-4, keyed with the 16-byte secret, over 22 bytes: peer id (u32 LE), key (u64 LE), the hello's source IPv4 address and UDP port as on the wire, and epoch = floor(monotonic seconds / 30) (u32 LE). Test vectors (secret 00 01 … 0f): SipHash of 00 01 … 0e is `a129ca6149be45e5`; id 1, key `0x0123456789abcdef`, 127.0.0.1:50000, epoch 1000 gives `c180445be3d73103`; id 7, key `0xfedcba9876543210`, 192.0.2.10:2049, epoch 57000000 gives `f1620faed24ff4a6`.
+- A hello is **verified** when its cookie equals the cookie of its sender, key, source address and port at the current epoch or the previous one, compared in constant time. The reply always carries the current epoch's cookie.
+- A verified hello binds the player: bound address := the hello's source, local address := where it arrived, last hello := now. Nothing else binds; data never does. The player stays **bound** for 20 s after its last verified hello (checked every 100 ms), until the UDP port opens again, or until it leaves.
+
+### 15.7 The relay
+
+A **known player** is a Live player with a key, with Live allowed and the UDP port open (over the limit and listeners only included). Each datagram goes through these checks; one that fails is dropped silently and counted under the reason given:
+
+| Step | Check | Reason |
+|---|---|---|
+| 1 | length ≤ 1472 | too big |
+| 2 | length ≥ 20, magic, version 1, and type 1 with length 40 or type 2 with length above 20 | malformed |
+| 3 | the sender is a known player | unknown sender |
+| 4 | the key matches (constant time) | wrong key |
+| 5 | strict address: the source IPv4 address is the player's TCP peer address | wrong address |
+| 6 | the rate limit | over the rate limit |
+| 7 | hello: always answered; unverified ones are counted here | unverified address (answered) |
+| 7 | data: the room is on | room's Live is off |
+| 8 | data: the sender is a sender | sender may not send |
+| 9 | data: destination ≠ 0 must be a known player, not the sender, a sender, and bound | no such player |
+
+- Destination 0 goes to every other sender that is bound, at most 64 copies. Addresses only ever come from the relay's own table. The copy is the 8-byte server header followed by the payload, byte for byte, sent at once. A copy that can't be sent counts as `could not send`.
+- **Rate limit**, per known player, with *fps* = 48000 / frame and *scale* = max(1, the number of senders other than this player): bytes per second = *scale* × (2 × (kbps × 125 + *fps* × 64) + 8000); datagrams per second = *scale* × (2 × *fps* + 50); each bucket holds 0.25 s, fills completely at the player's first datagram that reaches the check, refills continuously and is charged once per datagram (header included), except that a data datagram to destination 0 costs *scale* times as much. So a player that sends to each of the others on its own (15.10) may send that many streams, and the copies the relay makes of one datagram to everyone are limited as before. The levels survive option changes (a level above a new burst is cut to it) and start full again when the player is known again.
+- **The right address.** Every reply and every copy is sent from the local address at which the hello (or the destination's last verified hello) arrived, except a broadcast or multicast one. When that address is gone, the server sends once more from where the routing table chooses and forgets it until the next verified hello.
+- **The traffic line.** Every 60 s, when datagrams arrived in that period: `[live] in the last <T> s: <n> player<s>, <in> datagrams/s in, <out> out` followed by `, nothing dropped` or `, dropped <total>:` and ` <count> <reason>` for each reason that occurred, separated by commas, in this order: malformed, too big, unknown sender, wrong key, wrong address, over the rate limit, unverified address (answered), room's Live is off, sender may not send, no such player, could not send (the first two are the other way round from the table). *T* is the real time of the period, *n* the bound players, *in* every datagram read and *out* every datagram sent, divided by *T*; numbers are rounded as `printf` rounds. A normal bind shows `dropped 1: 1 unverified address (answered)`.
+- **Test hooks**: `NINJAM_LIVE_FRESH_SECONDS` (the bound time) and `NINJAM_LIVE_STATS_SECONDS` (the period), decimal seconds above 0, read when the UDP port opens and at each `setLiveConfig()` while it is open; also `LiveConfig::fresh_seconds` and `stats_seconds`.
+- For tests, any thread: `Server::intervalTraffic()` gives the interval audio since the start, in bytes of `UPLOAD_INTERVAL_WRITE` received (from clients with bit 16, and from the others) and of `DOWNLOAD_INTERVAL_WRITE` sent, and the uploads refused while the room was Live (15.11); `Server::liveDataRelayed()` the Live data datagrams the relay has copied to players.
+
+### 15.8 Port mapping
+
+With the UDP port open, the port mapper (`PORTMAP.md`, `PortMapper::start(port, true)`) maps UDP on the same number too, right after TCP and at every renewal: UPnP with the same ports, address, description and the TCP lease (0 with a permanent-only router); NAT-PMP asking for the public port TCP was granted and lifetime 3600, counted as working only when granted exactly that port. The lines say `TCP and UDP` instead of `TCP` while UDP works (`asking the router to forward TCP and UDP port <p> to this machine`, `removed the forward for TCP and UDP port <p>`, the section 7 lines); without a router, `Forward TCP port <p> on your router to this machine by hand, and UDP port <p> for Live, or turn on UPnP …`. A UDP failure never fails TCP and is logged once, until UDP works again, as `warning: Live: the router did not forward UDP port <p> (<why>), so players outside your network can't play Live with you: while the room is Live they hear no one, and no one hears them (!live off puts everyone on intervals)` (not a `[portmap]` line), with `<why>` one of `UPnP: the router forwards it to another machine`, `UPnP error <n>`, `NAT-PMP: the router did not answer`, `NAT-PMP error <n>`, `NAT-PMP: it gave public port <p>, not <q>`. UDP is removed first, quietly.
+
+### 15.9 The payload
+
+The relay never reads the payload. Between Live clients it is the subset of AOO 2.0 in Live spec section 5, written for o11proto from that description (no AOO code): every number big-endian, every source and sink AOO id 1, the UDP header's peer ids saying who is who. Messages for a sink come from a source and messages for a source from a sink. Each client has one source (its channel 0) and up to eight sinks (`ENGINE.md` 16.4).
+
+**Binary messages** (first byte has bit 7 set):
+
+| Message | Bytes | Layout |
+|---|---|---|
+| `/data`, an audio block (source → sinks) | 24 + packet | `81 00 01 01`, i32 stream id, i32 sequence, u8 channel 0, u8 flags `0x01`, u16 packet size, f64 rate 48000.0, the Opus packet |
+| `/data`, an xrun block | 16 | the same with flags `0x08`, size 0, no rate and no data |
+| data request (sink → source) | 12 + 8 × *n* | `80 00 01 01`, i32 stream id, i32 *n* (1-32), then *n* × (i32 sequence, i16 frame offset −1, u16 0) |
+
+- The audio blocks are one stream for every sink (broadcast mode: one stream id). Each block goes to each listed player directly where the pair's path is up and through the relay, addressed to that player, to a bound player without a path (15.10); when every player would get it through the relay it goes once to destination 0 instead. Everything else is unicast to one peer, by the same route.
+- Reading `/data` follows Live 5.4: 16 fixed bytes, then the optional fields its flags announce (`0x02` frames: u32 total, u16 count, u16 index; `0x04` stream messages: u32 bytes; `0x01` f64 rate, finite and above 0; `0x10` u64 time), then the size's bytes; stream messages are skipped. o11proto never splits a block and treats a split one as lost; it drops a negative stream id or sequence, command bit `0x80`, and channel onsets other than 0.
+- Sequences run from 0 to `0x7ffffffe` and start again at 0; a block 2^30 or more below the last one played is a wrap. A data request's frame offset −1 asks for the whole block; o11proto also reads requests for frame 0, ignores other frames, drops a message whose count is negative or larger than it holds, and reads at most 32.
+
+**OSC messages** (single OSC 1.0 messages; no bundles), each with the sender's id 1 as first argument:
+
+| Address | Tags | Bytes | Arguments after the id |
+|---|---|---|---|
+| `/aoo/sink/1/start` | `,isiiiiiisbtiiNNi` | 116 | version `2.0-test4`, stream id, start sequence, format id, channels 2, rate 48000, block (frame size), codec `opus`, blob `00 00 08 03` (restricted low delay), stream time (the sender's monotonic clock), latency, codec delay 120, two nils, sample offset 0 |
+| `/aoo/sink/1/stop` | `,iiii` | 44 | stream id, next sequence, 0 |
+| `/aoo/sink/1/ping` | `,it` | 36 | t1 (wall clock) |
+| `/aoo/src/1/pong` | `,itttf` | 56 | t1, t2, t3, f32 loss since the previous pong |
+| `/aoo/src/1/ping` | `,it` | 32 | t1 |
+| `/aoo/sink/1/pong` | `,ittt` | 56 | t1, t2, t3 |
+| `/aoo/src/1/start` (start request) | `,is` | 40 | version |
+| `/aoo/src/1/stop` (stop request) | `,ii` | 28 | stream id |
+
+- A version is accepted when it reads as a decimal number 2, a period and a digit (`2.0-test4`, `2.1`; not `2`). A `/start` is accepted for codec `opus`, 1 or 2 channels, 48000 Hz and a block of 120, 240 or 480; its latency is clamped to 0..10 s and its codec delay and sample offset to 0..rate/10. The latency the source sends is trunc(max(0, *F* − 64*r*) + *L r*), *r* = 48000 / host rate, *L* = 0 at 48 kHz multiples and 2 otherwise (176 at 48 kHz and frame 240).
+- Round trips are (t4 − t1) − (t3 − t2) on the measuring side's clock. Time tags are NTP 32.32; the `/start`'s stream time is never compared with another clock.
+- o11proto doesn't send or accept the OSC forms of `/data` and of the data request (`/aoo/sink/1/data`, `/aoo/src/1/data`); it sends and accepts the binary forms only.
+
+**The codec**: Opus, 48 kHz, stereo (mono input as L = R), one packet of one frame per block, the frame size and bitrate of `0x07` (frame 120, 240 or 480, otherwise 240; 32-510 kbps), application restricted low delay. Decoded samples are clamped to −2..+2. Resends, budgets, stream life and the client's rules are `ENGINE.md` 16.5-16.6.
+
+### 15.10 All to all: the direct paths (`0x09`, `0x86`, `0x87`)
+
+O11 Session's own. A client with caps bit 17 sends its Live datagrams straight to each of the room's other players over a direct path, and the relay (15.7) carries Live only for the players who have none. Each pair finds its path itself, by probes, from addresses and a key the server gives it.
+
+**SERVER_LIVE_PATHS (`0x09`)**, server → client: to each sender with bits 16 and 17 that isn't relay-only (below), after its `0x07` and whenever it changes (15.2). It lists the room's other senders with bit 17 that aren't relay-only, a full state each time. Without Live allowed, the UDP port open and a path secret, or to a client that isn't such a sender, it lists no one, and that empty message goes only to a client that had records.
+
+| Offset | Size | Field | Meaning |
+|---|---|---|---|
+| 0 | u8 | version | 1 |
+| 1 | u8 | fixed length | 8: where the records start |
+| 2 | u16 | record size | 24 |
+| 4 | 4 | reserved | 0 |
+| 8 | … | records | to the end: u32 peer id, u64 pair key, u32 public IPv4, u16 public port, u32 LAN IPv4, u16 LAN port |
+
+- The public address is where the player's verified hellos come from (its bound address, 15.6; 0 while it isn't bound), the LAN address the one its `0x86` reported (0 for none). IPv4 addresses are in network order, ports little-endian like every other field.
+- **Parsing**: a payload under 8 bytes, version 0, a fixed length below 8 or beyond the payload, or a record size below 24 is ignored. Records follow at the record size to the end, at most 256; those with id 0 or key 0 are skipped. A client also skips its own id and a second record for the same id.
+- **The pair key** = SipHash-2-4 keyed with the server's 16-byte path secret, over the smaller peer id and then the larger (u32 LE each); 1 where that gives 0. Only the two players and the server know it. The server draws a new path secret whenever the UDP port opens (15.4), so every pair gets a new key and every path opens again; without randomness it has no paths (no `0x09`, and the room's route is none).
+
+**CLIENT_LIVE_LAN (`0x86`)**, client → server, 8 bytes: u8 version 1, u8 0, u16 port, u32 IPv4 (network order; 0 for none). The address of the client's Live socket on its own network, for the players on that network: the address the system sends to the relay from (loopback counts as none) and the socket's port. A client sends it once per start of its Live client, once a `0x09` has come on the connection. The server takes it only from a player with bit 17; under 8 bytes or version 0 is ignored, and a zero address or port, or a broadcast or multicast address, counts as none.
+
+**CLIENT_LIVE_PATHS (`0x87`)**, client → server: from a client with bit 17 whose Live client runs and that has had a `0x09`, whenever its content changes. u8 version 1, u8 flags (`0x01` relay only: it sends and takes Live through the relay only, a test setting), u16 count, then count records of 8 bytes: u32 peer id, u8 state (0 opening, 1 up, 2 unreachable), 3 zero bytes; one for each player of its latest `0x09`, in that order, at most 256. **Parsing**: under 4 bytes or version 0 is ignored; records follow to the count or the end, at most 256; a state above 2 reads as opening; id 0 is skipped. The server takes it only from a player with bit 17 and keeps its relay-only flag and its states; a relay-only player is listed in no one's `0x09`, and its own lists no one.
+
+**Datagrams between players** use the client header of 15.5 with the pair's key in place of the player's key and the receiver's peer id as destination:
+
+- data (type 2): the header, then 1-1452 bytes of payload, as to the relay;
+- probe (type 3) and probe reply (type 4), exactly 32 bytes: the header, u64 timestamp at 20 (the prober's monotonic microseconds with bit 63 set; echoed), u8 candidate at 28 (which of the receiver's addresses the probe was sent to; echoed), 3 zero bytes. The reply is the probe with type 4, the answering player as sender and the prober as destination.
+
+A client takes such a datagram only from a player of its latest `0x09`, with that pair's key (compared in constant time), its own id as destination and one of these lengths; everything else is dropped. It answers each probe to the address it came from. An address it doesn't have for that player becomes the player's third candidate, *seen*.
+
+**The paths.** A client has up to three candidate addresses for each player: the LAN address, the public address (left out when it is the LAN one) and the seen one. A player's loopback address is read as the relay's address, unless the relay is on loopback itself (a player who hosts the room). The network thread works each path out at every pass:
+
+- **opening** from the time the pair first has an address (again with a new key): probes to every candidate every 250 ms for the first 2 s, then every 2 s;
+- **up** at a probe reply with a round trip of 0 to 10 s: it sends to the *active* address, the first of LAN, public and seen answered in the last 10 s, and probes only that one, every 2 s, which also keeps the routers' mappings open;
+- **suspect** 3 s after the last reply: probes to every candidate every 250 ms;
+- **unreachable** 10 s after the last reply, or 10 s after it opened without one: probes to every candidate every 2 s, and a reply brings it up again.
+
+A probe from a player whose path isn't up makes the client probe back at its next pass. When a `0x09` changes the addresses of a path that is up, it turns suspect and is probed at once. The `0x87` reports suspect as up.
+
+**Where Live goes.** A payload for one player goes directly while the pair's path is up or suspect. Otherwise it follows the room's route (`0x08` version 3, 15.11), which a client applies when the message comes:
+
+- **Direct only**, the server's default: nothing goes to a player whose path isn't up, not while it opens (but for make before break, below) and not a second copy while it is suspect. A pair that can't reach each other can't hear each other, and the advice says so (15.11). A client is direct only from each start of its Live client until a room message says otherwise.
+- **Make before break** (direct only): a bound player that the client's audio blocks have reached through the relay for 1 s or more, up to the block before (a run ends after 250 ms with none through the relay; blocks to destination 0 count for every bound player), goes on getting them through the relay, addressed to it, while its new path is opening (listed, never answered and not yet unreachable). The first block after the path is up goes directly; if the path becomes unreachable instead, nothing more goes to that player. The blocks a player gets through the relay between its `0x07` listing and its `0x09` are no such run, so a pair whose path never opens still can't hear each other.
+- With the server's **relay fallback**: a payload for a player whose path isn't up goes through the relay, addressed to that player, and one for a suspect path goes both ways; while the room's route is relay, everything goes through the relay.
+- A player without a path (no bit 17, or relay-only) is reached through the relay, addressed to it, while it is bound, and sends to the room through the relay.
+- The audio blocks go to each player by its own route. When none would go directly, and none is held back by direct only, they go once to destination 0 instead, as without paths.
+
+A client without bit 17, or on a server without paths, sends everything through the relay as in 15.7. Data received directly is handled as the relay's, from the header's sender.
+
+**The room's route.** At every pass the server checks the bound senders: the first that doesn't send directly gives the reason *no direct* (no bit 17) or *relay only* (its `0x87`); then each pair of the others that either side reports unreachable has *no path*, and the first such pair is the reason if there is none yet. All are up when every one of them sends directly and both sides of every pair report up.
+
+- Without the relay fallback the route stays direct, and each sender's pairs with no path go into the advice: it can't play Live (15.11).
+- With the relay fallback, the route goes from direct to relay once there is a reason while the room is Live, with the log line `[live room] Live goes through the relay for everyone now: <a> and <b> had no direct path` (or `<a>'s client doesn't send directly`, `<a>'s client sends through the relay only`). The paths are still probed and reported. While it is relay, *direct possible* is set when there is no reason and all are up, logged once as `[live room] advice: everyone can connect directly again`. It stays relay until `!live direct`; a room with no Live player is direct again.
+- **`!live direct`** (15.3; only with the relay fallback, and shown nowhere): `[server] Live goes through the server here.` on a server without paths; `[server] Live already goes directly between the players.` when the route isn't relay; `[server] Live stays on the server's relay: <a> and <b> can't reach each other directly.` (or `<a>'s client doesn't send directly.`, `<a>'s client sends through the relay only.`) while there is a reason now; otherwise the route is direct again, the sender gets `[server] Live goes directly between the players again.` and the server logs `[live room] <name> switched Live to direct`.
+
+### 15.11 The room's mode and the advice (`0x85`, `0x08`)
+
+O11 Session's own, in place of the Live spec's per-player switching (its 6.5): the room has one mode for everyone, its switch (15.3) alone. While the room is on (15.2) it is **Live**: every Live player is heard live, no one is moved to intervals for its health, and there is no interval audio at all; otherwise everyone plays intervals. Each Live client reports whether everything it should hear live sounds clean, and the server tells every Live client who has trouble: advice, so that a UI can suggest switching the room to intervals. Nothing changes the mode but `!live`.
+
+**CLIENT_LIVE_REPORT (`0x85`)**, client → server, 8 bytes: u8 version 1, u8 flags (`0x01` clean: everything it should hear live sounds clean; `0x02` sending: its own source sends; `0x04` can't Live: its Live client doesn't run, or a sender is one it can't hear), u16 0, u32 fault: the peer id of the one player whose audio doesn't sound clean, or the reporter's own id when several don't or its own Live can't; 0 when clean. A client sends it once it has a `0x07`, whenever it changes, at most every 250 ms (`ENGINE.md` 16.7 says when it is clean). **Parsing**: under 8 bytes or version 0 is ignored; a later version is read as 1, and bytes after the eighth are ignored. The server keeps each Live player's latest; its sending bit becomes that player's peer flag `0x02` in the others' `0x07`.
+
+**SERVER_LIVE_ROOM (`0x08`)**, server → client, version 3, fields in this order:
+
+| Size | Field | Meaning |
+|---|---|---|
+| u8 | version | 3 |
+| u8 | mode | 0 intervals, 1 Live: the room is on |
+| u8 | reason | the advice: 0 none, 1 dropouts, 2 can't play Live |
+| u8 | reserved | 0 |
+| string | user | the player the advice names ("" with none) |
+| u16 | count | how many players have trouble, the one named among them (0 with no advice); from version 2 |
+| u8 | route | 0 none (a server without paths), 1 direct, 2 relay (15.10); from version 3 |
+| u8 | flags | `0x01` direct possible (while relay), `0x02` the server has the relay fallback |
+| u8 | why | while relay: 0 none, 1 the pair *a*, *b* had no direct path, 2 *a*'s client doesn't send directly, 3 *a*'s client sends through the relay only |
+| u8 | reserved | 0 |
+| string, string | a, b | the names *why* gives ("" for none) |
+
+- The server works it out at every pass (at least every 100 ms while the UDP port is open) and sends it to each Live player (bit 16, not hidden) whose last one differs byte for byte; while Live isn't allowed, not to one that never had one. The advice is none while the room isn't Live.
+- **Parsing**: under 4 bytes or version 0 is ignored. A mode other than 1 is intervals, a reason above 2 none; each name runs to its NUL or the end. Version 1 (where the reason said why the room was on intervals) has no count: 1 with a reason. A later version is read as 3: its count is 1 with a reason when the two bytes after the name's NUL are missing, its route none when the four after the count are; a route above 2 is none, a why above 3 none; bytes after the route's names are ignored.
+
+**The advice.** At every pass while the room is Live, over the logged-in users who aren't hidden, in the room's order (users without channels count for nothing):
+
+- **can't play Live**: no Live client (no bit 16, or no key), not among the senders, a report saying it can't, or still never bound or without a report 10 s after it joined; and, direct only (15.10), a sender with pairs that have no direct path;
+- **dropouts**: bound once but not now, or the reports of others that blame it (their fault, or the reporter itself when the fault is 0). The reports of a player still joining (in its first 10 s, and not yet bound, reported and clean once), those that blame a player still joining, and those that blame another player who doesn't send by its own report, don't count.
+
+A player has trouble from then until it has had none for 10 s, or has left. The advice names the player whose trouble now is the worst (can't play Live and a lost binding count as everyone's complaint, pairs without a path one each, else one for each report that blames it), the earliest in the room on a tie, else the first in the room of those whose trouble is still clearing, with that player's latest reason; the count is how many players have trouble.
+
+**No interval audio while Live.** The Live players stop uploading at the boundary where they go Live (`ENGINE.md` 16.7). The server refuses an upload that begins more than one interval (60 × BPI / BPM s) after the room went Live (from an older client, which doesn't know): its BEGIN goes to no one and its WRITEs are dropped. The uploads begun before that are relayed to their end, and silent intervals (zero GUID or fourcc 0) are still relayed: they tell the others none is due. So a player who can't play Live (an older client, no UDP, no place among the senders) neither hears nor is heard while the room is Live; after `!live off` the players' audio comes back from their first interval after Live.
+
+**Log lines** (`[live room]`, apart from the traffic line's `[live]`): `[live room] the room is Live` and `[live room] the room is on intervals: Live is off` when the room's state changes; while Live, when the advice's reason or name changes, `[live room] advice: <name>'s connection has dropouts` or `[live room] advice: <name> can't play Live`, each followed by ` (<count> players have trouble)` when more than one has, or `[live room] advice: none, everyone's Live sounds clean`; and the route lines of 15.10.

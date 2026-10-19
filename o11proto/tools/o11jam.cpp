@@ -4,7 +4,7 @@
 //   o11jam host:port --user NAME [--password P] [--tone HZ | --wav FILE] [--amp A]
 //         [--record out.wav] [--seconds N] [--srate N] [--block N] [--kbps N]
 //         [--no-flac] [--listen-only] [--toggle-transmit SECONDS] [--two]
-//         [--say TEXT]... [--quiet]
+//         [--say TEXT]... [--no-live] [--quiet]
 //
 // A simulated audio device calls process() every block in real time on an
 // audio thread; a control thread calls run(). What the (listening) engine
@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "o11proto/engine.h"
+#include "o11proto/realtime.h"
 
 using namespace o11proto;
 using namespace o11proto::engine;
@@ -33,7 +34,7 @@ struct Args {
     std::string hostport, user, password, wav, record;
     double tone = 997.0, amp = 0.5, seconds = 12.0, toggle = 0.0;
     int srate = 48000, block = 512, kbps = 128;
-    bool no_flac = false, listen_only = false, two = false, quiet = false, have_tone = true;
+    bool no_flac = false, listen_only = false, two = false, quiet = false, have_tone = true, no_live = false;
     std::vector<std::string> say;
 };
 
@@ -41,7 +42,7 @@ void usage() {
     std::fprintf(stderr,
         "usage: o11jam host:port --user NAME [--password P] [--tone HZ | --wav FILE] [--amp A]\n"
         "       [--record out.wav] [--seconds N] [--srate N] [--block N] [--kbps N] [--no-flac]\n"
-        "       [--listen-only] [--toggle-transmit SECONDS] [--two] [--say TEXT]... [--quiet]\n");
+        "       [--listen-only] [--toggle-transmit SECONDS] [--two] [--say TEXT]... [--no-live] [--quiet]\n");
 }
 
 // ---------------------------------------------------------------- WAV I/O
@@ -206,6 +207,7 @@ int main(int argc, char** argv) {
         else if (o == "--two") a.two = true;
         else if (o == "--say") a.say.push_back(need(i));
         else if (o == "--quiet") a.quiet = true;
+        else if (o == "--no-live") a.no_live = true;
         else if (o == "-h" || o == "--help") { usage(); return 0; }
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
@@ -228,6 +230,7 @@ int main(int argc, char** argv) {
     Engine& listener = a.two ? listener_engine : sender;
     auto setup = [&](Engine& e, const std::string& user, bool transmit) {
         e.preferFlac(!a.no_flac);
+        e.setLiveEnabled(!a.no_live);
         e.setMetronome(0.0f, 0.0f, true, 0);
         if (transmit) {
             LocalChannel lc;
@@ -240,6 +243,9 @@ int main(int argc, char** argv) {
         e.onChat = [&, user](const std::array<std::string, 5>& f) {
             if (!a.quiet) std::fprintf(stderr, "[%s] %s %s %s\n", user.c_str(), f[0].c_str(), f[1].c_str(), f[2].c_str());
         };
+        e.onLiveNotice = [&, user](const std::string& text, bool) {   // Live mode (ENGINE.md 16)
+            if (!a.quiet) std::fprintf(stderr, "[%s] live: %s\n", user.c_str(), text.c_str());
+        };
         e.connect(a.hostport, user, a.password);
     };
     setup(sender, a.user, !a.listen_only);
@@ -251,6 +257,9 @@ int main(int argc, char** argv) {
     recording.reserve(static_cast<std::size_t>((a.seconds + 1.0) * a.srate) * 2);
     std::thread audio([&] {
         const int n = a.block;
+        // A device's own audio thread is not held back by the system's timer
+        // coalescing (macOS); this one sleeps between blocks, so it asks.
+        o11proto::thread::makeAudioThread(static_cast<double>(n) / a.srate);
         std::vector<float> inbuf(static_cast<std::size_t>(n)), l(static_cast<std::size_t>(n)), r(static_cast<std::size_t>(n));
         std::vector<float> sl(static_cast<std::size_t>(n)), sr(static_cast<std::size_t>(n));
         const float* in[1] = {inbuf.data()};
@@ -320,7 +329,8 @@ int main(int argc, char** argv) {
         Status st = sender.status();
         if (st == Status::Ok && !said) {
             said = true;
-            for (const auto& s : a.say) sender.say(s);
+            for (const auto& s : a.say)
+                if (!sender.liveCommand(s)) sender.say(s);   // `/live ...` is the engine's own
         }
         if (!reported_status && (st == Status::CantConnect || st == Status::InvalidAuth || st == Status::Disconnected)) {
             reported_status = true;
