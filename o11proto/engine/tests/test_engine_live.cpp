@@ -117,7 +117,8 @@ struct LiveRoom {
     std::atomic<int> host_audio_thread{-1};      // whether the host thread became an audio thread (realtime.h)
     std::thread audio;
 
-    LiveRoom() {
+    // `frame`: the room's Live frame (0: the server's default).
+    explicit LiveRoom(int frame = 0) {
         ServerConfig cfg;
         cfg.port = 0;
         cfg.allow_anonymous = true;
@@ -127,6 +128,7 @@ struct LiveRoom {
         cfg.bpm = 120;
         cfg.bpi = 4;                             // 2 s intervals
         cfg.live.mode = LiveMode::On;
+        if (frame) cfg.live.frame = frame;
         bool ok = server.start(cfg);
         // Live's UDP port has the TCP port's number, which another program on
         // the machine may hold: then another port.
@@ -729,8 +731,14 @@ TEST(packet_loss_gives_advice_and_stays_live) {
     CHECK_EQ(t1.relayed - t0.relayed, 0u);
 }
 
+// Frames of 240 samples (5 ms). The delay a buffer gives comes in steps of
+// a frame here (the two hosts share one clock), a frame above or below the
+// estimate, and spec test 38's bound (5 ms under the estimate, 10 over)
+// holds the step below only for frames of 5 ms: at the default of 480 a
+// macOS runner heard 63.9 ms for an estimate of 73. The test is about the
+// setting, not the frame.
 TEST(jitter_buffer_setting_takes_effect) {
-    LiveRoom r;
+    LiveRoom r(240);
     REQUIRE(r.connect());
     REQUIRE(r.liveAndCalm(20));
     CHECK_EQ(r.side[1].e.liveBufferInUseMs(), 20);
@@ -766,8 +774,9 @@ TEST(jitter_buffer_setting_takes_effect) {
     const std::string line = r.side[1].findNotice("alice: ", seen);
     std::printf("    %s\n    %s\n", head.c_str(), line.c_str());
     CHECK(head.find("Live is on. Jitter buffer 60 ms (/live buffer N to change it). Round trip to the server ") == 0);
-    // The buffer and the codec as they are. The network figure is half the
-    // round trip measured over the loopback (0 ms here, 1 ms on the macOS
+    // The buffer and the codec as they are: at this room's frame of 240
+    // samples, 6 ms (11 ms at the default of 480). The network figure is half the round
+    // trip measured over the loopback (0 ms here, 1 ms on the macOS
     // runner), so any number.
     {
         const std::string pre = " ms late (buffer 60 ms, network ";

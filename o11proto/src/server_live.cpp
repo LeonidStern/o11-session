@@ -94,7 +94,7 @@ LiveConfig sanitize(LiveConfig c, const std::function<void(const std::string&)>&
         c.kbps = live::kDefaultKbps;
     }
     if (!live::validFrame(c.frame)) {
-        warn("LiveFrame " + std::to_string(c.frame) + " is not 120, 240 or 480, using 240");
+        warn("LiveFrame " + std::to_string(c.frame) + " is not 120, 240 or 480, using " + std::to_string(live::kDefaultFrame));
         c.frame = live::kDefaultFrame;
     }
     if (c.max_peers < 1 || c.max_peers > live::kMaxMaxPeers) {

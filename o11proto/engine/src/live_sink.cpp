@@ -60,7 +60,7 @@ void SinkStats::clear(std::uint32_t g) {
 SinkSizes sinkSizes(double latency_ms, int host_block, int host_rate, int frame) {
     SinkSizes s;
     if (host_rate <= 0) host_rate = 48000;
-    if (frame <= 0) frame = 240;
+    if (frame <= 0) frame = o11proto::live::kDefaultFrame;
     s.latency48 = ceilDiv(latency_ms * 48.0, 1.0);
     s.latency_blocks = std::max(ceilDiv(latency_ms * 48.0, frame), ceilDiv(64.0 * 48000.0, double(host_rate) * frame));
     const double capacity_ms = std::max(2.0 * latency_ms, latency_ms + 2000.0 * host_block / host_rate + 5.0);

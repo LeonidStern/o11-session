@@ -13,6 +13,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "o11proto/live.h"
+
 namespace o11proto {
 namespace engine {
 namespace aoo {
@@ -76,7 +78,7 @@ struct StartInfo {
     std::int32_t format = 0;
     std::int32_t channels = 2;
     std::int32_t rate = 48000;
-    std::int32_t block = 240;                   // the frame size
+    std::int32_t block = o11proto::live::kDefaultFrame;   // the frame size
     std::uint64_t time = 0;                     // the sender's monotonic clock, NTP form
     std::int32_t latency = 0;                   // the source's latency, 48 kHz samples
     std::int32_t codec_delay = kCodecDelay;

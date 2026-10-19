@@ -452,7 +452,7 @@ private:
     Phase phase_ = Idle;
     bool stopping_ = false;                     // /stop came: play out, then end
     bool started_ = false;                      // the stream has played: concealment from now on is heard
-    int block_ = 240;
+    int block_ = o11proto::live::kDefaultFrame;
     // Sequences in 64 bits, so that a jump near 0x7fffffff can't overflow.
     std::int64_t next_ = 0;                     // the next sequence to play
     std::int64_t newest_ = -1;                  // the newest block taken

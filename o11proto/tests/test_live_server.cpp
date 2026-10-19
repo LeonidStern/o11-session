@@ -4,7 +4,9 @@
 // the UDP side is driven by raw test sockets. Everything but the latency
 // test runs in one thread that pumps the server and the clients.
 #include <algorithm>
+#include <cmath>
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -262,6 +264,13 @@ struct Harness {
     }
 };
 
+// The server's cookie epoch now: its cookies change every
+// kCookieEpochSeconds of the steady clock, which this process shares.
+static std::int64_t cookieEpoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() /
+           live::kCookieEpochSeconds;
+}
+
 // Drains everything waiting on `u`; returns how many datagrams.
 static int drain(Harness& h, Udp& u, int quiet_ms = 100) {
     int n = 0;
@@ -310,7 +319,8 @@ TEST(lone_client_and_old_client) {                 // 1
     CHECK_EQ(m.flags, live::kFlagUdpOpen | live::kFlagMaySend);
     CHECK_EQ(m.udp_port, 0);
     CHECK_EQ(m.live_kbps, 128);
-    CHECK_EQ(m.frame_samples, 240);
+    CHECK_EQ(m.frame_samples, live::kDefaultFrame);
+    CHECK_EQ(m.frame_samples, 480);
     CHECK_EQ(m.max_peers, 8);
     CHECK(m.peer_id != 0);
     CHECK(m.key != 0);
@@ -671,13 +681,21 @@ TEST(nat_rebinding) {                               // 12, 13
     // 13: a hello without a cookie from another socket on the same IP
     CHECK(h.helloCookie(stranger, b) != 0);
     // 12: the old port's cookie from the new port: answered, doesn't move b
+    const std::int64_t epoch = cookieEpoch();
     std::uint64_t new_cookie = h.helloCookie(ub_new, b, old_cookie);
     CHECK(new_cookie != 0 && new_cookie != old_cookie);
     Bytes p = payloadOf(20, 7), got;
     ua.send(data(a.id(), a.key(), b.id(), p));
     CHECK(h.recv(ub_old, got) && isData(got, a.id(), p));
     CHECK(h.silent(ub_new, 100) && h.silent(stranger, 50));
-    CHECK_EQ(h.helloCookie(ub_new, b, new_cookie), new_cookie);
+    // Echoed, the cookie moves b. Its reply has the same cookie, or the next
+    // epoch's when one began meanwhile (the echoed one, of the epoch
+    // before, still binds; the data below shows it).
+    const std::uint64_t again = h.helloCookie(ub_new, b, new_cookie);
+    if (cookieEpoch() == epoch)
+        CHECK_EQ(again, new_cookie);
+    else
+        CHECK(again != 0);
     ua.send(data(a.id(), a.key(), b.id(), p));
     CHECK(h.recv(ub_new, got) && isData(got, a.id(), p));
     CHECK(h.silent(ub_old, 100));
@@ -793,16 +811,25 @@ TEST(rate_limit) {                                  // 19
         t = std::chrono::duration<double>(last - t0).count();
         return got;
     };
+    // The buckets at the default frame and bitrate (128 kbps): datagrams
+    // 2 x fps + 50 a second, bytes 2 x (16000 + 64 x fps) + 8000 a second,
+    // a quarter second of each. At 480 samples (fps 100): 250 datagrams and
+    // 52800 bytes a second, buckets of 62.5 and 13200; at 240 they were
+    // 450 and 65600, 112.5 and 16400.
+    const double fps = 48000.0 / live::kDefaultFrame;
+    const double dgram_rate = 2.0 * fps + 50.0, byte_rate = 2.0 * (128000.0 / 8.0 + fps * 64.0) + 8000.0;
+    const double cap1 = std::min(dgram_rate, byte_rate / 120.0) * 0.25, rate1 = std::min(dgram_rate, byte_rate / 120.0);
+    const double cap2 = std::min(dgram_rate, byte_rate / 1472.0) * 0.25, rate2 = std::min(dgram_rate, byte_rate / 1472.0);
     double t = 0;
     int n = burst(1000, 120, t);
-    std::printf("    1000 x 120 bytes: %d arrived in %.3f s\n", n, t);
-    CHECK(n >= 110);
-    CHECK(n <= 112.5 + 450 * t + 2);
+    std::printf("    1000 x 120 bytes: %d arrived in %.3f s (a bucket of %.1f, %.1f a second)\n", n, t, cap1, rate1);
+    CHECK(n >= cap1 - 2.5);
+    CHECK(n <= cap1 + rate1 * t + 2);
     h.pump(1200);
     n = burst(200, 1472, t);
-    std::printf("    200 x 1472 bytes: %d arrived in %.3f s\n", n, t);
-    CHECK(n >= 10);
-    CHECK(n <= 11.2 + 44.6 * t + 2);
+    std::printf("    200 x 1472 bytes: %d arrived in %.3f s (a bucket of %.1f, %.1f a second)\n", n, t, cap2, rate2);
+    CHECK(n >= std::floor(cap2) - 1);
+    CHECK(n <= cap2 + rate2 * t + 2);
     h.pump(300);
     Bytes p = payloadOf(10, 1), got;
     ua.send(data(a.id(), a.key(), b.id(), p));
@@ -870,7 +897,11 @@ TEST(room_off) {                                    // 21
 }
 
 TEST(forwarding_latency) {                          // 22
-    Harness h(LiveMode::On);
+    // A datagram every 2 ms, within the rate limit of a frame of 240
+    // samples (450 datagrams a second and a bucket of 112.5): 500 a
+    // second for 2 s stays inside it. The default frame's (480: 250 a
+    // second) would drop half.
+    Harness h(LiveMode::On, [](ServerConfig& c) { c.live.frame = 240; });
     LiveClient a, b;
     REQUIRE(h.login(a, "anonymous:a"));
     REQUIRE(h.login(b, "anonymous:b"));

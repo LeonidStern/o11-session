@@ -292,7 +292,7 @@ struct LiveLayer {
         bool stopped = false;
         bool got_data = false;
         std::int32_t stream = -1;
-        int block = 240;
+        int block = o11proto::live::kDefaultFrame;
         std::int32_t source_latency = 0;        // the /start's latency + codec delay, 48 kHz
         TimePoint last_data{}, last_ping{}, last_stop_request{}, last_start_request{}, last_pong{}, last_request_msg{};
         double rtt_ms = -1;                     // smoothed
@@ -343,7 +343,7 @@ private:
     struct Source {
         OpusEncoder* enc = nullptr;
         int enc_frame = 0;
-        int kbps = 128, frame = 240;            // from 0x07
+        int kbps = 128, frame = o11proto::live::kDefaultFrame;   // from 0x07
         bool kbps_changed = false, frame_changed = false;
         bool running = false;
         std::int32_t stream = 0, format = 0, seq = 0;

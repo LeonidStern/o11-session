@@ -302,7 +302,7 @@ double Engine::liveOneWayMs(int slot, double* buffer_ms, double* network_ms, dou
     const SinkStats& st = L.sinks[slot]->stats;
     double rtt = -1;
     std::int32_t source_latency = 0;
-    int block = 240;
+    int block = o11proto::live::kDefaultFrame;
     {
         std::lock_guard<std::mutex> lock(L.net_mutex);
         rtt = L.net[slot].rtt_ms;
@@ -814,7 +814,7 @@ void Engine::liveStatus() {
             double buffer = 0, network = 0, codec = 0;
             double oneway = liveOneWayMs(p.slot, &buffer, &network, &codec);
             if (oneway < 0) oneway = network + codec + buffer + 64.0 / sr * 1000.0;
-            const int block = st.block.load() > 0 ? st.block.load() : 240;
+            const int block = st.block.load() > 0 ? st.block.load() : o11proto::live::kDefaultFrame;
             const double since = (now_ns - st.active_since_ns.load()) / 1e9;
             double loss = 0;
             if (since >= block / 48000.0) {

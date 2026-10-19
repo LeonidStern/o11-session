@@ -226,7 +226,7 @@ void LiveLayer::apply(const o11proto::live::ServerLive& m) {
     std::lock_guard<std::mutex> lock(net_mutex);
     const bool was_on = net_room_on;
     net_room_on = m.roomOn();
-    const int frame = o11proto::live::validFrame(m.frame_samples) ? m.frame_samples : 240;
+    const int frame = o11proto::live::validFrame(m.frame_samples) ? m.frame_samples : o11proto::live::kDefaultFrame;
     const int kbps = std::max(32, std::min(510, static_cast<int>(m.live_kbps)));
     if (kbps != src_.kbps) {
         src_.kbps = kbps;
@@ -383,7 +383,7 @@ void LiveLayer::health(TimePoint now) {
         h.lost[b % 20] += static_cast<int>(dl);
         int lost2 = 0;
         for (int v : h.lost) lost2 += v;
-        const int frame = st.block.load() > 0 ? st.block.load() : 240;
+        const int frame = st.block.load() > 0 ? st.block.load() : o11proto::live::kDefaultFrame;
         const int limit = 2880 / frame;          // floor(0.03 x 2 x 48000 / frame)
         const bool active = st.active.load() && now_ns - st.active_since_ns.load() >= 1000000000LL;
         h.recent = recent;

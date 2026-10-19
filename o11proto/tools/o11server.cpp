@@ -54,7 +54,7 @@ static void usage() {
         "  --live MODE            Live mode, real-time audio over UDP on the same port number:\n"
         "                         no (default), yes (starts off), on, require (fail without UDP)\n"
         "  --live-kbps N          Live Opus bitrate, 32-510 (default 128)\n"
-        "  --live-frame N         Live Opus frame at 48 kHz: 120, 240 or 480 (default 240)\n"
+        "  --live-frame N         Live Opus frame at 48 kHz: 120, 240 or 480 (default 480)\n"
         "  --live-max-peers N     players per room who play Live, 1-64 (default 8)\n"
         "  --live-port N          UDP port to announce instead of the real one (default 0: don't)\n"
         "  --live-strict-address yes|no  UDP must come from the player's TCP address (default yes)\n"
