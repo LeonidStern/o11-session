@@ -2,6 +2,7 @@
 #include "o11proto/realtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -21,9 +22,48 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#if defined(_WIN32)
+#include <windows.h>
+#include <mmsystem.h>                           // timeBeginPeriod(), in winmm
+#endif
 
 namespace o11proto {
 namespace thread {
+
+#if defined(_WIN32)
+namespace {
+
+// Windows' timer ticks every 15.6 ms unless a process asks for more, and a
+// wait ends on a tick: a wait of 1, 2 or 5 ms takes 15.6 (on any thread).
+// A thread made here asks for 1 ms (timeBeginPeriod(1)) once, and lets go
+// (timeEndPeriod(1)) when it ends, so the process keeps the 1 ms timer
+// while it has such a thread. The count is for describe().
+std::atomic<int> timer_threads{0};
+
+struct TimerPeriod {
+    bool held = false;
+    bool hold() {
+        if (!held && timeBeginPeriod(1) == TIMERR_NOERROR) {
+            held = true;
+            timer_threads.fetch_add(1);
+        }
+        return held;
+    }
+    ~TimerPeriod() {
+        if (held) {
+            timeEndPeriod(1);
+            timer_threads.fetch_sub(1);
+        }
+    }
+};
+
+bool holdTimerPeriod() {
+    thread_local TimerPeriod period;
+    return period.hold();
+}
+
+}  // namespace
+#endif
 
 bool makeAudioThread(double period_seconds) {
 #if defined(__APPLE__)
@@ -44,6 +84,9 @@ bool makeAudioThread(double period_seconds) {
 #elif defined(__linux__)
     (void)period_seconds;                      // the least timer slack: its waits end on time
     return prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL) == 0;
+#elif defined(_WIN32)
+    (void)period_seconds;                      // the 1 ms timer: its waits end on time
+    return holdTimerPeriod();
 #else
     (void)period_seconds;
     return false;
@@ -55,6 +98,8 @@ bool makeLatencyCritical() {
     return pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0;
 #elif defined(__linux__)
     return prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL) == 0;
+#elif defined(_WIN32)
+    return holdTimerPeriod();
 #else
     return false;
 #endif
@@ -128,6 +173,9 @@ std::string describe(int samples) {
 #elif defined(__linux__)
     const int slack = prctl(PR_GET_TIMERSLACK, 0UL, 0UL, 0UL, 0UL);
     std::snprintf(buf, sizeof(buf), "timer slack %d ns; ", slack);
+    s += buf;
+#elif defined(_WIN32)
+    std::snprintf(buf, sizeof(buf), "the 1 ms timer held by %d threads; ", timer_threads.load());
     s += buf;
 #endif
     s += "waits of";

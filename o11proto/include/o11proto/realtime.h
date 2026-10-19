@@ -8,7 +8,11 @@
 // of our own (a test, o11jam) that calls Engine::process() from a thread
 // that sleeps between blocks makes that thread an audio thread here, as a
 // DAW's already is. On Linux they give the thread the least timer slack
-// (PR_SET_TIMERSLACK, 50 us by default); elsewhere they do nothing.
+// (PR_SET_TIMERSLACK, 50 us by default). On Windows, whose timer ticks
+// every 15.6 ms (a wait of 1 ms takes 15.6), the thread holds the 1 ms
+// timer (timeBeginPeriod(1), for the whole process) until it ends; the
+// network thread, then, holds it while Live runs. Elsewhere they do
+// nothing.
 #ifndef O11PROTO_REALTIME_H
 #define O11PROTO_REALTIME_H
 
@@ -20,12 +24,12 @@ namespace thread {
 // The calling thread is a host's audio thread, woken every `period_seconds`
 // (a block): on macOS the time-constraint policy, its computation half the
 // period (at most 5 ms) and its constraint the period; on Linux the least
-// timer slack. True when it took.
+// timer slack; on Windows the 1 ms timer. True when it took.
 bool makeAudioThread(double period_seconds);
 
 // The calling thread does latency-critical work and blocks between (a
 // server's thread, say): on macOS the user-interactive QoS class; on Linux
-// the least timer slack. True when it took.
+// the least timer slack; on Windows the 1 ms timer. True when it took.
 bool makeLatencyCritical();
 
 // The calling thread is Live's network thread (live::Transport): it blocks
@@ -41,7 +45,8 @@ NetworkScheduling makeNetworkThread();
 
 // For diagnostics, one line: the calling thread's scheduling (on macOS its
 // QoS class, whether it has the time-constraint policy, the process's task
-// role and background state; on Linux its timer slack) and how long timed
+// role and background state; on Linux its timer slack; on Windows how many
+// threads hold the 1 ms timer) and how long timed
 // waits of 1, 2 and 5 ms
 // take on it (`samples` of each: the median and the longest).
 std::string describe(int samples = 8);
