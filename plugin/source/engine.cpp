@@ -529,15 +529,24 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
     // the engine only reads its input: your input as you hear it, or silence (m_bufL and m_bufR
     // are never written after setupProcessing) while the host is stopped
     const float *ins[2] = { stopped ? m_bufL.data() : m_monL.data(), stopped ? m_bufR.data() : m_monR.data() };
+    // each player output: that player alone, written there by the engine itself (each of the
+    // host's channels is a buffer of its own: JUCE gives each one); the player pairs it doesn't
+    // use go to ours
     float *mix[MIX_OUTS];
     for (int c = 0; c < MIX_OUTS; c ++) mix[c] = m_mix[(size_t)c].data();
+    if (playerOuts)
+      for (int p = 0; p < NUM_PLAYER_OUTS; p ++)
+        if (float **bus = playerOuts->bus[p])
+          for (int c = 0; c < std::min(playerOuts->channels[p], 2); c ++)
+            if (bus[c]) mix[2 + 2 * p + c] = bus[c] + done;
     m_client->process(ins, 2, mix, MIX_OUTS, n, srate);
 
     // the main output: everyone, and your monitoring (the engine's own is muted, so it goes on
-    // while nothing is sent); each player output: that player alone
+    // while nothing is sent)
     float *outs[2] = { out[0] + done, numOut > 1 && out[1] ? out[1] + done : m_spare.data() };
-    // a channel at a time (loops the compiler vectorizes: the host's buffer is none of ours), in
-    // the same order for each sample: the main pair, the player pairs, your monitoring
+    // a channel at a time (loops the compiler vectorizes: the main output's channel is none of
+    // those it sums), in the same order for each sample: the main pair, the player pairs, your
+    // monitoring
     static_assert(NUM_PLAYER_OUTS == 8, "the sum below names each player pair");
     for (int c = 0; c < 2; c ++)
     {
@@ -551,14 +560,6 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
         for (int i = 0; i < n; i ++) o[i] += mon[i];
       }
     }
-    if (playerOuts)
-      for (int p = 0; p < NUM_PLAYER_OUTS; p ++)
-      {
-        float **bus = playerOuts->bus[p];
-        if (!bus) continue;
-        for (int c = 0; c < playerOuts->channels[p]; c ++)
-          if (bus[c]) memcpy(bus[c] + done, mix[2 + 2 * p + (c & 1)], sizeof(float) * (size_t)n);
-      }
 
     // the metronome, on the beats of the interval these samples played in
     if (m_client->isIntervalRunning())
