@@ -375,7 +375,8 @@ jobs:
       # the README's one-line install, on the build already published (it checks the signature)
       - name: Install script (the published build)
         run: |
-          HOME="$RUNNER_TEMP/home" sh plugin/install.sh
+          HOME="$RUNNER_TEMP/home" sh plugin/install.sh | tee "$RUNNER_TEMP/install.log"
+          if [ "${{ steps.devid.outputs.notarize }}" = true ]; then grep -q "^Signed by: Developer ID Application" "$RUNNER_TEMP/install.log"; fi
           test -d "$RUNNER_TEMP/home/Library/Audio/Plug-Ins/VST3/O11Session.vst3"
 
       - name: Remove the signing keychain
