@@ -56,8 +56,8 @@ Add `-s rc0.2` after `sh` for a release candidate instead of the newest build.
 
 ## Quick start
 
-1. **Install.** On macOS, open the disk image, double-click the VST3
-   folder in it, and drag O11 Session into that folder's window (it is signed and notarized by Apple). On Windows, copy
+1. **Install.** On macOS, open the disk image, open `/Library/Audio/Plug-Ins/VST3`
+   (in Finder: Go, Go to Folder), and drag O11 Session into that folder's window (it is signed and notarized by Apple). On Windows, copy
    `O11Session.vst3` into `C:\Program Files\Common Files\VST3`. On Linux, copy
    it into `~/.vst3`. On macOS and Linux, the
    [one-line terminal install](#download) does this for you and also updates later.

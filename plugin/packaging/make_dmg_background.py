@@ -2,9 +2,9 @@
 """Draws the background of O11 Session's Mac disk image, at 1x and 2x.
 
 The window is 640 x 400 points. Finder draws the two icons on top, centred at the points
-dmg_settings.py gives (O11Session.vst3 at 170,180 and the VST3 folder at 470,180). Finder
-won't drop a bundle on a shortcut to a system folder, so there is no arrow: the text says to
-open the folder first and drag the plug-in into its window. The plug-in in the image is
+dmg_settings.py gives (O11Session.vst3 at 320,180). There is no shortcut to the VST3 folder:
+Finder won't drop a bundle on one, and its arrow badge reads as "drag here" (Leo). The text
+says how to open the folder and drag the plug-in into its window. The plug-in in the image is
 signed with a Developer ID and notarized, so there is no Terminal step.
 
   python3 make_dmg_background.py SANS.otf SANS-SEMIBOLD.otf OUT_DIR
@@ -18,7 +18,7 @@ import sys
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 640, 400
-LEFT, RIGHT, ICONS_Y = 170, 470, 180
+ICON_X, ICON_Y = 320, 180
 BACKGROUND = (246, 246, 244)
 TEXT = (29, 29, 31)
 DIM = (110, 110, 115)
@@ -35,8 +35,8 @@ def draw(scale, sans, semibold):
         d.text((s(W / 2), s(y)), text, font=font, fill=fill, anchor="mm")
 
     centred(36, "Install O11 Session", title, TEXT)
-    centred(64, "1. Double-click VST3 Plug-Ins to open the folder", body, TEXT)
-    centred(84, "2. Drag O11 Session into that folder's window", body, TEXT)
+    centred(64, "1. In Finder, choose Go, Go to Folder, and type /Library/Audio/Plug-Ins/VST3", body, TEXT)
+    centred(84, "2. Drag O11 Session from here into that folder's window", body, TEXT)
 
     # the step after it, in the bottom third (Finder's labels end near y = 255)
     centred(310, "Then rescan plug-ins in your DAW", body, DIM)
