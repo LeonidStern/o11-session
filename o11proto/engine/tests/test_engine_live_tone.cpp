@@ -55,6 +55,7 @@
 
 #include "check.h"
 #include "o11proto/engine.h"
+#include "o11proto/live.h"
 #include "o11proto/realtime.h"
 #include "o11proto/server.h"
 #include "socket_compat.h"
@@ -925,9 +926,10 @@ TEST(automatic_buffer_falls_back_on_jitter) {
 // them.
 TEST(automatic_buffer_ignores_loss) {
     RunSetup setup;
+    static constexpr double kLoss = 0.05;
     setup.seconds = 12;
     setup.buffer_ms[0] = setup.buffer_ms[1] = Engine::kLiveBufferAutomatic;
-    setup.steps.push_back({0.0, [](ToneRoom& r) { r.side[1].e.setLiveTestLoss(0.05); }});
+    setup.steps.push_back({0.0, [](ToneRoom& r) { r.side[1].e.setLiveTestLoss(kLoss); }});
     setup.disturbed[1] = true;
     const RunResult res = toneRun(setup);
     const Heard& bob = res.heard[1];
@@ -936,7 +938,19 @@ TEST(automatic_buffer_ignores_loss) {
     CHECK(fallbackIsTheMachines(res.heard[0]));
     std::printf("    bob: %u blocks came when asked for again, %u lost for good, %u late\n", bob.c.resent, bob.c.lost,
                 bob.c.late);
-    CHECK(bob.c.resent + bob.c.lost >= 40);      // about 120 of alice's blocks lost on the way in 12 s
+    // What the loss takes: each of alice's blocks in the recording (one a
+    // frame) independently, so binomially. A block lost on the way comes
+    // when asked for again, is lost for good, or comes after its turn
+    // (late), so the three together reach the mean less four standard
+    // deviations: 29 of a mean of 60 at the default frame of 480. (40 was
+    // a third of the 120 of frame 240; at 480 a Windows runner had 35 and
+    // 4 late.)
+    const int frame = setup.frame ? setup.frame : live::kDefaultFrame;
+    const double blocks = setup.seconds * 48000.0 / frame;
+    const double floor_lost = blocks * kLoss - 4.0 * std::sqrt(blocks * kLoss * (1.0 - kLoss));
+    std::printf("    bob: %u of an expected %.0f lost blocks seen (at least %.0f)\n", bob.c.resent + bob.c.lost + bob.c.late,
+                blocks * kLoss, std::floor(floor_lost));
+    CHECK(bob.c.resent + bob.c.lost + bob.c.late >= std::floor(floor_lost));
     CHECK(fallbackIsTheMachines(bob));
 }
 
