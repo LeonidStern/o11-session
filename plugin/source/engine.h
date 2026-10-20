@@ -210,9 +210,10 @@ struct Settings
   bool transmit = true;
   int opusKbps = DEFAULT_OPUS_KBPS; // what we send in Opus rooms; FLAC is lossless and ignores it
   bool followHostTempo = true; // Sync: follow the host's tempo (and line up with its bars)
-  // the room you host starts with these; picked in the editor, also before you host
+  // the room you host starts with these; picked in the editor, also before you host. Its server
+  // opens Live when it can, and the plug-in switches Live off at once unless roomLive
   int roomBpm = 120, roomBpi = 4;
-  bool roomLive = true, roomFlac = false;
+  bool roomLive = false, roomFlac = false; // Intervals of 4 beats by default (Leo)
   int liveBufferMs = DEFAULT_LIVE_BUFFER_MS; // Live's jitter buffer: LIVE_BUFFER_AUTO, or fixed at one of LIVE_BUFFER_MS; not saved: only the `live buffer` command and O11_LIVE_BUFFER_MS (tests) change it
   int editorWidth = 0, editorHeight = 0; // the editor's size, 0 for the default
 
@@ -367,6 +368,7 @@ private:
 
   // audio thread
   std::atomic<float> m_inputGain { 1.0f };
+  float m_inputGainNow = -1; // the audio thread's: the gain it ramps from (-1 before the first block)
   std::atomic<float> m_clickVolume { 0.5f }; // 0 when muted
   Click m_click;
   std::atomic<int> m_sampleRate { 48000 };

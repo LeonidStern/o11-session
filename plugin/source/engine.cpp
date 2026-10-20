@@ -526,13 +526,16 @@ void Engine::process(float **in, int numIn, float **out, int numOut, int frames,
     int pos = 0, length = 0;
     m_client->position(&pos, &length);
     if (m_client->isIntervalRunning() && pos < length) n = std::min(n, length - pos);
+    // your volume glides to a new value over the piece: a step in the gain clicks
+    const float from = m_inputGainNow < 0 ? gain : m_inputGainNow, step = (gain - from) / (float)n;
+    m_inputGainNow = gain;
     for (int c = 0; c < 2; c ++)
     {
       const float *src = c == 0 ? inL : inR;
       float *mon = c == 0 ? m_monL.data() : m_monR.data();
-      if (src)
-        for (int i = 0; i < n; i ++) mon[i] = src[done + i] * gain;
-      else memset(mon, 0, sizeof(float) * (size_t)n);
+      if (!src) memset(mon, 0, sizeof(float) * (size_t)n);
+      else if (step == 0) for (int i = 0; i < n; i ++) mon[i] = src[done + i] * gain;
+      else for (int i = 0; i < n; i ++) mon[i] = src[done + i] * (from + step * (float)(i + 1));
     }
     // the engine only reads its input: your input as you hear it, or silence (m_bufL and m_bufR
     // are never written after setupProcessing) while the host is stopped

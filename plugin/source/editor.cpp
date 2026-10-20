@@ -976,7 +976,27 @@ void O11Editor::updateRoom(const Snapshot &s, double)
   const Vote nobody;
   const std::string advice = liveHere && s.liveSwitchOn && s.liveRoom
                                ? uitext::liveAdviceText((int)s.liveReason, s.liveReasonWho, s.liveReasonOthers) : "";
-  if (!advice.empty())
+  // too far for Live: whoever you hear the latest, past uitext::LIVE_FAR_MS
+  std::string far;
+  int farMs = 0, farOthers = 0;
+  if (advice.empty() && liveHere && s.liveSwitchOn && s.liveRoom)
+    for (const RemoteUserView &u : s.users)
+      if (u.liveHeardMs > uitext::LIVE_FAR_MS)
+      {
+        if (u.liveHeardMs > farMs)
+        {
+          if (!far.empty()) farOthers ++;
+          far = u.displayName;
+          farMs = u.liveHeardMs;
+        }
+        else farOthers ++;
+      }
+  if (!far.empty())
+    chip(true, uitext::liveFarText(far, farMs, farOthers),
+         "Live keeps time only when everyone hears everyone within about " + std::to_string(uitext::LIVE_FAR_MS) +
+           " ms; intervals keep everyone on the beat at any distance. Click to switch the room to intervals for everyone",
+         nobody, -1, [this]() { engine().setRoomLive(false); });
+  else if (!advice.empty())
     chip(true, advice, std::string(s.liveReason == Snapshot::LiveCantLive
                                      ? "A player can't reach the others directly, so they don't hear each other in Live"
                                      : "Live audio has dropouts that intervals wouldn't have")
@@ -1205,6 +1225,7 @@ void O11Editor::updateRows(const Snapshot &s, double now)
         silent = true;
       }
       row.name->setStatus(status, color);
+      row.name->setOut(c.playerOut);
       row.led->setColor(led, !silent);
       std::string tip = u.displayName + (c.name.empty() ? std::string() : " \xc2\xb7 " + c.name) + " (" + u.name + "): ";
       tip += c.playerOut > 0 ? "also plays alone on the DAW output Player " + std::to_string(c.playerOut)
