@@ -351,10 +351,17 @@ void stallCase(int frame, const Case& c) {
             CHECK_EQ(w.d.host_gap_frames, 0);
             CHECK(std::labs(w.after - w.before) <= 128);
         } else if (mine.blocks && !theirs.blocks) {
-            // 2: this host's alone: as much skipped, the delay kept.
+            // 2: this host's alone: as much skipped, the delay kept. The
+            // skip is the gap this host measured, to the nearest frame; its
+            // measure is off by as much as the block that reported it came
+            // late, which it takes back only from half a host block on
+            // (less is the callbacks' own jitter: GapBack, live_layer.h),
+            // so up to half a frame and half a host block from the stall.
+            // (A macOS runner's alice, frame 240, missed 1536 and skipped
+            // 1680: the gap measured at least 24 frames long.)
             CHECK_EQ(w.d.concealed, 0);
             CHECK_EQ(w.d.underruns, 0);
-            CHECK(std::labs(w.d.host_gap_frames - missed) <= frame / 2);
+            CHECK(std::labs(w.d.host_gap_frames - missed) <= frame / 2 + 64);
             CHECK(std::labs(w.after - w.before) <= frame / 2 + 128);
         } else if (!mine.blocks && theirs.blocks) {
             // 3: the sender's alone: the hole concealed, as before this
