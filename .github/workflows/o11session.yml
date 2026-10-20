@@ -6,7 +6,8 @@ name: o11session
 #
 # Day to day (pushes to main, pull requests) only macOS builds and tests: that's where the
 # plug-in is tried by hand. Linux and Windows build too for a release candidate: a pushed tag
-# rc-<anything> (git tag rc-3 && git push origin rc-3), or a manual run with "all platforms".
+# rc<anything> (rc-3, rc0.2: a tag pushed, or a release made on GitHub), a manual run with
+# "all platforms", or a manual run naming a release candidate ("rc") already made.
 #
 # Pushes and pull requests skip the five long Live timing tests (LONG_TESTS, about 14 of the
 # 16 minutes on macOS). Those run every night on main, and on every release candidate or
@@ -15,7 +16,7 @@ name: o11session
 on:
   push:
     branches: [main]
-    tags: ['rc-*']
+    tags: ['rc*']
     paths: ['plugin/**', 'o11proto/**', '.github/workflows/o11session.yml']
   pull_request:
     paths: ['plugin/**', 'o11proto/**', '.github/workflows/o11session.yml']
@@ -27,6 +28,10 @@ on:
         description: Build and test on Linux and Windows too, as for a release candidate
         type: boolean
         default: false
+      rc:
+        description: A release candidate already made (its tag, e.g. rc0.2) to build main for and fill
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -34,7 +39,7 @@ permissions:
 env:
   # the long Live timing tests, and whether this run includes them
   LONG_TESTS: '^test_engine_live(_room|_tone|_paths|_stalls)?$'
-  FULL_TESTS: ${{ startsWith(github.ref, 'refs/tags/rc-') || inputs.all_platforms || github.event_name == 'schedule' }}
+  FULL_TESTS: ${{ startsWith(github.ref, 'refs/tags/rc') || inputs.all_platforms || inputs.rc != '' || github.event_name == 'schedule' }}
   # pluginval release and the SHA-256 of each of its zips
   PLUGINVAL_VERSION: v1.0.4
   PLUGINVAL_SHA256_LINUX: c01c49d8063965c4c2dea8324468336768f5c9139e0b1caebde14c2400b55352
@@ -48,7 +53,7 @@ env:
 
 jobs:
   linux:
-    if: startsWith(github.ref, 'refs/tags/rc-') || inputs.all_platforms
+    if: startsWith(github.ref, 'refs/tags/rc') || inputs.all_platforms || inputs.rc != ''
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -103,7 +108,7 @@ jobs:
           if-no-files-found: ignore
 
   windows:
-    if: startsWith(github.ref, 'refs/tags/rc-') || inputs.all_platforms
+    if: startsWith(github.ref, 'refs/tags/rc') || inputs.all_platforms || inputs.rc != ''
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -385,13 +390,13 @@ jobs:
 
   # The downloads in the README: each push to main puts its macOS build in the release
   # "o11session-latest" (the tag moves to the commit), replacing the files there; Linux and
-  # Windows are replaced only by a build of all three. A release candidate (tag rc-*) also gets
-  # its own pre-release with all three.
+  # Windows are replaced only by a build of all three. A release candidate (tag rc*, or a manual
+  # run naming one) also gets its own release with all three.
   release:
     if: >-
       always() && needs.macos.result == 'success' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
-      (startsWith(github.ref, 'refs/tags/rc-') ||
+      (startsWith(github.ref, 'refs/tags/rc') || inputs.rc != '' ||
        (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')))
     needs: [linux, windows, macos]
     runs-on: ubuntu-24.04
@@ -431,7 +436,7 @@ jobs:
           ls -l release
 
       - name: Publish to the o11session-latest release
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/rc-')
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/rc')
         run: |
           if [ "$ALL" = true ]; then
             NOTES="The newest build of O11 Session, from ${GITHUB_SHA::7}, on every platform. See the README for how to install it."
@@ -451,9 +456,11 @@ jobs:
           gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Publish the release candidate
-        if: startsWith(github.ref, 'refs/tags/rc-')
+        if: startsWith(github.ref, 'refs/tags/rc') || inputs.rc != ''
+        env:
+          RC_INPUT: ${{ inputs.rc }}
         run: |
-          RC="$GITHUB_REF_NAME"
+          RC="${RC_INPUT:-$GITHUB_REF_NAME}"
           NOTES="Release candidate $RC of O11 Session, from ${GITHUB_SHA::7}, for testing by hand. See the README for how to install it."
           if gh release view "$RC" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$RC" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
