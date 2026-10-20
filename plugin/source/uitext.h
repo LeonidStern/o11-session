@@ -30,7 +30,7 @@ constexpr double PIXELS_PER_BPM = 2.0;               // dragging the BPM box up 
 // the level meters show -60 dB to 0 dB: green, amber from -12 dB, red from -3 dB
 constexpr float METER_FLOOR_DB = -60.0f, METER_AMBER = 0.8f, METER_RED = 0.95f;
 constexpr double JOINED_SECONDS = 30.0;              // a player's row says "joined" this long
-constexpr double DROPOUT_SECONDS = 60.0;             // and how many dropouts it had, this long after one
+constexpr double DROPOUT_SECONDS = 10.0;             // and how many dropouts it had lately, this long after the last
 
 // the BPM box dragged dy pixels up (down when negative) from start, within BPM_MIN..BPM_MAX
 int dragBpm(int start, double dy, bool fine);

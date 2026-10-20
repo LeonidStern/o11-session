@@ -263,6 +263,7 @@ public:
   void setLevel(float peak, double now); // the latest peak (linear), at now (seconds)
   void paint(juce::Graphics &g) override;
   void mouseDown(const juce::MouseEvent &e) override; // puts the clip light out
+  juce::String getTooltip() override; // the level at the peak mark, "-12.3 dB"
 
 private:
   float m_level = 0, m_peak = 0; // fractions of the meter

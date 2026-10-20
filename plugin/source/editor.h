@@ -151,6 +151,7 @@ private:
     double heard = 0;   // when it last had sound
     long dropouts = -1; // its dropouts when last seen (-1: not seen yet)
     double droppedAt = -1; // when they last went up
+    long shownFrom = 0;    // its dropouts before the ones the status counts now
   };
   std::map<std::string, RowTrack> m_tracks; // by user and channel
 

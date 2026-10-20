@@ -496,6 +496,12 @@ void LevelMeter::setLevel(float peak, double now)
   repaint();
 }
 
+juce::String LevelMeter::getTooltip()
+{
+  if (!(m_peak > 0)) return "-inf dB";
+  return str(uitext::dbText(powf(10.0f, (uitext::METER_FLOOR_DB * (1.0f - m_peak)) / 20.0f)));
+}
+
 void LevelMeter::mouseDown(const juce::MouseEvent &e)
 {
   if (!e.mods.isLeftButtonDown() || !m_clip) return;
