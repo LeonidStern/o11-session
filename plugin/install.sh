@@ -60,7 +60,9 @@ NEW="$(find "$WORK/x" -maxdepth 2 -name "$NAME" -type d | head -1)"
 [ -n "$NEW" ] || { echo "O11 Session: $NAME isn't in $FILE" >&2; exit 1; }
 
 if [ "$(uname -s)" = Darwin ]; then
-  codesign --verify --deep --strict "$NEW" 2>/dev/null || { echo "O11 Session: the download's signature doesn't check out; not installing it" >&2; exit 1; }
+  # not --strict: the bundle carries Finder's bundle bit (an extended attribute) on purpose,
+  # which --strict rejects; the signature over the files inside is what this checks
+  codesign --verify --deep "$NEW" || { echo "O11 Session: the download's signature doesn't check out; not installing it" >&2; exit 1; }
   SIGNER="$(codesign -dv "$NEW" 2>&1 | sed -n 's/^Authority=\(Developer ID Application:.*\)/\1/p' | head -1)"
   echo "Signed by: ${SIGNER:-ad hoc (not notarized)}"
 fi
