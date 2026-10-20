@@ -698,8 +698,14 @@ TEST(restarts_survive) {                       // 45: stop and start while sendi
     REQUIRE(r.until([&] { return a.c.liveMessage().peers.size() == 1; }));
     REQUIRE(b.startTransport());
     std::uint32_t bid = b.id();
-    a.t.on_tick = [&, bid] {                   // a stream's 200 datagrams/s, within the rate limit
-        if (Clock::now() - last < std::chrono::milliseconds(5)) return;
+    // A stream: one datagram a frame of the server's default (100/s at 480
+    // samples), within the server's rate limit (PROTOCOL.md 15.7, 6): 2 x
+    // that + 50 a second, with 0.25 s of it as a burst. The hellos count in
+    // it too, two for each start, and a hello dropped there is sent again
+    // only 2 s later.
+    const auto frame = std::chrono::microseconds(1000000LL * live::kDefaultFrame / 48000);
+    a.t.on_tick = [&, bid, frame] {
+        if (Clock::now() - last < frame) return;
         last = Clock::now();
         std::uint8_t p[100] = {0x81};
         a.t.send(bid, p, sizeof(p));
@@ -714,6 +720,12 @@ TEST(restarts_survive) {                       // 45: stop and start while sendi
     }
     std::printf("    %d of 50 restarts answered\n", answered);
     CHECK(answered >= 45);
+    // The restarts' hellos, about 100 in 0.15 s, use up the burst (62.5 at
+    // frame 480), so the last of them may go over the limit: the next start
+    // comes once it has filled again, as a player's next start would. (A
+    // Linux runner, without the pause and at 200 datagrams/s: that start
+    // unanswered in 2 s.)
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     REQUIRE(a.startTransport());
     CHECK(r.until([&] { return a.t.serverAnswered(); }));
     const std::size_t had = b.in.size();
