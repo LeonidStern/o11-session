@@ -44,6 +44,16 @@ and mix.
 These links always point to the newest build. Works in Ableton, Bitwig,
 Reaper, Studio One, Cubase and any other VST3 host.
 
+**Install or update from the terminal** (macOS and Linux). This puts the newest
+build in `~/Library/Audio/Plug-Ins/VST3` on macOS (after checking its signature)
+or in `~/.vst3` on Linux, replacing the copy that is there:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LeonidStern/o11-session/main/plugin/install.sh | sh
+```
+
+Add `-s rc0.2` after `sh` for a release candidate instead of the newest build.
+
 ## Quick start
 
 1. **Install.** On macOS, open the disk image, double-click the VST3
