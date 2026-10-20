@@ -63,7 +63,7 @@ if [ "$(uname -s)" = Darwin ]; then
   # not --strict: the bundle carries Finder's bundle bit (an extended attribute) on purpose,
   # which --strict rejects; the signature over the files inside is what this checks
   codesign --verify --deep "$NEW" || { echo "O11 Session: the download's signature doesn't check out; not installing it" >&2; exit 1; }
-  SIGNER="$(codesign -dv "$NEW" 2>&1 | sed -n 's/^Authority=\(Developer ID Application:.*\)/\1/p' | head -1)"
+  SIGNER="$(codesign -dvv "$NEW" 2>&1 | sed -n 's/^Authority=\(Developer ID Application:.*\)/\1/p' | head -1)"
   echo "Signed by: ${SIGNER:-ad hoc (not notarized)}"
 fi
 
