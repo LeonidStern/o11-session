@@ -136,22 +136,22 @@ static void test_state()
   CHECK(!offLoaded.followHostTempo);
   CHECK(e.followHostTempo);
 
-  // the room you host: 120 BPM, 4 beats, Live, Opus by default; saved with the project
+  // the room you host: 120 BPM, intervals of 4 beats, Opus by default; saved with the project
   CHECK_EQ(Settings().roomBpm, 120);
   CHECK_EQ(Settings().roomBpi, 4);
-  CHECK(Settings().roomLive && !Settings().roomFlac);
+  CHECK(!Settings().roomLive && !Settings().roomFlac);
   Settings picked;
   picked.roomBpm = 95;
   picked.roomBpi = 16;
-  picked.roomLive = false;
+  picked.roomLive = true;
   picked.roomFlac = true;
   Settings pickedLoaded;
   CHECK(pickedLoaded.deserialize(picked.serialize()));
   CHECK_EQ(pickedLoaded.roomBpm, 95);
   CHECK_EQ(pickedLoaded.roomBpi, 16);
-  CHECK(!pickedLoaded.roomLive && pickedLoaded.roomFlac);
+  CHECK(pickedLoaded.roomLive && pickedLoaded.roomFlac);
   CHECK_EQ(old.roomBpm, 120);
-  CHECK(old.roomLive);
+  CHECK(!old.roomLive);
 
   // Live's jitter buffer: automatic, not saved, and older states' setting is ignored
   CHECK_EQ(Settings().liveBufferMs, Settings::LIVE_BUFFER_AUTO);
@@ -906,6 +906,8 @@ static void test_uitext()
   CHECK_EQ(intervalsModeText(4, true), std::string("Intervals \xc2\xb7 4 beats"));
   CHECK_EQ(intervalsModeText(16, false), std::string("Intervals \xc2\xb7 16"));
   CHECK_EQ(intervalsModeText(0, false), std::string("Intervals"));
+  CHECK_EQ(liveFarText("Anton", 106, 0), std::string("Anton is 106 ms away: try Intervals"));
+  CHECK_EQ(liveFarText("Anton", 106, 1), std::string("Anton and 1 more are over 50 ms away: try Intervals"));
   CHECK_EQ(liveAdviceText(1, "Anna", 0), std::string("Anna drops out: try Intervals"));
   CHECK_EQ(liveAdviceText(1, "You", 0), std::string("Your connection drops out: try Intervals"));
   CHECK_EQ(liveAdviceText(1, "Anna", 2), std::string("Anna and 2 more drop out: try Intervals"));

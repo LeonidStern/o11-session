@@ -193,6 +193,7 @@ int main()
   Room room;
   // the host: a room on this computer (120 BPM, 4 BPI), joined at once
   CHECK(room.host.command("name Host") == "ok");
+  room.host.setStartRoom(120, 4, true, false); // Live, for the Live checks below (the default is intervals)
   CHECK(room.host.command("host on") == "ok");
   CHECK(room.waitFor(room.host, "state", "connected", 10));
   const std::string hostStatus = room.host.command("status");
@@ -232,9 +233,22 @@ int main()
   CHECK(room.waitForLive(room.guest, "server", "1", 10));
   CHECK(room.waitForLive(room.guest, "switch", "1", 5));
   CHECK(room.waitForLive(room.host, "switch", "1", 5));
+  // in Live the guest's row meter follows the host it hears
+  for (int i = 0; i < 8 && field(room.guest.command("live"), "room") != "live"; i ++) room.advance(0.5);
+  CHECK(field(room.guest.command("live"), "room") == "live");
+  room.advance(1.0);
+  {
+    const std::string u = room.guest.command("users");
+    const size_t at = u.find("level=");
+    const double level = at == std::string::npos ? 0 : atof(u.c_str() + at + 6);
+    printf("  guest hears in Live: %s", u.c_str());
+    CHECK(level > 0.1);
+  }
   CHECK(room.guest.command("live off") == "ok");
   CHECK(room.waitForLive(room.host, "switch", "0", 5));
   CHECK(room.waitForLive(room.guest, "switch", "0", 5));
+  // back to intervals when the next one starts
+  for (int i = 0; i < 8 && field(room.guest.command("live"), "room") != "intervals"; i ++) room.advance(0.5);
   CHECK(field(room.guest.command("live"), "room") == "intervals");
 
   // Opus, at the room's bitrate

@@ -263,6 +263,7 @@ public:
   void setLevel(float peak, double now); // the latest peak (linear), at now (seconds)
   void paint(juce::Graphics &g) override;
   void mouseDown(const juce::MouseEvent &e) override; // puts the clip light out
+  juce::String getTooltip() override; // the level at the peak mark, "-12.3 dB"
 
 private:
   float m_level = 0, m_peak = 0; // fractions of the meter
@@ -278,6 +279,7 @@ public:
   NameCell(const juce::Font &nameFont, const juce::Font &statusFont, float statusGap);
   void setPlayer(const std::string &name, const std::string &channel);
   void setStatus(const std::string &status, juce::Colour color);
+  void setOut(int player); // the DAW output Player 1-8 they play on alone, 0 for none
   void setNameColor(juce::Colour c);
   void paint(juce::Graphics &g) override;
 
@@ -285,6 +287,7 @@ private:
   juce::Font m_nameFont, m_statusFont;
   float m_gap;
   std::string m_name, m_channel, m_status;
+  int m_out = 0;
   juce::Colour m_nameColor = Colors::value(), m_statusColor = Colors::label();
 };
 

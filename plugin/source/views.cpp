@@ -496,6 +496,12 @@ void LevelMeter::setLevel(float peak, double now)
   repaint();
 }
 
+juce::String LevelMeter::getTooltip()
+{
+  if (!(m_peak > 0)) return "-inf dB";
+  return str(uitext::dbText(powf(10.0f, (uitext::METER_FLOOR_DB * (1.0f - m_peak)) / 20.0f)));
+}
+
 void LevelMeter::mouseDown(const juce::MouseEvent &e)
 {
   if (!e.mods.isLeftButtonDown() || !m_clip) return;
@@ -556,6 +562,13 @@ void NameCell::setStatus(const std::string &status, juce::Colour color)
   repaint();
 }
 
+void NameCell::setOut(int player)
+{
+  if (player == m_out) return;
+  m_out = player;
+  repaint();
+}
+
 void NameCell::setNameColor(juce::Colour c)
 {
   if (c == m_nameColor) return;
@@ -567,7 +580,8 @@ void NameCell::paint(juce::Graphics &g)
 {
   const float w = (float)getWidth(), h = (float)getHeight();
   float x = 0;
-  // as much as fits, cut with an ellipsis: the name first, then the channel, then the status
+  // as much as fits, cut with an ellipsis: the name first, then the channel, the DAW output
+  // they play on alone ("P1", for the output Player 1), then the status
   auto part = [&](const std::string &text, const juce::Font &font, juce::Colour color) {
     if (text.empty() || x >= w - 4) return;
     g.setFont(font);
@@ -578,6 +592,7 @@ void NameCell::paint(juce::Graphics &g)
   };
   part(m_name, m_nameFont, m_nameColor);
   if (!m_channel.empty()) part(" \xc2\xb7 " + m_channel, m_nameFont, Colors::label());
+  if (m_out > 0) part(" \xc2\xb7 P" + std::to_string(m_out), m_nameFont, Colors::label());
   if (!m_status.empty() && x + m_gap < w - 20)
   {
     x += m_gap;

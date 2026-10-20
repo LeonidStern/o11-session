@@ -333,8 +333,8 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           NOTARIZE: ${{ steps.devid.outputs.notarize }}
         run: |
-          # The Mac download: a disk image with O11Session.vst3 next to a shortcut to the VST3
-          # folder, over a background that says to open the folder and drag the plug-in in (plugin/packaging).
+          # The Mac download: a disk image with O11Session.vst3 alone (no shortcut: its arrow badge
+          # reads as "drag here"), over a background that says to open the VST3 folder and drag the plug-in in (plugin/packaging).
           # dmgbuild lays it out in a read-write image; the bundle bit is set in there, for the
           # reasons above, and then the image is compressed, signed and notarized.
           python3 -m venv "$RUNNER_TEMP/dmgbuild"
@@ -360,11 +360,11 @@ jobs:
             xcrun stapler validate "$DMG"
           fi
           ls -l dist
-          # what someone gets: the shortcut, the layout, the bundle bit, a valid signature
+          # what someone gets: the plug-in alone, the layout, the bundle bit, a valid signature
           RO="$RUNNER_TEMP/dmg-check"
           hdiutil attach -nobrowse -noautoopen -readonly -mountpoint "$RO" "$DMG"
           ls -la "$RO"
-          test "$(readlink "$RO/VST3 Plug-Ins")" = /Library/Audio/Plug-Ins/VST3
+          test ! -e "$RO/VST3 Plug-Ins"
           test -f "$RO/.DS_Store"
           ls "$RO"/.background.*
           test "$(xattr -px com.apple.FinderInfo "$RO/O11Session.vst3" | tr -d ' \n' | cut -c17-20)" = 2000

@@ -169,7 +169,6 @@ static juce::Label *makeValueLabel(const juce::Font &font)
 
 static const char *SERVER_PLACEHOLDER = "IP address of a room";
 static const char *SERVER_TIP = "The room's IP address, as 203.0.113.9 (port 2049 unless you add another, as 203.0.113.9:2050)";
-static const char *METER_TIP = "Green, amber from -12 dB, red from -3 dB; the light at the right stays red after 0 dB until you click it";
 
 void O11Editor::buildViews()
 {
@@ -231,7 +230,6 @@ void O11Editor::buildViews()
   m_inputVolume->setTooltip("The volume of what you send: drag left or right (double-click for 0 dB)");
   m_inputVolume->onChange = [this]() { engine().setInputVolume(sliderToGain(m_inputVolume->value())); };
   m_myMeter = add(m_myRow, new LevelMeter);
-  m_myMeter->setTooltip(std::string("Your input. ") + METER_TIP);
 
   m_players = add(m_mixer, new juce::Viewport);
   m_players->setScrollBarsShown(true, false, true, false);
@@ -976,7 +974,27 @@ void O11Editor::updateRoom(const Snapshot &s, double)
   const Vote nobody;
   const std::string advice = liveHere && s.liveSwitchOn && s.liveRoom
                                ? uitext::liveAdviceText((int)s.liveReason, s.liveReasonWho, s.liveReasonOthers) : "";
-  if (!advice.empty())
+  // too far for Live: whoever you hear the latest, past uitext::LIVE_FAR_MS
+  std::string far;
+  int farMs = 0, farOthers = 0;
+  if (advice.empty() && liveHere && s.liveSwitchOn && s.liveRoom)
+    for (const RemoteUserView &u : s.users)
+      if (u.liveHeardMs > uitext::LIVE_FAR_MS)
+      {
+        if (u.liveHeardMs > farMs)
+        {
+          if (!far.empty()) farOthers ++;
+          far = u.displayName;
+          farMs = u.liveHeardMs;
+        }
+        else farOthers ++;
+      }
+  if (!far.empty())
+    chip(true, uitext::liveFarText(far, farMs, farOthers),
+         "Live keeps time only when everyone hears everyone within about " + std::to_string(uitext::LIVE_FAR_MS) +
+           " ms; intervals keep everyone on the beat at any distance. Click to switch the room to intervals for everyone",
+         nobody, -1, [this]() { engine().setRoomLive(false); });
+  else if (!advice.empty())
     chip(true, advice, std::string(s.liveReason == Snapshot::LiveCantLive
                                      ? "A player can't reach the others directly, so they don't hear each other in Live"
                                      : "Live audio has dropouts that intervals wouldn't have")
@@ -1142,7 +1160,6 @@ void O11Editor::rebuildRows(const Snapshot &s)
       row.solo->onChange = [this, index]() { setRemote(index, Engine::RemoteSolo, m_rows[index].solo->value() ? 1.0f : 0.0f); };
       row.container->addAndMakeVisible(row.solo);
       row.meter = new LevelMeter;
-      row.meter->setTooltip(METER_TIP);
       row.container->addAndMakeVisible(row.meter);
       m_playersContent->addAndMakeVisible(*row.container);
       m_rows.push_back(std::move(row));
@@ -1184,7 +1201,12 @@ void O11Editor::updateRows(const Snapshot &s, double now)
       // while the audio runs: the intervals, and their sound, come with it)
       RowTrack &track = m_tracks.emplace(rowKey(u.name, c.index), RowTrack { now, -1, -1 }).first->second;
       if (level > 0.0001f || !s.audioRunning) track.heard = now;
-      if (track.dropouts >= 0 && c.dropouts > track.dropouts) track.droppedAt = now;
+      if (track.dropouts >= 0 && c.dropouts > track.dropouts)
+      {
+        // a dropout after a quiet spell starts the count again
+        if (track.droppedAt < 0 || now - track.droppedAt >= uitext::DROPOUT_SECONDS) track.shownFrom = track.dropouts;
+        track.droppedAt = now;
+      }
       track.dropouts = c.dropouts;
       const double joined = u.joinedAt > 0 ? now - u.joinedAt : -1;
       std::string status;
@@ -1192,7 +1214,7 @@ void O11Editor::updateRows(const Snapshot &s, double now)
       bool silent = false, dropping = false;
       if (track.droppedAt >= 0 && now - track.droppedAt < uitext::DROPOUT_SECONDS && c.dropouts > 0)
       {
-        status = uitext::dropoutsText(c.dropouts);
+        status = uitext::dropoutsText(c.dropouts - track.shownFrom);
         color = led = Colors::amber();
         dropping = true;
       }
@@ -1205,6 +1227,7 @@ void O11Editor::updateRows(const Snapshot &s, double now)
         silent = true;
       }
       row.name->setStatus(status, color);
+      row.name->setOut(c.playerOut);
       row.led->setColor(led, !silent);
       std::string tip = u.displayName + (c.name.empty() ? std::string() : " \xc2\xb7 " + c.name) + " (" + u.name + "): ";
       tip += c.playerOut > 0 ? "also plays alone on the DAW output Player " + std::to_string(c.playerOut)

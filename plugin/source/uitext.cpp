@@ -144,6 +144,13 @@ std::string liveAdviceText(int reason, const std::string &who, int others)
   }
 }
 
+std::string liveFarText(const std::string &who, int ms, int others)
+{
+  if (others > 0)
+    return who + " and " + std::to_string(others) + " more are over " + std::to_string(LIVE_FAR_MS) + " ms away: try Intervals";
+  return who + " is " + std::to_string(ms) + " ms away: try Intervals";
+}
+
 std::string ageText(double seconds)
 {
   if (!(seconds >= 5)) return "now";

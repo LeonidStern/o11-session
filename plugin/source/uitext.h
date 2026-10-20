@@ -30,7 +30,7 @@ constexpr double PIXELS_PER_BPM = 2.0;               // dragging the BPM box up 
 // the level meters show -60 dB to 0 dB: green, amber from -12 dB, red from -3 dB
 constexpr float METER_FLOOR_DB = -60.0f, METER_AMBER = 0.8f, METER_RED = 0.95f;
 constexpr double JOINED_SECONDS = 30.0;              // a player's row says "joined" this long
-constexpr double DROPOUT_SECONDS = 60.0;             // and how many dropouts it had, this long after one
+constexpr double DROPOUT_SECONDS = 10.0;             // and how many dropouts it had lately, this long after the last
 
 // the BPM box dragged dy pixels up (down when negative) from start, within BPM_MIN..BPM_MAX
 int dragBpm(int start, double dy, bool fine);
@@ -67,6 +67,10 @@ std::string intervalsModeText(int beats, bool unit);
 // Intervals: "Anna drops out: try Intervals", "Your connection drops out: try Intervals",
 // "Carol and 1 more can't play Live: try Intervals"; "" for no reason
 std::string liveAdviceText(int reason, const std::string &who, int others);
+// Live is in time only when everyone hears everyone soon enough: past LIVE_FAR_MS the room
+// suggests Intervals, "Anton is 106 ms away: try Intervals", "Anton and 1 more are over 50 ms away: ..."
+constexpr int LIVE_FAR_MS = 50;
+std::string liveFarText(const std::string &who, int ms, int others);
 // how long ago something happened, in the room panel: "now", "12 s", "2 min", "1 h"
 std::string ageText(double seconds);
 // a server's line with the players' addresses taken out: "anna@203.0.113.9 set ..." is "anna set ..."
