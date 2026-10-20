@@ -44,24 +44,12 @@ and mix.
 These links always point to the newest build. Works in Ableton, Bitwig,
 Reaper, Studio One, Cubase and any other VST3 host.
 
-**Install or update from the terminal** (macOS and Linux). This puts the newest
-build in `~/Library/Audio/Plug-Ins/VST3` on macOS (after checking its signature)
-or in `~/.vst3` on Linux, replacing the copy that is there:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/LeonidStern/o11-session/main/plugin/install.sh | sh
-```
-
-Add `-s rc0.2` after `sh` for a release candidate instead of the newest build.
-
 ## Quick start
 
 1. **Install.** On macOS, open the disk image, double-click the VST3
    folder in it, and drag O11 Session into that folder's window (it is signed and notarized by Apple). On Windows, copy
    `O11Session.vst3` into `C:\Program Files\Common Files\VST3`. On Linux, copy
-   it into `~/.vst3`. On macOS and Linux, the
-   [one-line terminal install](#download) does this for you and also updates later.
-   Then rescan plug-ins in your DAW.
+   it into `~/.vst3`. Then rescan plug-ins in your DAW.
 2. **Start a room.** Put O11 Session on a track and press Host. It opens the
    room on your computer, asks your router to let people in, and shows the
    address to share.

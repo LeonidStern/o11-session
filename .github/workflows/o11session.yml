@@ -372,12 +372,6 @@ jobs:
           hdiutil detach "$RO"
           done
 
-      # the README's one-line install, on the build already published (it checks the signature)
-      - name: Install script (the published build)
-        run: |
-          HOME="$RUNNER_TEMP/home" sh plugin/install.sh
-          test -d "$RUNNER_TEMP/home/Library/Audio/Plug-Ins/VST3/O11Session.vst3"
-
       - name: Remove the signing keychain
         if: always() && steps.devid.outputs.notarize == 'true'
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
