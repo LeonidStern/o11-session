@@ -136,6 +136,23 @@ static void test_state()
   CHECK(!offLoaded.followHostTempo);
   CHECK(e.followHostTempo);
 
+  // the room you host: 120 BPM, 4 beats, Live, Opus by default; saved with the project
+  CHECK_EQ(Settings().roomBpm, 120);
+  CHECK_EQ(Settings().roomBpi, 4);
+  CHECK(Settings().roomLive && !Settings().roomFlac);
+  Settings picked;
+  picked.roomBpm = 95;
+  picked.roomBpi = 16;
+  picked.roomLive = false;
+  picked.roomFlac = true;
+  Settings pickedLoaded;
+  CHECK(pickedLoaded.deserialize(picked.serialize()));
+  CHECK_EQ(pickedLoaded.roomBpm, 95);
+  CHECK_EQ(pickedLoaded.roomBpi, 16);
+  CHECK(!pickedLoaded.roomLive && pickedLoaded.roomFlac);
+  CHECK_EQ(old.roomBpm, 120);
+  CHECK(old.roomLive);
+
   // Live's jitter buffer: automatic, not saved, and older states' setting is ignored
   CHECK_EQ(Settings().liveBufferMs, Settings::LIVE_BUFFER_AUTO);
   CHECK_EQ(old.liveBufferMs, Settings::LIVE_BUFFER_AUTO);

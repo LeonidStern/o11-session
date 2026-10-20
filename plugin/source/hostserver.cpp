@@ -55,7 +55,7 @@ static bool env_is_off(const char *name)
   return v && strcmp(v, "off") == 0;
 }
 
-bool HostServer::start(const void *owner, int opusKbps, std::string *error)
+bool HostServer::start(const void *owner, int opusKbps, int bpm, int bpi, bool flac, std::string *error)
 {
   std::lock_guard<std::mutex> busy(m_startStop);
   {
@@ -74,14 +74,14 @@ bool HostServer::start(const void *owner, int opusKbps, std::string *error)
   o11proto::ServerConfig cfg;
   cfg.allow_anonymous = true;
   cfg.anonymous_privs = o11proto::kPrivChat | o11proto::kPrivVote;
-  cfg.bpm = DEFAULT_BPM;
-  cfg.bpi = DEFAULT_BPI;
+  cfg.bpm = (std::uint16_t)(bpm >= 40 && bpm <= 400 ? bpm : DEFAULT_BPM);
+  cfg.bpi = (std::uint16_t)(bpi >= 1 && bpi <= 64 ? bpi : DEFAULT_BPI);
   // benchmarks and tests: the hosted room's tempo
   if (const char *v = getenv("O11_HOST_BPM")) if (atoi(v) > 0) cfg.bpm = (std::uint16_t)atoi(v);
   if (const char *v = getenv("O11_HOST_BPI")) if (atoi(v) > 0) cfg.bpi = (std::uint16_t)atoi(v);
   cfg.max_users = MAX_USERS;
   cfg.allow_codecs = o11proto::kCapOpus | o11proto::kCapFlac;
-  cfg.chosen_codec = o11proto::kCapOpus;
+  cfg.chosen_codec = flac ? o11proto::kCapFlac : o11proto::kCapOpus;
   cfg.opus_kbps = (std::uint32_t)(opusKbps >= 32 && opusKbps <= 510 ? opusKbps : 128);
   cfg.vote_threshold_percent = 1; // a single vote changes BPM or BPI
   cfg.log = [this](const std::string &line) { onLog(line); };

@@ -389,6 +389,17 @@ int main()
   CHECK(room.waitFor(room.host, "hosting", "0", 10));
   CHECK(field(room.host.command("status"), "state") == "disconnected");
 
+  // the room you host starts with what you picked before hosting: tempo, interval, codec, intervals
+  room.host.setStartRoom(100, 8, false, true);
+  CHECK(room.host.command("host on") == "ok");
+  CHECK(room.waitFor(room.host, "state", "connected", 10));
+  CHECK(room.waitFor(room.host, "bpm", "100.0", 5));
+  CHECK(field(room.host.command("status"), "bpi") == "8");
+  CHECK(room.waitFor(room.host, "codec", "FLAC", 5));
+  CHECK(room.waitForLive(room.host, "switch", "0", 5));
+  CHECK(room.host.command("host off") == "ok");
+  CHECK(room.waitFor(room.host, "hosting", "0", 10));
+
   printf("%d checks, %d failed\n", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }
