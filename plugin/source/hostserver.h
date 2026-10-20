@@ -51,7 +51,7 @@ public:
   enum { FIRST_PORT = 2049, PORTS_TO_TRY = 10, MAX_USERS = 8, DEFAULT_BPM = 120, DEFAULT_BPI = 4 };
 
   // true when started (or already running for this owner); the room's Opus bitrate starts at opusKbps
-  bool start(const void *owner, int opusKbps, std::string *error);
+  bool start(const void *owner, int opusKbps, int bpm, int bpi, bool flac, std::string *error);
   void stop(const void *owner);
 
   struct State

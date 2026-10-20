@@ -162,6 +162,10 @@ std::string Settings::serialize() const
   s += std::string("transmit=") + (transmit ? "1" : "0") + "\n";
   s += "opus_kbps=" + std::to_string(opusKbps) + "\n";
   s += std::string("follow_host_tempo=") + (followHostTempo ? "1" : "0") + "\n";
+  s += "room_bpm=" + std::to_string(roomBpm) + "\n";
+  s += "room_bpi=" + std::to_string(roomBpi) + "\n";
+  s += std::string("room_live=") + (roomLive ? "1" : "0") + "\n";
+  s += std::string("room_codec=") + (roomFlac ? "flac" : "opus") + "\n";
   if (editorWidth > 0 && editorHeight > 0) s += "editor_window=" + std::to_string(editorWidth) + "x" + std::to_string(editorHeight) + "\n";
   for (auto &r : remote)
     s += "remote=" + escape(r.first) + "\t" + num(r.second.volume) + "\t" + num(r.second.pan) + "\t" + (r.second.mute ? "1" : "0") + "\n";
@@ -191,6 +195,10 @@ bool Settings::deserialize(const std::string &data)
     else if (key == "monitor") s.monitor = value == "1";
     else if (key == "transmit") s.transmit = value == "1";
     else if (key == "follow_host_tempo") s.followHostTempo = value == "1";
+    else if (key == "room_bpm") { const int b = atoi(value.c_str()); if (b >= 40 && b <= 400) s.roomBpm = b; }
+    else if (key == "room_bpi") { const int b = atoi(value.c_str()); if (b >= 1 && b <= 64) s.roomBpi = b; }
+    else if (key == "room_live") s.roomLive = value == "1";
+    else if (key == "room_codec") s.roomFlac = value == "flac";
     else if (key == "live_buffer_ms") {} // older states: Live picks its buffer itself now
     else if (key == "opus_kbps")
     {
@@ -840,6 +848,15 @@ void Engine::setRoomLive(bool on)
   });
 }
 
+void Engine::setStartRoom(int bpm, int bpi, bool live, bool flac)
+{
+  std::lock_guard<std::mutex> lock(m_settingsMutex);
+  if (bpm >= 40 && bpm <= 400) m_settings.roomBpm = bpm;
+  if (bpi >= 1 && bpi <= 64) m_settings.roomBpi = bpi;
+  m_settings.roomLive = live;
+  m_settings.roomFlac = flac;
+}
+
 void Engine::setLiveBuffer(int ms)
 {
   const int b = Settings::nearestLiveBufferMs(ms);
@@ -1069,6 +1086,9 @@ void Engine::updateConnection()
       addChat(ChatLine::System, "", m_statusText);
       // the room gets the host's tempo, if they differ, unless Live follows the room through Link
       m_armPending = true;
+      // your own room starts Live; the plug-in turns it off if you picked intervals
+      if (m_hosting && m_server == "127.0.0.1:" + std::to_string(m_hostPort) && !setting(&Settings::roomLive))
+        m_client->say("!live off");
     }
     return;
   }
@@ -1239,7 +1259,8 @@ void Engine::doSetHosting(bool on)
   if (on)
   {
     std::string err;
-    if (HostServer::instance().start(this, getSettings().opusKbps, &err))
+    const Settings set = getSettings();
+    if (HostServer::instance().start(this, set.opusKbps, set.roomBpm, set.roomBpi, set.roomFlac, &err))
     {
       m_hosting = true;
       m_hostLogSerial = 0;

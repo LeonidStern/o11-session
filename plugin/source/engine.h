@@ -210,6 +210,9 @@ struct Settings
   bool transmit = true;
   int opusKbps = DEFAULT_OPUS_KBPS; // what we send in Opus rooms; FLAC is lossless and ignores it
   bool followHostTempo = true; // Sync: follow the host's tempo (and line up with its bars)
+  // the room you host starts with these; picked in the editor, also before you host
+  int roomBpm = 120, roomBpi = 4;
+  bool roomLive = true, roomFlac = false;
   int liveBufferMs = DEFAULT_LIVE_BUFFER_MS; // Live's jitter buffer: LIVE_BUFFER_AUTO, or fixed at one of LIVE_BUFFER_MS; not saved: only the `live buffer` command and O11_LIVE_BUFFER_MS (tests) change it
   int editorWidth = 0, editorHeight = 0; // the editor's size, 0 for the default
 
@@ -282,6 +285,8 @@ public:
   void setFollowHostTempo(bool on); // Sync, and with it Ableton Link
   void setHostName(const std::string &name); // the host's name, for the editor
   void setRoomLive(bool on);       // the room's Live switch (!live on|off), while connected
+  // what the room you host starts with (Settings::roomBpm and on), saved with the project
+  void setStartRoom(int bpm, int bpi, bool live, bool flac);
   void setLiveBuffer(int ms);      // your jitter buffer: Settings::LIVE_BUFFER_AUTO or one of Settings::LIVE_BUFFER_MS
 
   enum RemoteField { RemoteVolume, RemotePan, RemoteMute, RemoteSolo };

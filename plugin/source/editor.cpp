@@ -262,43 +262,52 @@ void O11Editor::buildViews()
   m_bpm->setJustificationType(juce::Justification::centredRight);
   m_bpm->dragMap = [](int start, double dy, bool fine) { return uitext::dragBpm(start, dy, fine); };
   m_bpm->format = [](int v) { return uitext::bpmBoxText(v); };
-  m_bpm->onDragged = [this](int bpm) {
+  // the room you host starts with what you pick before you host, and with your last picks in it
+  auto startRoom = [this](const Snapshot &s, std::function<void(Settings &)> change) {
+    if (s.state == ConnState::Connected && !s.hosting) return;
+    Settings set = engine().getSettings();
+    change(set);
+    engine().setStartRoom(set.roomBpm, set.roomBpi, set.roomLive, set.roomFlac);
+  };
+  auto pickBpm = [this, startRoom](int bpm) {
     Snapshot s;
     engine().getSnapshot(s);
     if (s.state == ConnState::Connected && bpm != (int)lround(s.bpm)) engine().vote("bpm", bpm);
+    startRoom(s, [bpm](Settings &set) { set.roomBpm = bpm; });
   };
-  m_bpm->onTyped = [this](const std::string &text) {
+  m_bpm->onDragged = pickBpm;
+  m_bpm->onTyped = [pickBpm](const std::string &text) {
     int bpm = 0;
-    if (!uitext::parseBpm(text, &bpm)) return;
-    Snapshot s;
-    engine().getSnapshot(s);
-    if (s.state == ConnState::Connected && bpm != (int)lround(s.bpm)) engine().vote("bpm", bpm);
+    if (uitext::parseBpm(text, &bpm)) pickBpm(bpm);
   };
-  m_bpm->setTooltip("The room's tempo: drag up or down (Shift for fine steps), or double-click and type, to change it "
-                    "for everyone from the next interval");
   // Live, or intervals of so many beats: picking one switches everyone from the next interval
   m_mode = add(m_room, new MenuBox(f.value));
   m_mode->addEntry("Live"); // the order of the choices
   for (int b : uitext::BPI_CHOICES) m_mode->addEntry(uitext::intervalsModeText(b, true));
-  m_mode->onSelect = [this](int i) {
+  m_mode->onSelect = [this, startRoom](int i) {
     Snapshot s;
     engine().getSnapshot(s);
-    if (i < 0 || s.state != ConnState::Connected) return;
+    if (i < 0 || i > uitext::NUM_BPI_CHOICES) return;
+    startRoom(s, [i](Settings &set) {
+      set.roomLive = i == 0;
+      if (i > 0) set.roomBpi = uitext::BPI_CHOICES[i - 1];
+    });
+    if (s.state != ConnState::Connected) return;
     if (i == 0)
     {
       if (s.liveServer && !s.liveSwitchOn) engine().setRoomLive(true);
       return;
     }
-    if (i > uitext::NUM_BPI_CHOICES) return;
     if (s.liveServer && s.liveSwitchOn) engine().setRoomLive(false);
     if (uitext::BPI_CHOICES[i - 1] != s.bpi) engine().vote("bpi", uitext::BPI_CHOICES[i - 1]);
   };
   m_codec = add(m_room, new MenuBox(f.value));
   m_codec->addEntry("Opus"); // the order of the choices
   m_codec->addEntry("FLAC");
-  m_codec->onSelect = [this](int i) {
+  m_codec->onSelect = [this, startRoom](int i) {
     Snapshot s;
     engine().getSnapshot(s);
+    if (i >= 0) startRoom(s, [i](Settings &set) { set.roomFlac = i == 1; });
     const char *codec = i == 1 ? "FLAC" : "Opus";
     if (i >= 0 && s.state == ConnState::Connected && s.roomCodec != codec) engine().setRoomCodec(i == 1 ? "flac" : "opus");
   };
@@ -880,16 +889,23 @@ void O11Editor::updateRoom(const Snapshot &s, double)
   const bool playing = connected && s.audioRunning && s.intervalBeats > 0 && s.intervalBpm > 0;
   const double bpm = playing ? s.intervalBpm : s.bpm;
   const int bpi = playing ? s.intervalBeats : s.bpi;
-  m_bpm->setEnabled(connected);
-  m_bpm->setShown(connected && bpm > 0 ? (int)lround(bpm) : 120, uitext::bpmBoxText(connected ? bpm : 0));
+  // out of a room, what the room you host starts with
+  const Settings start = connected ? Settings() : engine().getSettings();
+  const int shownBpm = connected ? (bpm > 0 ? (int)lround(bpm) : 120) : start.roomBpm;
+  m_bpm->setShown(shownBpm, uitext::bpmBoxText(connected ? bpm : start.roomBpm));
+  setTooltip(m_bpm, connected ? "The room's tempo: drag up or down (Shift for fine steps), or double-click and type, to "
+                                "change it for everyone from the next interval"
+                              : "The tempo the room you host starts with: drag up or down (Shift for fine steps), or "
+                                "double-click and type");
 
-  // the room's codec: picking one switches everyone (!codec), so only in a room
-  m_codec->setEnabled(connected);
-  m_codec->setShown(connected && !s.roomCodec.empty() ? s.roomCodec : "\xe2\x80\x94");
+  // the room's codec: picking one switches everyone (!codec)
+  const std::string codecShown = connected ? s.roomCodec : start.roomFlac ? "FLAC" : "Opus";
+  m_codec->setShown(!codecShown.empty() ? codecShown : "\xe2\x80\x94");
   setTooltip(m_codec, connected ? "The room's codec: pick Opus or FLAC to switch everyone (FLAC is lossless and needs "
                                   "several times the bandwidth)"
-                                : "The room's codec, Opus or FLAC: in a room, pick one to switch everyone");
-  m_codec->setCurrentIndex(s.roomCodec == "FLAC" ? 1 : connected && s.roomCodec == "Opus" ? 0 : -1);
+                                : "The codec the room you host starts with: Opus, or FLAC (lossless, several times the "
+                                  "bandwidth)");
+  m_codec->setCurrentIndex(codecShown == "FLAC" ? 1 : codecShown == "Opus" ? 0 : -1);
 
   // the bitrate: the room's (picking one changes it for everyone), else your own; FLAC is lossless,
   // and in a room the plug-in can't send in it means nothing
@@ -914,21 +930,20 @@ void O11Editor::updateRoom(const Snapshot &s, double)
   const bool liveHere = connected && s.liveServer;
   // without the host's audio nothing plays, so the room's switch
   const bool liveShown = liveHere && (s.audioRunning ? s.liveRoom : s.liveSwitchOn);
-  m_mode->setEnabled(connected);
-  m_mode->setEntryEnabled(0, liveHere);
-  m_mode->setShown(!connected ? "\xe2\x80\x94"
+  m_mode->setEntryEnabled(0, !connected || liveHere);
+  m_mode->setShown(!connected ? (start.roomLive ? uitext::liveModeText(true, 0) : uitext::intervalsModeText(start.roomBpi, false))
                    : liveShown ? uitext::liveModeText(true, s.liveHeardMs)
                                             : uitext::intervalsModeText(bpi, false));
   {
     int index = -1;
     for (int i = 0; i < uitext::NUM_BPI_CHOICES; i ++)
-      if (uitext::BPI_CHOICES[i] == s.bpi) index = i + 1;
-    m_mode->setCurrentIndex(!connected ? -1 : liveHere && s.liveSwitchOn ? 0 : index);
+      if (uitext::BPI_CHOICES[i] == (connected ? s.bpi : start.roomBpi)) index = i + 1;
+    m_mode->setCurrentIndex(!connected ? (start.roomLive ? 0 : index) : liveHere && s.liveSwitchOn ? 0 : index);
   }
   const std::string lengths = "pick a length to switch everyone to intervals of that many beats from the next interval";
   if (!connected)
-    setTooltip(m_mode, "Live plays everyone in real time, about 30 ms late, on servers that have it; Intervals plays each "
-                       "player one interval late, in time with the beat");
+    setTooltip(m_mode, "What the room you host starts with: Live plays everyone in real time, about 30 ms late; Intervals "
+                       "plays each player one interval late, in time with the beat");
   else if (!s.liveServer)
     setTooltip(m_mode, "This server doesn't have Live, so everyone plays through intervals: pick a length to change it for "
                        "everyone from the next interval");
